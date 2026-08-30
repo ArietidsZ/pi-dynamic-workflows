@@ -12,7 +12,7 @@ import { WorkflowManager } from "../src/workflow-manager.js";
 
 type DeliveryCall = { content: string; customType?: string; triggerTurn?: boolean };
 type StableSend = (
-  msg: { customType?: string; content?: string; display?: boolean },
+  msg: { customType?: string; content?: string; display?: boolean; details?: { deliveryId?: string } },
   opts?: { triggerTurn?: boolean; deliverAs?: string },
 ) => unknown;
 
@@ -344,7 +344,7 @@ describe("installResultDelivery", () => {
   }
 
   type ExactSendCall = {
-    message: { customType?: string; content?: string; display?: boolean };
+    message: { customType?: string; content?: string; display?: boolean; details?: { deliveryId?: string } };
     options: { triggerTurn?: boolean; deliverAs?: string } | undefined;
   };
   /** Record the FULL message + options so tests can assert the exact payload
@@ -940,6 +940,514 @@ describe("installResultDelivery", () => {
     manager.emit("complete", { runId: "run-double" });
     assert.equal(sends, 2, "the retried send keeps its lock — no third delivery");
     resolvers[1]?.(new Error("test cleanup"));
+  });
+
+  it("retries a transient rejection without waiting for another session bind", async () => {
+    const pi = createMockPi();
+    const run = makeRun();
+    const manager = createMockManager(run);
+    let sends = 0;
+
+    setup(pi, manager, SESSION, {
+      stableSend: () => {
+        sends++;
+        return sends === 1 ? Promise.reject(new Error("temporary send failure")) : Promise.resolve();
+      },
+    });
+    manager.emit("complete", { runId: "test-run-1" });
+
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(sends, 2, "the live endpoint retries once without a rebind");
+    assert.equal(run.pendingDelivery, undefined, "the successful retry clears pending delivery");
+  });
+
+  it("does not send until the pending marker is durable", async () => {
+    const pi = createMockPi();
+    const run = makeRun();
+    const manager = createMockManager(run);
+    const getPersistence = manager.getPersistence;
+    let failSave = true;
+    let sends = 0;
+    manager.getPersistence = () => {
+      const persistence = getPersistence?.();
+      assert.ok(persistence);
+      return {
+        ...persistence,
+        save: (state: Record<string, unknown>) => {
+          if (failSave) {
+            failSave = false;
+            throw new Error("disk temporarily unavailable");
+          }
+          persistence.save(state);
+        },
+      };
+    };
+
+    setup(pi, manager, SESSION, {
+      stableSend: () => {
+        sends++;
+        return Promise.resolve();
+      },
+    });
+    manager.emit("complete", { runId: "test-run-1" });
+    assert.equal(sends, 0, "an unpersisted marker is never sent");
+
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(sends, 1, "delivery resumes after marker persistence recovers");
+    assert.equal(run.pendingDelivery, undefined);
+  });
+
+  it("does not ACK a streaming follow-up until its message is persisted", async () => {
+    const pi = createMockPi();
+    const run = makeRun();
+    const manager = createMockManager(run);
+    const entries: Array<{ type: string; customType: string; details?: unknown }> = [];
+    const sent: Array<{ customType: string; content: string; display: boolean; details?: { deliveryId?: string } }> =
+      [];
+    let listener:
+      | ((event: { type?: string; message?: { role?: string; customType?: string; details?: unknown } }) => void)
+      | undefined;
+
+    mod._registerHostSessionForTests({
+      isStreaming: true,
+      sessionManager: {
+        persist: true,
+        getSessionId: () => SESSION,
+        getSessionName: () => "chat",
+        isPersisted: () => true,
+        getEntries: () => entries,
+      },
+      subscribe: (next: typeof listener) => {
+        listener = next;
+        return () => {
+          if (listener === next) listener = undefined;
+        };
+      },
+      sendCustomMessage: (message: (typeof sent)[number]) => {
+        sent.push(message);
+        return Promise.resolve();
+      },
+    });
+    mod.installResultDelivery(pi, manager);
+    manager.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, pi, { manager });
+    manager.emit("complete", { runId: "test-run-1" });
+    await Promise.resolve();
+
+    assert.equal(sent.length, 1);
+    assert.ok(run.pendingDelivery, "queue acceptance alone must not clear the marker");
+    const details = sent[0].details;
+    listener?.({ type: "message_end", message: { role: "custom", customType: "workflow-result", details } });
+    entries.push({ type: "custom_message", customType: "workflow-result", details });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(run.pendingDelivery, undefined, "matching durable message_end ACKs the delivery");
+  });
+
+  it("fails closed when streaming message persistence cannot be inspected", async () => {
+    const pi = createMockPi();
+    const run = makeRun();
+    const manager = createMockManager(run);
+    let listener:
+      | ((event: { type?: string; message?: { role?: string; customType?: string; details?: unknown } }) => void)
+      | undefined;
+    let details: { deliveryId?: string } | undefined;
+
+    mod._registerHostSessionForTests({
+      isStreaming: true,
+      sessionManager: {
+        persist: true,
+        getSessionId: () => SESSION,
+        getSessionName: () => "chat",
+        isPersisted: () => true,
+        getEntries: () => {
+          throw new Error("history unavailable");
+        },
+      },
+      subscribe: (next: typeof listener) => {
+        listener = next;
+        return () => {};
+      },
+      sendCustomMessage: (message: { details?: { deliveryId?: string } }) => {
+        details = message.details;
+        return Promise.resolve();
+      },
+    });
+    mod.installResultDelivery(pi, manager);
+    manager.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, pi, { manager });
+    manager.emit("complete", { runId: "test-run-1" });
+    listener?.({ type: "message_end", message: { role: "custom", customType: "workflow-result", details } });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.ok(run.pendingDelivery, "an unverifiable message_end cannot ACK delivery");
+  });
+
+  it("re-delivers a queued follow-up after session replacement discards it", async () => {
+    const oldPi = createMockPi();
+    const freshPi = createMockPi();
+    const run = makeRun();
+    const manager = createMockManager(run);
+    let queued = 0;
+
+    mod._registerHostSessionForTests({
+      isStreaming: true,
+      sessionManager: {
+        persist: true,
+        getSessionId: () => SESSION,
+        getSessionName: () => "chat",
+        isPersisted: () => true,
+        getEntries: () => [],
+      },
+      subscribe: () => () => {},
+      sendCustomMessage: () => {
+        queued++;
+        return Promise.resolve();
+      },
+    });
+    mod.installResultDelivery(oldPi, manager);
+    manager.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, oldPi, { manager });
+    manager.emit("complete", { runId: "test-run-1" });
+    await Promise.resolve();
+    assert.equal(queued, 1);
+    assert.ok(run.pendingDelivery, "the unpersisted queue item stays pending");
+
+    mod.suspendSessionDelivery(SESSION);
+    mod.bindSessionDelivery(SESSION, freshPi, { manager, stableSend: recordingStableSend(freshPi) });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(piCalls(freshPi).length, 1, "the replacement session receives the pending result");
+    assert.equal(run.pendingDelivery, undefined);
+  });
+
+  it("retries a failed marker clear without delivering the result twice", async () => {
+    const pi = createMockPi();
+    const run = makeRun();
+    const manager = createMockManager(run);
+    const getPersistence = manager.getPersistence;
+    let failClear = true;
+    let sends = 0;
+    manager.getPersistence = () => {
+      const persistence = getPersistence?.();
+      assert.ok(persistence);
+      return {
+        ...persistence,
+        save: (state: Record<string, unknown>) => {
+          if (failClear && !("pendingDelivery" in state)) {
+            failClear = false;
+            throw new Error("disk temporarily unavailable");
+          }
+          persistence.save(state);
+        },
+      };
+    };
+
+    setup(pi, manager, SESSION, {
+      stableSend: () => {
+        sends++;
+        return Promise.resolve();
+      },
+    });
+    manager.emit("complete", { runId: "test-run-1" });
+    await Promise.resolve();
+    assert.ok(run.pendingDelivery, "failed clear keeps the marker until persistence recovers");
+
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(sends, 1, "clear retries never resend an already delivered result");
+    assert.equal(run.pendingDelivery, undefined);
+  });
+
+  it("deduplicates a stale marker against the originating session history", async () => {
+    const deliveryId = "existing-delivery";
+    const pi = createMockPi();
+    const run = makeRun({ pendingDelivery: { kind: "complete", deliveryId } });
+    const manager = createMockManager(run);
+    let sends = 0;
+
+    mod._registerHostSessionForTests({
+      isStreaming: false,
+      sessionManager: {
+        persist: true,
+        getSessionId: () => SESSION,
+        getSessionName: () => "chat",
+        isPersisted: () => true,
+        getEntries: () => [{ type: "custom_message", customType: "workflow-result", details: { deliveryId } }],
+      },
+      sendCustomMessage: () => {
+        sends++;
+        return Promise.resolve();
+      },
+    });
+    mod.installResultDelivery(pi, manager);
+    manager.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, pi, { manager });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(sends, 0, "an already persisted delivery is not sent twice");
+    assert.equal(run.pendingDelivery, undefined, "the stale marker is cleared");
+  });
+
+  it("does not let an older ACK clear a newer delivery marker", async () => {
+    const resolvers: Array<() => void> = [];
+    const sent: Array<{ details?: { deliveryId?: string } }> = [];
+    const pi = createMockPi();
+    const run = makeRun();
+    const manager = createMockManager(run);
+
+    setup(pi, manager, SESSION, {
+      stableSend: (message) => {
+        sent.push(message);
+        return new Promise<void>((resolve) => resolvers.push(resolve));
+      },
+    });
+    manager.emit("complete", { runId: "test-run-1" });
+    const firstId = run.pendingDelivery?.deliveryId;
+    manager.emit("error", { runId: "test-run-1", error: { message: "newer failure" } });
+    const newer = run.pendingDelivery;
+    assert.equal(newer?.kind, "text");
+    assert.notEqual(newer?.deliveryId, firstId);
+
+    resolvers[0]();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(sent.length, 2, "the newer marker is flushed after the older ACK settles");
+    assert.equal(run.pendingDelivery?.deliveryId, newer?.deliveryId, "the old ACK cannot clear the newer marker");
+
+    resolvers[1]();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(run.pendingDelivery, undefined);
+  });
+
+  it("fails the streaming ACK waiter on agent_end so retry sends on the idle path", async () => {
+    const pi = createMockPi();
+    const run = makeRun();
+    const manager = createMockManager(run);
+    const sent: Array<{ customType: string; content: string; display: boolean; details?: { deliveryId?: string } }> =
+      [];
+    let listener:
+      | ((event: { type?: string; message?: { role?: string; customType?: string; details?: unknown } }) => void)
+      | undefined;
+    const sessionObj = {
+      isStreaming: true,
+      sessionManager: {
+        persist: true,
+        getSessionId: () => SESSION,
+        getSessionName: () => "chat",
+        isPersisted: () => true,
+        getEntries: () => [],
+      },
+      subscribe: (next: typeof listener) => {
+        listener = next;
+        return () => {
+          if (listener === next) listener = undefined;
+        };
+      },
+      sendCustomMessage: (message: (typeof sent)[number]) => {
+        sent.push(message);
+        return Promise.resolve();
+      },
+    };
+
+    mod._registerHostSessionForTests(sessionObj);
+    mod.installResultDelivery(pi, manager);
+    manager.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, pi, { manager });
+    manager.emit("complete", { runId: "test-run-1" });
+    await Promise.resolve();
+
+    assert.equal(sent.length, 1, "first send queued as follow-up");
+    assert.ok(run.pendingDelivery, "still pending delivery while follow-up is queued");
+
+    // Agent turn ends (aborted or completed without delivering the follow-up)
+    sessionObj.isStreaming = false;
+    listener?.({ type: "agent_end" });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Now retry kicks in on the same generation, sending via the idle path
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(sent.length, 2, "retry sends on the idle path");
+    assert.equal(run.pendingDelivery, undefined, "result delivered on the idle path clears pending marker");
+  });
+
+  it("fails the streaming ACK waiter on queue_update when queue is cleared", async () => {
+    const pi = createMockPi();
+    const run = makeRun();
+    const manager = createMockManager(run);
+    const sent: Array<{ customType: string; content: string; display: boolean; details?: { deliveryId?: string } }> =
+      [];
+    let listener:
+      | ((event: {
+          type?: string;
+          message?: { role?: string; customType?: string; details?: unknown };
+          followUp?: unknown[];
+        }) => void)
+      | undefined;
+    const sessionObj = {
+      isStreaming: true,
+      agent: {
+        hasQueuedMessages: () => false,
+      },
+      sessionManager: {
+        persist: true,
+        getSessionId: () => SESSION,
+        getSessionName: () => "chat",
+        isPersisted: () => true,
+        getEntries: () => [],
+      },
+      subscribe: (next: typeof listener) => {
+        listener = next;
+        return () => {
+          if (listener === next) listener = undefined;
+        };
+      },
+      sendCustomMessage: (message: (typeof sent)[number]) => {
+        sent.push(message);
+        return Promise.resolve();
+      },
+    };
+
+    mod._registerHostSessionForTests(sessionObj);
+    mod.installResultDelivery(pi, manager);
+    manager.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, pi, { manager });
+    manager.emit("complete", { runId: "test-run-1" });
+    await Promise.resolve();
+
+    assert.equal(sent.length, 1);
+    assert.ok(run.pendingDelivery);
+
+    // clearQueue() emits queue_update with empty followUp
+    sessionObj.isStreaming = false;
+    listener?.({ type: "queue_update", followUp: [] });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(sent.length, 2, "retry sends on the idle path");
+    assert.equal(run.pendingDelivery, undefined);
+  });
+
+  it("times out the streaming ACK waiter if message_end never fires", async () => {
+    mod._setStreamingAckTimeoutForTests(50);
+    const pi = createMockPi();
+    const run = makeRun();
+    const manager = createMockManager(run);
+    const sent: Array<{ customType: string; content: string; display: boolean; details?: { deliveryId?: string } }> =
+      [];
+    const sessionObj = {
+      isStreaming: true,
+      sessionManager: {
+        persist: true,
+        getSessionId: () => SESSION,
+        getSessionName: () => "chat",
+        isPersisted: () => true,
+        getEntries: () => [],
+      },
+      subscribe: () => () => {},
+      sendCustomMessage: (message: (typeof sent)[number]) => {
+        sent.push(message);
+        return Promise.resolve();
+      },
+    };
+
+    mod._registerHostSessionForTests(sessionObj);
+    mod.installResultDelivery(pi, manager);
+    manager.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, pi, { manager });
+    manager.emit("complete", { runId: "test-run-1" });
+    await Promise.resolve();
+
+    assert.equal(sent.length, 1);
+    assert.ok(run.pendingDelivery);
+
+    // Allow timeout to fire (50ms) and session to transition to idle
+    sessionObj.isStreaming = false;
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    // Retry should fire (250ms delay)
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    assert.equal(sent.length, 2, "retry sends after streaming waiter times out");
+    assert.equal(run.pendingDelivery, undefined);
+  });
+
+  it("cancels active streaming waiters on suspend so they cannot ACK a later generation", async () => {
+    const pi = createMockPi();
+    const freshPi = createMockPi();
+    const run = makeRun();
+    const manager = createMockManager(run);
+    let gen1Listener:
+      | ((event: { type?: string; message?: { role?: string; customType?: string; details?: unknown } }) => void)
+      | undefined;
+
+    mod._registerHostSessionForTests({
+      isStreaming: true,
+      sessionManager: {
+        persist: true,
+        getSessionId: () => SESSION,
+        getSessionName: () => "chat",
+        isPersisted: () => true,
+        getEntries: () => [],
+      },
+      subscribe: (next: typeof gen1Listener) => {
+        gen1Listener = next;
+        return () => {
+          if (gen1Listener === next) gen1Listener = undefined;
+        };
+      },
+      sendCustomMessage: () => {
+        return Promise.resolve();
+      },
+    });
+
+    mod.installResultDelivery(pi, manager);
+    manager.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, pi, { manager });
+    manager.emit("complete", { runId: "test-run-1" });
+    await Promise.resolve();
+    assert.ok(run.pendingDelivery);
+
+    // Suspend generation 1
+    mod.suspendSessionDelivery(SESSION);
+
+    // Generation 1's subscriber should have been unsubscribed by suspend
+    assert.equal(gen1Listener, undefined, "streaming waiter was unsubscribed on suspend");
+
+    // Bind generation 2
+    mod.bindSessionDelivery(SESSION, freshPi, { manager, stableSend: recordingStableSend(freshPi) });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(piCalls(freshPi).length, 1, "generation 2 received the pending delivery");
+    assert.equal(run.pendingDelivery, undefined);
+  });
+
+  it("ignores late ACK if the endpoint generation has changed", async () => {
+    let resolveSend: (() => void) | undefined;
+    const pi = createMockPi();
+    const run = makeRun();
+    const manager = createMockManager(run);
+
+    setup(pi, manager, SESSION, {
+      stableSend: () =>
+        new Promise<void>((resolve) => {
+          resolveSend = resolve;
+        }),
+    });
+    manager.emit("complete", { runId: "test-run-1" });
+    await Promise.resolve();
+    const deliveryId = run.pendingDelivery?.deliveryId;
+    assert.ok(deliveryId);
+
+    // Rebind session (bumps endpoint generation)
+    mod.bindSessionDelivery(SESSION, pi, { manager, stableSend: () => Promise.resolve() });
+
+    // Old send resolves late
+    resolveSend?.();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // The stale send resolution must not have cleared the pending marker
+    assert.equal(run.pendingDelivery?.deliveryId, deliveryId, "stale generation send cannot ACK");
   });
 
   it("never silently drops pending deliveries when the queue grows past the soft cap", () => {

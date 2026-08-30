@@ -6,6 +6,7 @@
  *    conversation so the paused task continues with the outcome.
  */
 
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import {
   AgentSession,
@@ -166,10 +167,14 @@ function deliveredMaxChars(opts: { loadSettings?: () => WorkflowSettings }): num
  * and never ACK on a durable append (that writes history without triggerTurn).
  */
 
-type DeliverySend = (
-  message: { customType: string; content: string; display: boolean },
-  options: { triggerTurn: boolean; deliverAs: "followUp" },
-) => unknown;
+type DeliveryMessage = {
+  customType: string;
+  content: string;
+  display: boolean;
+  details?: { deliveryId?: string };
+};
+
+type DeliverySend = (message: DeliveryMessage, options: { triggerTurn: boolean; deliverAs: "followUp" }) => unknown;
 
 interface SessionDeliveryEndpoint {
   sessionId: string;
@@ -206,9 +211,32 @@ const sessionEndpoints = new Map<string, SessionDeliveryEndpoint>();
  */
 const boundSessionSends = new Map<string, DeliverySend>();
 
-/** runId → token of the deliver-and-ack that owns the lock, so bind flush does not double-send. Ownership prevents a stale finally from releasing a newer send's lock. */
-const inFlightDeliveries = new Map<string, number>();
+type InFlightDelivery = { token: number; sessionId: string };
+
+/** Ownership-token locks prevent stale promise chains from releasing newer sends. */
+const inFlightDeliveries = new Map<string, InFlightDelivery>();
 let inFlightSeq = 0;
+
+const DEFAULT_STREAMING_ACK_TIMEOUT_MS = 60_000;
+let streamingAckTimeoutMs = DEFAULT_STREAMING_ACK_TIMEOUT_MS;
+
+interface ActiveStreamingWaiter {
+  sessionId: string;
+  deliveryId: string;
+  cancel: (error: Error) => void;
+}
+const activeStreamingWaiters = new Set<ActiveStreamingWaiter>();
+
+const DELIVERY_RETRY_DELAYS_MS = [250, 1_000, 4_000] as const;
+type DeliveryRetry = {
+  attempt: number;
+  generation: number;
+  sessionId: string;
+  timer?: ReturnType<typeof setTimeout>;
+};
+const deliveryRetries = new Map<string, DeliveryRetry>();
+/** ACKed messages whose pending marker still needs to be cleared durably. */
+const deliveredAwaitingClear = new Map<string, { deliveryId: string; sessionId: string; generation: number }>();
 
 /**
  * Custom type for the session bind probe (see probeHostSessionSend). Sent
@@ -256,10 +284,23 @@ let bindCoreObserved = false;
 
 interface StealCandidate {
   sendCustomMessage?: DeliverySend;
+  isStreaming?: boolean;
+  agent?: {
+    hasQueuedMessages?: () => boolean;
+  };
+  subscribe?: (
+    listener: (event: {
+      type?: string;
+      message?: { role?: string; customType?: string; details?: unknown };
+      followUp?: readonly unknown[];
+      steering?: readonly unknown[];
+    }) => void,
+  ) => () => void;
   sessionManager?: {
     persist?: boolean;
     getSessionId?: () => string;
     getSessionName?: () => string | undefined;
+    getEntries?: () => Array<{ type?: string; customType?: string; details?: unknown }>;
     isPersisted?: () => boolean;
     isSessionOnDisk?: () => boolean;
   };
@@ -304,10 +345,135 @@ function hostSessionIdToSteal(session: StealCandidate, probe?: boolean): string 
   return sid;
 }
 
+function deliveryIdFromDetails(details: unknown): string | undefined {
+  if (!details || typeof details !== "object") return undefined;
+  const deliveryId = (details as { deliveryId?: unknown }).deliveryId;
+  return typeof deliveryId === "string" && deliveryId ? deliveryId : undefined;
+}
+
+function sessionHasDelivery(session: StealCandidate, deliveryId: string): boolean | undefined {
+  if (typeof session.sessionManager?.getEntries !== "function") return undefined;
+  try {
+    return session.sessionManager
+      .getEntries()
+      .some(
+        (entry) =>
+          entry.type === "custom_message" &&
+          entry.customType === "workflow-result" &&
+          deliveryIdFromDetails(entry.details) === deliveryId,
+      );
+  } catch {
+    return undefined;
+  }
+}
+
 function captureHostSessionSend(session: StealCandidate, probe?: boolean): void {
   const sid = hostSessionIdToSteal(session, probe);
-  if (!sid) return;
-  boundSessionSends.set(sid, (message, options) => session.sendCustomMessage?.(message, options));
+  const send = session.sendCustomMessage;
+  if (!sid || typeof send !== "function") return;
+
+  boundSessionSends.set(sid, (message, options) => {
+    const deliveryId = deliveryIdFromDetails(message.details);
+    if (deliveryId && sessionHasDelivery(session, deliveryId) === true) return Promise.resolve();
+
+    // An idle triggerTurn send resolves only after the message has been appended
+    // and its turn has settled. A streaming follow-up resolves immediately after
+    // queueing, so wait for the matching message_end instead; replacement can
+    // otherwise discard the queue after we have already cleared pendingDelivery.
+    if (!deliveryId || !session.isStreaming || typeof session.subscribe !== "function") {
+      return send.call(session, message, options);
+    }
+
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let unsubscribe = () => {};
+      let timer: ReturnType<typeof setTimeout> | undefined;
+
+      const finish = (error?: unknown) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        activeStreamingWaiters.delete(waiterRecord);
+        unsubscribe();
+        if (error) reject(error);
+        else resolve();
+      };
+
+      const waiterRecord: ActiveStreamingWaiter = {
+        sessionId: sid,
+        deliveryId,
+        cancel: (err) => finish(err),
+      };
+      activeStreamingWaiters.add(waiterRecord);
+
+      if (streamingAckTimeoutMs > 0) {
+        timer = setTimeout(() => {
+          queueMicrotask(() => {
+            if (settled) return;
+            if (sessionHasDelivery(session, deliveryId) === true) finish();
+            else finish(new Error("timed out waiting for follow-up message_end"));
+          });
+        }, streamingAckTimeoutMs);
+        timer.unref?.();
+      }
+
+      unsubscribe =
+        session.subscribe?.((event) => {
+          if (
+            event.type === "message_end" &&
+            event.message?.role === "custom" &&
+            event.message.customType === "workflow-result" &&
+            deliveryIdFromDetails(event.message.details) === deliveryId
+          ) {
+            // AgentSession persists a custom message immediately after message_end
+            // listeners run. Check on the next microtask so the ACK is durable.
+            queueMicrotask(() => {
+              if (settled) return;
+              const persisted = sessionHasDelivery(session, deliveryId);
+              if (persisted === true) finish();
+              else finish(new Error("workflow result was not persisted after message_end"));
+            });
+            return;
+          }
+
+          // If the agent run ended without persisting the follow-up, it cannot land.
+          if (event.type === "agent_end" || event.type === "agent_settled") {
+            queueMicrotask(() => {
+              if (settled) return;
+              if (sessionHasDelivery(session, deliveryId) === true) finish();
+              else finish(new Error(`agent turn ended without delivering follow-up (${event.type})`));
+            });
+            return;
+          }
+
+          if (event.type === "queue_update") {
+            const followUp = (event as { followUp?: unknown[] }).followUp;
+            const queueEmptied =
+              followUp === undefined ||
+              (Array.isArray(followUp) && followUp.length === 0) ||
+              (typeof session.agent?.hasQueuedMessages === "function" && !session.agent.hasQueuedMessages());
+            if (queueEmptied) {
+              queueMicrotask(() => {
+                if (settled) return;
+                if (sessionHasDelivery(session, deliveryId) === true) finish();
+                else finish(new Error("follow-up discarded from queue (queue_update)"));
+              });
+            }
+          }
+        }) ?? (() => {});
+
+      try {
+        const queued = send.call(session, message, options);
+        if (queued == null || typeof (queued as { then?: unknown }).then !== "function") {
+          finish(new Error("workflow result send did not return a thenable"));
+          return;
+        }
+        Promise.resolve(queued).catch(finish);
+      } catch (error) {
+        finish(error);
+      }
+    });
+  });
 }
 
 /**
@@ -419,43 +585,66 @@ function resolveDeliverySessionId(run: ManagedRun, manager: WorkflowManager): st
   return run.sessionId ?? manager.getSessionId?.();
 }
 
-function markRunPending(run: ManagedRun, marker: PendingDeliveryMarker): void {
-  run.pendingDelivery = marker;
+function sameDelivery(a: PendingDeliveryMarker | undefined, b: PendingDeliveryMarker): boolean {
+  return a?.kind === b.kind && (a.kind !== "text" || (b.kind === "text" && a.text === b.text));
 }
 
-function clearRunPending(manager: WorkflowManager, runId: string, run?: ManagedRun): void {
-  if (run?.pendingDelivery) {
-    run.pendingDelivery = undefined;
-  }
-  // Also clear on disk for runs already written / evicted from memory. Best-effort:
-  // a missing persistence layer (unit tests) is fine — memory clear is enough.
+function markerWithId(marker: PendingDeliveryMarker, existing?: PendingDeliveryMarker): PendingDeliveryMarker {
+  const deliveryId = sameDelivery(existing, marker) ? existing?.deliveryId : undefined;
+  return { ...marker, deliveryId: deliveryId ?? marker.deliveryId ?? randomUUID() };
+}
+
+function markRunPending(run: ManagedRun, marker: PendingDeliveryMarker): PendingDeliveryMarker {
+  const identified = markerWithId(marker, run.pendingDelivery);
+  if (run.pendingDelivery?.deliveryId !== identified.deliveryId) deliveredAwaitingClear.delete(run.runId);
+  run.pendingDelivery = identified;
+  return identified;
+}
+
+type ClearPendingResult = "cleared" | "stale" | "failed";
+
+function clearRunPending(
+  manager: WorkflowManager,
+  runId: string,
+  deliveryId: string,
+  run?: ManagedRun,
+): ClearPendingResult {
+  // Clear disk first. If that fails, retain the live marker so the delivered
+  // message remains visible to the bounded clear retry instead of being lost.
   try {
-    const persistence = manager.getPersistence?.();
-    if (!persistence) return;
-    const state = persistence.load(runId);
-    if (!state?.pendingDelivery) return;
-    const { pendingDelivery: _drop, ...rest } = state;
-    persistence.save(rest as PersistedRunState);
-    // If the live run still exists, keep it aligned without a full persistRace.
     const live = run ?? manager.getRun(runId);
+    if (live?.pendingDelivery?.deliveryId && live.pendingDelivery.deliveryId !== deliveryId) return "stale";
+
+    const persistence = manager.getPersistence?.();
+    if (persistence) {
+      const state = persistence.load(runId);
+      if (!state) throw new Error("persisted run disappeared before delivery ACK");
+      if (state.pendingDelivery?.deliveryId && state.pendingDelivery.deliveryId !== deliveryId) return "stale";
+      if (state.pendingDelivery) {
+        const { pendingDelivery: _drop, ...rest } = state;
+        persistence.save(rest as PersistedRunState);
+      }
+    }
     if (live) live.pendingDelivery = undefined;
-  } catch {
-    // ignore persistence errors — conversation delivery already succeeded
+    return "cleared";
+  } catch (error) {
+    console.warn(`[workflow-delivery] failed to clear pending marker for ${runId}:`, error);
+    return "failed";
   }
 }
 
-function persistRunPendingBestEffort(manager: WorkflowManager, run: ManagedRun): void {
+function persistRunPending(manager: WorkflowManager, run: ManagedRun): boolean {
   try {
     // Prefer merging into an existing on-disk record so we don't clobber the
     // manager's richer write that follows the complete/error emit. When no
     // record exists yet (complete fires before manager.persistRun), seed a
     // minimal marker-bearing record; the subsequent manager write overwrites.
     const persistence = manager.getPersistence?.();
-    if (!persistence) return;
+    if (!persistence) return true;
     const existing = persistence.load(run.runId);
     if (existing) {
       persistence.save({ ...existing, pendingDelivery: run.pendingDelivery, sessionId: run.sessionId });
-      return;
+      return true;
     }
     if (run.pendingDelivery) {
       persistence.save({
@@ -475,8 +664,10 @@ function persistRunPendingBestEffort(manager: WorkflowManager, run: ManagedRun):
         pendingDelivery: run.pendingDelivery,
       });
     }
-  } catch {
-    // best-effort
+    return true;
+  } catch (error) {
+    console.warn(`[workflow-delivery] failed to persist pending marker for ${run.runId}:`, error);
+    return false;
   }
 }
 
@@ -522,7 +713,7 @@ function contentForPending(
  * fire-and-forget sends and durable appends are NOT success (append writes
  * history without triggerTurn). Does not clear pending markers.
  */
-function tryDeliverEndpoint(endpoint: SessionDeliveryEndpoint, content: string): Promise<boolean> {
+function tryDeliverEndpoint(endpoint: SessionDeliveryEndpoint, content: string, deliveryId: string): Promise<boolean> {
   if (endpoint.suspended) return Promise.resolve(false);
   if (endpoint.sessionId && sessionEndpoints.get(endpoint.sessionId) !== endpoint) {
     // Stale endpoint object after rebind/drop.
@@ -533,7 +724,7 @@ function tryDeliverEndpoint(endpoint: SessionDeliveryEndpoint, content: string):
   if (typeof endpoint.send === "function") {
     try {
       const ret = endpoint.send(
-        { customType: "workflow-result", content, display: true },
+        { customType: "workflow-result", content, display: true, details: { deliveryId } },
         { triggerTurn: true, deliverAs: "followUp" },
       );
       if (ret != null && typeof (ret as { then?: unknown }).then === "function") {
@@ -572,45 +763,117 @@ function tryDeliverEndpoint(endpoint: SessionDeliveryEndpoint, content: string):
   return Promise.resolve(false);
 }
 
+function cancelDeliveryRetry(runId: string): void {
+  const retry = deliveryRetries.get(runId);
+  if (retry?.timer) clearTimeout(retry.timer);
+  deliveryRetries.delete(runId);
+}
+
+function cancelSessionDeliveryState(sessionId: string): void {
+  for (const [runId, retry] of deliveryRetries) {
+    if (retry.sessionId === sessionId) cancelDeliveryRetry(runId);
+  }
+  for (const [runId, delivered] of deliveredAwaitingClear) {
+    if (delivered.sessionId === sessionId) deliveredAwaitingClear.delete(runId);
+  }
+}
+
+function scheduleDeliveryRetry(manager: WorkflowManager, runId: string, sessionId: string, generation: number): void {
+  const current = deliveryRetries.get(runId);
+  if (current?.timer && current.generation === generation) return;
+  const attempt = current?.generation === generation ? current.attempt : 0;
+  if (attempt >= DELIVERY_RETRY_DELAYS_MS.length) {
+    console.warn(`[workflow-delivery] delivery for ${runId} remains pending after retries`);
+    return;
+  }
+
+  const retry: DeliveryRetry = { attempt: attempt + 1, generation, sessionId };
+  retry.timer = setTimeout(() => {
+    retry.timer = undefined;
+    if (deliveryRetries.get(runId) !== retry) return;
+    const endpoint = sessionEndpoints.get(sessionId);
+    if (!endpoint || endpoint.suspended || endpoint.generation !== generation) return;
+    flushSessionDiskPending(manager, sessionId, endpoint);
+  }, DELIVERY_RETRY_DELAYS_MS[attempt]);
+  retry.timer.unref?.();
+  deliveryRetries.set(runId, retry);
+}
+
+function releaseDelivery(runId: string, token: number): void {
+  if (inFlightDeliveries.get(runId)?.token === token) inFlightDeliveries.delete(runId);
+}
+
 function deliverAndAck(
   manager: WorkflowManager,
   runId: string,
   sessionId: string,
   content: string,
+  deliveryId: string,
   run?: ManagedRun,
 ): void {
   if (inFlightDeliveries.has(runId)) return;
   const endpoint = sessionEndpoints.get(sessionId);
   if (!endpoint || endpoint.suspended || endpoint.sessionId !== sessionId) return;
+
+  const delivered = deliveredAwaitingClear.get(runId);
+  if (
+    delivered?.deliveryId === deliveryId &&
+    delivered.sessionId === sessionId &&
+    delivered.generation === endpoint.generation
+  ) {
+    const clear = clearRunPending(manager, runId, deliveryId, run ?? manager.getRun?.(runId));
+    if (clear !== "failed") {
+      deliveredAwaitingClear.delete(runId);
+      cancelDeliveryRetry(runId);
+    } else {
+      scheduleDeliveryRetry(manager, runId, sessionId, endpoint.generation);
+    }
+    return;
+  }
+
   // Fail-closed (no send): keep the run pending on disk with NO lock, so a
   // synchronous re-bind + flush (e.g. probe retry on the next session_start)
   // is not locked out by a microtask that has not run yet.
   if (typeof endpoint.send !== "function") return;
-  // Ownership token: a stale finally (from a superseded send) must never
-  // release the lock held by a newer delivery — that would let a third
-  // caller double-deliver the same result mid-flight.
-  const lockToken = ++inFlightSeq;
-  inFlightDeliveries.set(runId, lockToken);
+
+  const token = ++inFlightSeq;
+  inFlightDeliveries.set(runId, { token, sessionId });
   const startedGeneration = endpoint.generation;
-  const release = () => {
-    if (inFlightDeliveries.get(runId) === lockToken) inFlightDeliveries.delete(runId);
-  };
-  void tryDeliverEndpoint(endpoint, content)
+  void tryDeliverEndpoint(endpoint, content, deliveryId)
     .then((ok) => {
       if (ok) {
-        clearRunPending(manager, runId, run ?? manager.getRun?.(runId));
+        cancelDeliveryRetry(runId);
+        const current = sessionEndpoints.get(sessionId);
+        if (!current || current.suspended || current.generation !== startedGeneration || current !== endpoint) {
+          return;
+        }
+        const clear = clearRunPending(manager, runId, deliveryId, run ?? manager.getRun?.(runId));
+        if (clear === "failed") {
+          deliveredAwaitingClear.set(runId, { deliveryId, sessionId, generation: startedGeneration });
+          scheduleDeliveryRetry(manager, runId, sessionId, startedGeneration);
+        } else if (clear === "stale") {
+          // This send belonged to an older marker. Release before flushing the
+          // newer delivery, and let the ownership token protect its lock.
+          releaseDelivery(runId, token);
+          const active = sessionEndpoints.get(sessionId);
+          if (active && !active.suspended && active.manager) {
+            flushSessionDiskPending(active.manager, sessionId, active);
+          }
+        }
         return;
       }
-      // Release the in-flight lock before a generation-change retry so flush
-      // can actually pick this run back up. If the retry re-arms the lock with
-      // a new token before this handler's release runs, the release is a no-op.
-      release();
+
+      releaseDelivery(runId, token);
       const current = sessionEndpoints.get(sessionId);
-      if (current && !current.suspended && current.generation !== startedGeneration && current.manager) {
+      if (!current || current.suspended || !current.manager) return;
+      if (current.generation !== startedGeneration) {
+        cancelDeliveryRetry(runId);
         flushSessionDiskPending(current.manager, sessionId, current);
+      } else {
+        scheduleDeliveryRetry(manager, runId, sessionId, startedGeneration);
       }
     })
-    .finally(release);
+    .finally(() => releaseDelivery(runId, token));
 }
 
 function routeBackgroundDelivery(
@@ -619,9 +882,12 @@ function routeBackgroundDelivery(
   marker: PendingDeliveryMarker,
   content: string,
 ): void {
-  // 1. Mark pending first (fail closed / crash safe).
-  markRunPending(run, marker);
-  persistRunPendingBestEffort(manager, run);
+  // 1. Mark pending first (fail closed / crash safe). Repeated lifecycle
+  // events reuse the same id so host-session history can deduplicate retries.
+  const pending = markRunPending(run, marker);
+  const deliveryId = pending.deliveryId;
+  if (!deliveryId) return;
+  const persisted = persistRunPending(manager, run);
 
   const sessionId = resolveDeliverySessionId(run, manager);
   if (!sessionId) {
@@ -629,8 +895,16 @@ function routeBackgroundDelivery(
     return;
   }
 
+  if (!persisted) {
+    const endpoint = sessionEndpoints.get(sessionId);
+    if (endpoint && !endpoint.suspended) {
+      scheduleDeliveryRetry(manager, run.runId, sessionId, endpoint.generation);
+    }
+    return;
+  }
+
   // 2. Deliver only via the originating session's endpoint; clear after ACK.
-  deliverAndAck(manager, run.runId, sessionId, content, run);
+  deliverAndAck(manager, run.runId, sessionId, content, deliveryId, run);
 }
 
 /**
@@ -722,6 +996,25 @@ export function suspendSessionDelivery(sessionId: string | undefined): void {
   if (!sessionId) return;
   const endpoint = sessionEndpoints.get(sessionId);
   if (endpoint) endpoint.suspended = true;
+
+  // Cancel any active streaming waiters for this session so zombie waiters
+  // cannot ACK a later generation that reused the same deliveryId.
+  for (const waiter of activeStreamingWaiters) {
+    if (waiter.sessionId === sessionId) {
+      waiter.cancel(new Error("session delivery suspended"));
+    }
+  }
+
+  // A streaming follow-up ACK may still be waiting for message_end. Replacement
+  // can discard that queue, so release only this session's ownership-token locks;
+  // stale promise chains cannot release a newer generation's lock.
+  for (const [runId, inFlight] of inFlightDeliveries) {
+    if (inFlight.sessionId !== sessionId) continue;
+    inFlightDeliveries.delete(runId);
+  }
+  for (const [runId, retry] of deliveryRetries) {
+    if (retry.sessionId === sessionId) cancelDeliveryRetry(runId);
+  }
 }
 
 /**
@@ -731,6 +1024,8 @@ export function suspendSessionDelivery(sessionId: string | undefined): void {
  */
 export function dropSessionDelivery(sessionId: string | undefined): void {
   if (!sessionId) return;
+  suspendSessionDelivery(sessionId);
+  cancelSessionDeliveryState(sessionId);
   sessionEndpoints.delete(sessionId);
   boundSessionSends.delete(sessionId);
   // A dropped session may be rebound fresh (e.g. replaced id): forget probe
@@ -756,9 +1051,28 @@ function flushSessionDiskPending(manager: WorkflowManager, sessionId: string, en
 
   const tryOne = (runId: string, marker: PendingDeliveryMarker, run?: ManagedRun, persisted?: PersistedRunState) => {
     if (inFlightDeliveries.has(runId)) return;
-    const content = contentForPending(manager, runId, marker, endpoint.loadSettings, run, persisted);
+    let identified = marker;
+    if (!identified.deliveryId) {
+      identified = markerWithId(marker);
+      if (run) run.pendingDelivery = identified;
+      try {
+        const persistence = manager.getPersistence?.();
+        const state = persisted ?? persistence?.load(runId);
+        if (persistence && state) persistence.save({ ...state, pendingDelivery: identified });
+      } catch (error) {
+        console.warn(`[workflow-delivery] failed to assign delivery id for ${runId}:`, error);
+        return;
+      }
+    }
+    const deliveryId = identified.deliveryId;
+    if (!deliveryId) return;
+    if (run && !persistRunPending(manager, run)) {
+      scheduleDeliveryRetry(manager, runId, sessionId, endpoint.generation);
+      return;
+    }
+    const content = contentForPending(manager, runId, identified, endpoint.loadSettings, run, persisted);
     if (content === undefined) return;
-    deliverAndAck(manager, runId, sessionId, content, run);
+    deliverAndAck(manager, runId, sessionId, content, deliveryId, run);
   };
 
   // Live in-memory runs for this session. Null sessionId is claimable only for
@@ -938,10 +1252,23 @@ export function installResultDelivery(
 
 /** @internal test helper — reset process-wide delivery registries between cases. */
 export function _resetDeliveryRegistriesForTests(): void {
+  for (const waiter of activeStreamingWaiters) {
+    waiter.cancel(new Error("test reset"));
+  }
+  activeStreamingWaiters.clear();
+  streamingAckTimeoutMs = DEFAULT_STREAMING_ACK_TIMEOUT_MS;
   sessionEndpoints.clear();
   boundSessionSends.clear();
   inFlightDeliveries.clear();
+  for (const retry of deliveryRetries.values()) if (retry.timer) clearTimeout(retry.timer);
+  deliveryRetries.clear();
+  deliveredAwaitingClear.clear();
+  inFlightSeq = 0;
   probedSessionIds.clear();
+}
+
+export function _setStreamingAckTimeoutForTests(timeoutMs: number): void {
+  streamingAckTimeoutMs = timeoutMs;
 }
 
 /** @internal test helper — register a thenable session-stable send (steal map). */
