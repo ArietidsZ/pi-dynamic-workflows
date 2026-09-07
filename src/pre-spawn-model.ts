@@ -1,4 +1,5 @@
 import { WorkflowError, WorkflowErrorCode } from "./errors.js";
+import type { ModelThinkingLevel } from "./model-spec.js";
 
 /**
  * How DW arrived at the model intent for this agent, before a host policy runs.
@@ -14,6 +15,8 @@ export type ModelSource = "explicit" | "tier" | "phase" | "default" | "session";
 /** Minimal fields a host policy needs to decide. No session/history. */
 export interface PreSpawnModelContext {
   requestedModel?: string;
+  /** Separate caller/agent-type option; a selected model's suffix takes precedence. */
+  requestedThinking?: ModelThinkingLevel;
   tier?: string;
   resolvedModel?: string;
   modelSource: ModelSource;

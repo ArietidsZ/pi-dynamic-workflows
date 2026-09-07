@@ -1,9 +1,22 @@
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import { WorkflowError, WorkflowErrorCode } from "./errors.js";
 
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 export type ModelThinkingLevel = (typeof THINKING_LEVELS)[number];
+
+/** Validate the separate script/SDK option without changing model-id parsing. */
+export function validateThinkingLevel(value: unknown): asserts value is ModelThinkingLevel | undefined {
+  if (value === undefined) return;
+  if (typeof value !== "string" || !(THINKING_LEVELS as readonly string[]).includes(value)) {
+    throw new WorkflowError(
+      `agent thinking must be one of: ${THINKING_LEVELS.join(", ")}`,
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false },
+    );
+  }
+}
 
 export interface ResolvedModelSpec {
   requestedSpec: string;

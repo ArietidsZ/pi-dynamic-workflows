@@ -178,6 +178,9 @@ const AGENT_OPTIONS: OptionShape = {
     option("phase", "string", true, "current phase"),
     option("schema", "plain JSON Schema", true),
     option("model", "string", true, null, ["highest-priority exact model selector"]),
+    option("thinking", '"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"', true, null, [
+      "call-site value overrides agentType thinking; selected model suffix takes precedence; invalid values fail before dispatch",
+    ]),
     option("tier", "string", true, null, ["configured route name"], "model-routes"),
     option("isolation", '"worktree" | false', true),
     option("keepWorktree", "boolean", true, "true"),
