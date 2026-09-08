@@ -569,6 +569,7 @@ export interface WorkflowLifecycleEvent {
 
 type DeliveryManager = WorkflowManager & {
   __deliveryInstalled?: boolean;
+  __deliveryTurnEndInstalled?: boolean;
   __lifecycleEventInstalled?: boolean;
   __lifecycleEventEmitter?: (data: WorkflowLifecycleEvent) => void;
   /** Last loadSettings seen on install — used when binding endpoints. */
@@ -813,7 +814,20 @@ function deliverAndAck(
 ): void {
   if (inFlightDeliveries.has(runId)) return;
   const endpoint = sessionEndpoints.get(sessionId);
-  if (!endpoint || endpoint.suspended || endpoint.sessionId !== sessionId) return;
+  if (!endpoint) {
+    console.warn(`[workflow-delivery] delivery for ${runId} deferred: missing endpoint for session ${sessionId}`);
+    return;
+  }
+  if (endpoint.suspended) {
+    console.warn(`[workflow-delivery] delivery for ${runId} deferred: endpoint for session ${sessionId} is suspended`);
+    return;
+  }
+  if (endpoint.sessionId !== sessionId) {
+    console.warn(
+      `[workflow-delivery] delivery for ${runId} deferred: endpoint sessionId ${endpoint.sessionId} !== ${sessionId}`,
+    );
+    return;
+  }
 
   const delivered = deliveredAwaitingClear.get(runId);
   if (
@@ -834,7 +848,12 @@ function deliverAndAck(
   // Fail-closed (no send): keep the run pending on disk with NO lock, so a
   // synchronous re-bind + flush (e.g. probe retry on the next session_start)
   // is not locked out by a microtask that has not run yet.
-  if (typeof endpoint.send !== "function") return;
+  if (typeof endpoint.send !== "function") {
+    console.warn(
+      `[workflow-delivery] delivery for ${runId} deferred: endpoint for session ${sessionId} has no thenable send function`,
+    );
+    return;
+  }
 
   const token = ++inFlightSeq;
   inFlightDeliveries.set(runId, { token, sessionId });
@@ -896,6 +915,7 @@ function routeBackgroundDelivery(
   }
 
   if (!persisted) {
+    console.warn(`[workflow-delivery] delivery for ${run.runId} deferred: marker could not be persisted`);
     const endpoint = sessionEndpoints.get(sessionId);
     if (endpoint && !endpoint.suspended) {
       scheduleDeliveryRetry(manager, run.runId, sessionId, endpoint.generation);
@@ -1181,6 +1201,37 @@ export function installResultDelivery(
     manager.on("stopped", emitLifecycle("stopped"));
   }
 
+  if (!m.__deliveryTurnEndInstalled) {
+    m.__deliveryTurnEndInstalled = true;
+    pi.on?.("turn_end", (_event: unknown, ctx?: { sessionManager?: { getSessionId?: () => string } }) => {
+      let sid: string | undefined;
+      try {
+        sid = ctx?.sessionManager?.getSessionId?.() ?? manager.getSessionId?.();
+      } catch {
+        sid = manager.getSessionId?.();
+      }
+      if (!sid) return;
+
+      let endpoint = sessionEndpoints.get(sid);
+      if (!endpoint || typeof endpoint.send !== "function") {
+        probeHostSessionSend(pi, sid);
+        const stolen = boundSessionSends.get(sid);
+        if (stolen) {
+          bindSessionDelivery(sid, pi, {
+            loadSettings: opts.loadSettings ?? m.__deliveryLoadSettings,
+            manager,
+            sessionManager: ctx?.sessionManager,
+          });
+          endpoint = sessionEndpoints.get(sid);
+        }
+      }
+
+      if (endpoint && !endpoint.suspended && endpoint.manager) {
+        flushSessionDiskPending(endpoint.manager, sid, endpoint);
+      }
+    });
+  }
+
   if (m.__deliveryInstalled) {
     // Listeners survive session replacement. Refresh loadSettings / manager
     // pointers only — do NOT mutate send, generation, or suspended here.
@@ -1309,7 +1360,8 @@ export function _getSessionDeliveryEndpointForTests(
 export function renderPanel(manager: WorkflowManager, theme: Theme, width?: number): string[] {
   const all = manager.listRuns();
   const active = all.filter((r) => r.status === "running" || r.status === "paused");
-  if (!active.length) return [];
+  const pending = all.filter((r) => r.status !== "running" && r.status !== "paused" && r.pendingDelivery);
+  if (!active.length && !pending.length) return [];
   const rows = active.map((r) => {
     const live = manager.getRun(r.runId);
     const agents = live?.snapshot.agents ?? r.agents;
@@ -1318,16 +1370,20 @@ export function renderPanel(manager: WorkflowManager, theme: Theme, width?: numb
     const phase = live?.snapshot.currentPhase ? ` · ${live.snapshot.currentPhase}` : "";
     return `  ${icon} ${r.workflowName}  ${done}/${agents.length} agents${phase}`;
   });
+  const pendingRows = pending.map((r) => `  ⏳ ${r.workflowName}  Completed, result delivery pending`);
   // Finished runs leave this live panel but are kept in the navigator. Tell the
   // user so a completed run doesn't look like it vanished.
-  const finished = all.filter((r) => r.status !== "running" && r.status !== "paused").length;
+  const finished = all.filter((r) => r.status !== "running" && r.status !== "paused" && !r.pendingDelivery).length;
   const hint = theme.fg(
     "dim",
     finished > 0
       ? `  /workflows — open navigator (${finished} finished kept in history)`
       : "  /workflows — open navigator",
   );
-  return [theme.bold(`Workflows running (${active.length}):`), ...rows, hint].map((line) => fitLine(line, width));
+  const header = active.length
+    ? theme.bold(`Workflows running (${active.length}):`)
+    : theme.bold(`Workflows pending delivery (${pending.length}):`);
+  return [header, ...rows, ...pendingRows, hint].map((line) => fitLine(line, width));
 }
 
 // ─── Detailed mode: live token rate ────────────────────────────────────────────
@@ -1448,9 +1504,13 @@ export function renderPanelDetailed(
 ): string[] {
   const all = manager.listRuns();
   const active = all.filter((r) => r.status === "running" || r.status === "paused");
-  if (!active.length) return [];
+  const pending = all.filter((r) => r.status !== "running" && r.status !== "paused" && r.pendingDelivery);
+  if (!active.length && !pending.length) return [];
   const dim = (t: string) => theme.fg("dim", t);
-  const out: string[] = [theme.bold(`Workflows running (${active.length}):`)];
+  const header = active.length
+    ? theme.bold(`Workflows running (${active.length}):`)
+    : theme.bold(`Workflows pending delivery (${pending.length}):`);
+  const out: string[] = [header];
 
   for (const r of active) {
     const live = manager.getRun(r.runId);
@@ -1480,7 +1540,11 @@ export function renderPanelDetailed(
     if (snap) out.push(...renderRunBody(snap, agents, maxAgents, theme));
   }
 
-  const finished = all.filter((r) => r.status !== "running" && r.status !== "paused").length;
+  for (const r of pending) {
+    out.push(`  ⏳ ${theme.bold(r.workflowName)}  ${dim("Completed, result delivery pending")}`);
+  }
+
+  const finished = all.filter((r) => r.status !== "running" && r.status !== "paused" && !r.pendingDelivery).length;
   out.push(
     dim(
       finished > 0

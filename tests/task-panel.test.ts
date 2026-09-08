@@ -304,9 +304,13 @@ describe("installResultDelivery", () => {
     return manager;
   }
 
-  function createMockPi(): ExtensionAPI & { _calls: DeliveryCall[] } {
+  function createMockPi(): ExtensionAPI & {
+    _calls: DeliveryCall[];
+    emit?: (event: string, ...args: unknown[]) => void;
+  } {
     const calls: DeliveryCall[] = [];
     const events = new EventEmitter();
+    const handlers = new Map<string, Array<(...args: unknown[]) => void>>();
     const obj = {
       events: {
         emit: (channel: string, data: unknown) => events.emit(channel, data),
@@ -322,13 +326,29 @@ describe("installResultDelivery", () => {
         });
       },
       registerTool: () => {},
-      on: () => {},
+      on: (event: string, handler: (...args: unknown[]) => void) => {
+        const list = handlers.get(event) ?? [];
+        list.push(handler);
+        handlers.set(event, list);
+        return () => {
+          const idx = list.indexOf(handler);
+          if (idx !== -1) list.splice(idx, 1);
+        };
+      },
+      emit: (event: string, ...args: unknown[]) => {
+        for (const handler of handlers.get(event) ?? []) {
+          handler(...args);
+        }
+      },
       getActiveTools: () => [],
       setActiveTools: () => {},
       reload: () => Promise.resolve(),
       _calls: calls,
     };
-    return obj as unknown as ExtensionAPI & { _calls: DeliveryCall[] };
+    return obj as unknown as ExtensionAPI & {
+      _calls: DeliveryCall[];
+      emit?: (event: string, ...args: unknown[]) => void;
+    };
   }
 
   /** Session-stable thenable send that records like the old sendMessage spy. */
@@ -1448,6 +1468,38 @@ describe("installResultDelivery", () => {
 
     // The stale send resolution must not have cleared the pending marker
     assert.equal(run.pendingDelivery?.deliveryId, deliveryId, "stale generation send cannot ACK");
+  });
+
+  it("recovers and flushes pending delivery on turn_end when sender becomes available", async () => {
+    let sends = 0;
+    const pi = createMockPi();
+    const run = makeRun({ sessionId: SESSION });
+    const manager = createMockManager(run);
+    manager.setSessionId(SESSION);
+
+    // Initial install: endpoint has NO thenable send function (fail-closed)
+    mod.installResultDelivery(pi, manager);
+    mod.bindSessionDelivery(SESSION, pi, { manager });
+    manager.emit("complete", { runId: "test-run-1" });
+    await Promise.resolve();
+
+    assert.equal(sends, 0, "no send while sender is unavailable");
+    assert.ok(run.pendingDelivery, "delivery stays pending");
+
+    // Sender becomes available without session_start
+    const stableSend: StableSend = () => {
+      sends++;
+      return Promise.resolve();
+    };
+    mod._registerBoundSessionSendForTests(SESSION, stableSend);
+
+    // A normal conversation turn ends
+    pi.emit?.("turn_end", {}, { sessionManager: { getSessionId: () => SESSION } });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.equal(sends, 1, "pending delivery flushed on turn_end idle recovery");
+    assert.equal(run.pendingDelivery, undefined, "pending delivery cleared");
   });
 
   it("never silently drops pending deliveries when the queue grows past the soft cap", () => {
@@ -2842,6 +2894,26 @@ describe("renderPanel", () => {
     assert.deepEqual(renderPanel(manager as never, theme as never), []);
   });
 
+  it("renders pending delivery row when a completed run has pendingDelivery", async () => {
+    const { renderPanel } = await import("../src/task-panel.js");
+    const manager = {
+      listRuns: () => [
+        {
+          runId: "p",
+          workflowName: "pending-run",
+          status: "completed",
+          pendingDelivery: { kind: "complete" },
+          agents: [],
+          logs: [],
+        },
+      ],
+      getRun: () => undefined,
+    };
+    const lines = renderPanel(manager as never, theme as never);
+    assert.ok(lines.some((l) => l.includes("Completed, result delivery pending")));
+    assert.ok(lines.some((l) => l.includes("Workflows pending delivery (1):")));
+  });
+
   it("truncates every rendered line to the requested visible width", async () => {
     const { renderPanel } = await import("../src/task-panel.js");
     const ansiTheme = {
@@ -3105,6 +3177,25 @@ describe("renderPanelDetailed", () => {
     renderPanelDetailed(detailedManager(1000, "paused") as never, theme as never, undefined, 8, 1000);
     const lines = renderPanelDetailed(detailedManager(3000, "paused") as never, theme as never, undefined, 8, 2000);
     assert.ok(!lines.some((l) => /tok\/s/.test(l)), "paused run shows no token rate");
+  });
+
+  it("renders pending delivery row in detailed mode", async () => {
+    const { renderPanelDetailed } = await import("../src/task-panel.js");
+    const manager = {
+      listRuns: () => [
+        {
+          runId: "p",
+          workflowName: "pending-run",
+          status: "completed",
+          pendingDelivery: { kind: "complete" },
+          agents: [],
+          logs: [],
+        },
+      ],
+      getRun: () => undefined,
+    };
+    const lines = renderPanelDetailed(manager as never, theme as never, undefined, 8, 1000);
+    assert.ok(lines.some((l) => l.includes("Completed, result delivery pending")));
   });
 });
 
