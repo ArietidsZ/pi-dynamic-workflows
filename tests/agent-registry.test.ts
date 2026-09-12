@@ -76,7 +76,6 @@ describe("parseAgentDefinition", () => {
     assert.equal(def.isolation, undefined);
   });
 
-
   it("parses thinking from frontmatter", () => {
     const def = parseAgentDefinition(
       "---\nname: reviewer\nmodel: cursor/claude-opus-5@1m\nthinking: max\n---\nBody.",
@@ -88,11 +87,7 @@ describe("parseAgentDefinition", () => {
   });
 
   it("ignores unknown thinking values", () => {
-    const def = parseAgentDefinition(
-      "---\nname: agent\nthinking: ultra\n---\nBody.",
-      "project",
-      "agent.md",
-    );
+    const def = parseAgentDefinition("---\nname: agent\nthinking: ultra\n---\nBody.", "project", "agent.md");
     assert.equal(def?.thinking, undefined);
   });
 });
@@ -359,6 +354,7 @@ describe("agentDefinitionKey", () => {
 function capturingAgent() {
   const seen: Array<{
     model?: string;
+    thinking?: string;
     tier?: string;
     toolNames?: string[];
     disallowedToolNames?: string[];
@@ -370,6 +366,7 @@ function capturingAgent() {
     async run(_prompt: string, options: Record<string, unknown>) {
       seen.push({
         model: options.model as string | undefined,
+        thinking: options.thinking as string | undefined,
         tier: options.tier as string | undefined,
         toolNames: options.toolNames as string[] | undefined,
         disallowedToolNames: options.disallowedToolNames as string[] | undefined,
@@ -420,6 +417,19 @@ await agent('audit', { label: 'a', agentType: 'security-auditor', model: 'explic
 return {}`;
     await runWorkflow(script, { agent: runner, persistLogs: false, agentRegistry: registry });
     assert.equal(seen[0].model, "explicit/model");
+  });
+
+  it("call-site thinking overrides agentType thinking", async () => {
+    const { seen, runner } = capturingAgent();
+    const thinkingRegistry: AgentRegistry = new Map([
+      ["thinker", { name: "thinker", prompt: "think", thinking: "low", source: "project" } as AgentDefinition],
+    ]);
+    await runWorkflow(
+      `export const meta = { name: 'thinking', description: 'precedence' }
+return await agent('audit', { agentType: 'thinker', thinking: 'high' })`,
+      { agent: runner, persistLogs: false, agentRegistry: thinkingRegistry },
+    );
+    assert.equal(seen[0]?.thinking, "high");
   });
 
   it("agentType model beats a tier (model passed, tier still forwarded)", async () => {

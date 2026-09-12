@@ -684,6 +684,55 @@ test("resume replays cached results without re-running agents", async () => {
   assert.equal(JSON.stringify(r2.result), JSON.stringify(r1.result));
 });
 
+test("script thinking is forwarded, validates before dispatch, and changes journal identity", async () => {
+  const journal: JournalEntry[] = [];
+  const seen: Array<string | undefined> = [];
+  const script = (thinking: string) => `export const meta = { name: 'thinking_identity', description: 'thinking' }
+return await agent('work', { thinking: '${thinking}' })`;
+  await runWorkflow(script("low"), {
+    persistLogs: false,
+    runId: "thinking-run",
+    onAgentJournal: (entry) => journal.push(entry),
+    agent: {
+      async run(_prompt, options) {
+        seen.push(options.thinking);
+        return "low";
+      },
+    },
+  });
+  await runWorkflow(script("high"), {
+    persistLogs: false,
+    runId: "thinking-run",
+    resumeJournal: new Map(journal.map((entry) => [`${entry.runId}:${entry.index}`, entry])),
+    agent: {
+      async run(_prompt, options) {
+        seen.push(options.thinking);
+        return "high";
+      },
+    },
+  });
+  assert.deepEqual(seen, ["low", "high"], "changed thinking must not replay the old journal result");
+
+  let calls = 0;
+  await assert.rejects(
+    runWorkflow(
+      `export const meta = { name: 'bad_thinking', description: 'bad' }
+return await agent('work', { thinking: 'ultra' })`,
+      {
+        persistLogs: false,
+        agent: {
+          async run() {
+            calls++;
+            return "unexpected";
+          },
+        },
+      },
+    ),
+    /thinking/i,
+  );
+  assert.equal(calls, 0, "invalid script thinking rejects before agent dispatch");
+});
+
 test("requested worktree isolation fails closed before starting a non-git agent", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-worktree-fail-closed-"));
   let runs = 0;
