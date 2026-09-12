@@ -182,6 +182,7 @@ const AGENT_OPTIONS: OptionShape = {
     option("isolation", '"worktree"', true),
     option("cwd", "string", true, null, [
       "non-empty absolute existing directory; resolved to its real path",
+      "coding tools and session cwd use the target directory; settings and AGENTS/skill resources also use it unless explicitly injected by the embedding host",
       "cannot combine with worktree isolation",
     ]),
     option("thread", "string", true, null, ["non-empty name; same-name calls must be sequential"]),
@@ -321,7 +322,7 @@ const capabilities: readonly CapabilityDescriptor[] = [
       "threaded calls are live-execution resume barriers and are never journaled",
       "same-thread calls must be sequential; threads cannot use worktree isolation",
       "a named thread's canonical cwd is fixed by its first call; a later call using that name with a different cwd fails validation instead of reusing the prior transcript",
-      "an explicit cwd must be a non-empty absolute existing directory; it is resolved to its real path before dispatch, participates in resume identity, and cannot combine with worktree isolation",
+      "an explicit cwd must be a non-empty absolute existing directory; its real path determines coding tools and session cwd; default settings and AGENTS/skill resources follow it while embedding-host dependency overrides remain authoritative; it participates in resume identity and cannot combine with worktree isolation",
       "selector priority is explicit model > agentType model > tier > phase model > metadata model > implicit medium > session default",
       "an explicit model, agentType model, tier, or phase model that resolves to an unavailable model throws MODEL_NOT_FOUND naming the source (e.g. the tier and what it resolved to) instead of falling back",
       "only the implicit default medium tier (no explicit model, tier, agentType, or phase model requested) degrades to the session default when unavailable, logging a one-time run-visible warning instead of throwing",

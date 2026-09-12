@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -81,6 +81,32 @@ await agent('never runs', { cwd: 'relative-path' })`,
       "cwd validation precedes capacity reservation",
     );
     assert.equal(seen.length, 1, "invalid cwd never dispatches an agent");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("script agent cwd preserves a directory's significant trailing space", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-agent-cwd-space-"));
+  const target = join(root, "directory ");
+  mkdirSync(join(root, "directory"));
+  mkdirSync(target);
+  try {
+    let seen: string | undefined;
+    await runWorkflow(
+      `export const meta = { name: 'cwd_space', description: 'literal directory binding' }
+return await agent('inspect', { cwd: ${JSON.stringify(target)} })`,
+      {
+        agent: {
+          async run(_prompt, options) {
+            seen = options?.cwd;
+            return "ok";
+          },
+        },
+        persistLogs: false,
+      },
+    );
+    assert.equal(seen, realpathSync(target));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

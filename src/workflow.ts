@@ -1741,7 +1741,7 @@ function resolveAgentCwd(value: unknown): string | undefined {
       },
     );
   }
-  const cwd = value.trim();
+  const cwd = value;
   if (!isAbsolute(cwd)) {
     throw new WorkflowError("agent cwd must be an absolute directory", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
       recoverable: false,

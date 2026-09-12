@@ -19,7 +19,7 @@ Every exact fact below is projected from the installed extension's capability co
 - `model`: string (optional; highest-priority exact model selector)
 - `tier`: string (optional; configured route name; dynamic reference: model-routes)
 - `isolation`: "worktree" (optional)
-- `cwd`: string (optional; non-empty absolute existing directory; resolved to its real path; cannot combine with worktree isolation)
+- `cwd`: string (optional; non-empty absolute existing directory; resolved to its real path; coding tools and session cwd use the target directory; settings and AGENTS/skill resources also use it unless explicitly injected by the embedding host; cannot combine with worktree isolation)
 - `thread`: string (optional; non-empty name; same-name calls must be sequential)
 - `agentType`: string (optional; must come from provided context; dynamic reference: agent-types)
 - `timeoutMs`: number | null (optional; default: run timeout; null disables)
@@ -32,7 +32,7 @@ Every exact fact below is projected from the installed extension's capability co
 - Constraint: threaded calls are live-execution resume barriers and are never journaled
 - Constraint: same-thread calls must be sequential; threads cannot use worktree isolation
 - Constraint: a named thread's canonical cwd is fixed by its first call; a later call using that name with a different cwd fails validation instead of reusing the prior transcript
-- Constraint: an explicit cwd must be a non-empty absolute existing directory; it is resolved to its real path before dispatch, participates in resume identity, and cannot combine with worktree isolation
+- Constraint: an explicit cwd must be a non-empty absolute existing directory; its real path determines coding tools and session cwd; default settings and AGENTS/skill resources follow it while embedding-host dependency overrides remain authoritative; it participates in resume identity and cannot combine with worktree isolation
 - Constraint: selector priority is explicit model > agentType model > tier > phase model > metadata model > implicit medium > session default
 - Constraint: an explicit model, agentType model, tier, or phase model that resolves to an unavailable model throws MODEL_NOT_FOUND naming the source (e.g. the tier and what it resolved to) instead of falling back
 - Constraint: only the implicit default medium tier (no explicit model, tier, agentType, or phase model requested) degrades to the session default when unavailable, logging a one-time run-visible warning instead of throwing

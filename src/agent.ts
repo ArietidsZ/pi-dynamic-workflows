@@ -221,7 +221,10 @@ export interface WorkflowAgentOptions {
    * so a workflow subagent can't fan out through them either (#107).
    */
   excludeTools?: string[];
-  /** Override any createAgentSession option (model, modelRegistry, resourceLoader, etc.). */
+  /**
+   * Override createAgentSession dependencies (model, settingsManager, resourceLoader, etc.).
+   * An explicit per-call cwd and the computed agent identity remain authoritative.
+   */
   session?: Partial<CreateAgentSessionOptions>;
   /** Extra system guidance prepended to every subagent task. */
   instructions?: string;
@@ -638,10 +641,10 @@ export class WorkflowAgent {
    */
   private tierConfigBox?: { value: ModelTierConfig | null };
   /**
-   * Shared resource loader for every subagent of this run, built once. See
+   * Resource loaders shared by subagents using the same directory in this run. See
    * getSharedResourceLoader — this is the #109 memory mitigation.
    */
-  private sharedResourceLoaderPromise?: Promise<DefaultResourceLoader>;
+  private readonly resourceLoaders = new Map<string, Promise<DefaultResourceLoader>>();
   /**
    * Emitted at most once per instance (~= once per run, see the class-level
    * lifetime note above): the untagged/default "medium" tier resolved to a
@@ -673,7 +676,7 @@ export class WorkflowAgent {
   }
 
   /**
-   * A resource loader shared by every subagent of this run, built once (#109).
+   * A resource loader shared per directory within this run (#109).
    *
    * Without a resourceLoader, createAgentSession() builds a fresh
    * DefaultResourceLoader per subagent and reloads it — re-running EVERY installed
@@ -695,28 +698,30 @@ export class WorkflowAgent {
    * #107 denylist — and must be release-noted. `createAgentSession` with a shared
    * resourceLoader is a supported embedding pattern. runWorkflow builds one
    * WorkflowAgent per run, so this loader's lifetime is exactly one run: built
-   * once, reused by all its subagents, then dropped with the agent.
+   * once per directory, reused there, then dropped with the agent.
    */
-  private getSharedResourceLoader(agentDir: string): Promise<DefaultResourceLoader> {
-    if (!this.sharedResourceLoaderPromise) {
-      this.sharedResourceLoaderPromise = (async () => {
-        const loader = new DefaultResourceLoader({
-          cwd: this.cwd,
-          agentDir,
-          settingsManager: SettingsManager.create(this.cwd, agentDir),
-          noExtensions: true,
-        });
-        await loader.reload();
-        return loader;
-      })().catch((err) => {
-        // Don't let a transient build failure (e.g. EMFILE during reload's disk
-        // I/O) poison every subagent AND every retry of this run — clear the memo
-        // so the next caller rebuilds instead of replaying the same rejection.
-        this.sharedResourceLoaderPromise = undefined;
-        throw err;
+  private getSharedResourceLoader(agentDir: string, cwd = this.cwd): Promise<DefaultResourceLoader> {
+    const key = JSON.stringify([agentDir, cwd]);
+    const existing = this.resourceLoaders.get(key);
+    if (existing) return existing;
+    const pending = (async () => {
+      const loader = new DefaultResourceLoader({
+        cwd,
+        agentDir,
+        settingsManager: this.sessionOptions.settingsManager ?? SettingsManager.create(cwd, agentDir),
+        noExtensions: true,
       });
-    }
-    return this.sharedResourceLoaderPromise;
+      await loader.reload();
+      return loader;
+    })().catch((err) => {
+      // Don't let a transient build failure (e.g. EMFILE during reload's disk
+      // I/O) poison every subagent AND every retry of this run — clear the memo
+      // so the next caller rebuilds instead of replaying the same rejection.
+      this.resourceLoaders.delete(key);
+      throw err;
+    });
+    this.resourceLoaders.set(key, pending);
+    return pending;
   }
 
   /**
@@ -879,7 +884,14 @@ export class WorkflowAgent {
     // Per-call cwd (e.g. a worktree) needs coding tools bound to that directory,
     // since tools capture their cwd at construction and can't be relocated.
     const runCwd = realpathSync(options.cwd ?? this.cwd);
-    const baseTools = runCwd === this.cwd ? this.baseTools : createCodingTools(runCwd);
+    let usesBaseDirectory = false;
+    try {
+      usesBaseDirectory = runCwd === realpathSync(this.cwd);
+    } catch {
+      // An explicitly selected existing directory can outlive the constructor's
+      // original directory. Its tools must not depend on that old path existing.
+    }
+    const baseTools = usesBaseDirectory ? this.baseTools : createCodingTools(runCwd);
     // Apply the agentType tool policy BEFORE adding structured_output, so a
     // restrictive allowlist never strips the schema tool.
     const customTools: ToolDefinition[] = applyToolPolicy(
@@ -997,18 +1009,19 @@ export class WorkflowAgent {
         // SettingsManager.inMemory() doesn't load ~/.pi/settings.json, so subagents
         // would fall back to the first available model (e.g. openai-codex) which may
         // not have valid auth, causing silent empty responses.
-        settingsManager: SettingsManager.create(this.cwd, agentDir),
+        settingsManager: SettingsManager.create(runCwd, agentDir),
         customTools,
         // Shared per-run loader with no host extensions (#109) — see
         // getSharedResourceLoader. An injected resourceLoader (tests / embedders)
         // wins and skips the shared build entirely; the ...this.sessionOptions
         // spread below re-applies the same injected value harmlessly.
-        resourceLoader: this.sessionOptions.resourceLoader ?? (await this.getSharedResourceLoader(agentDir)),
+        resourceLoader: this.sessionOptions.resourceLoader ?? (await this.getSharedResourceLoader(agentDir, runCwd)),
         // Host split (see modelRuntime above): stock pi takes modelRuntime;
         // omp's fork takes modelRegistry. Spread-cast keeps the runtime value
         // while satisfying the upstream CreateAgentSessionOptions type.
         ...(modelRuntime ? { modelRuntime } : { modelRegistry }),
         ...this.sessionOptions,
+        ...(options.cwd !== undefined ? { cwd: runCwd } : {}),
         // The computed AgentRegistry id must win over any injected
         // sessionOptions value: a stable embedder-supplied agentId would
         // collide across runs in the process-global registry. `agentId` is
