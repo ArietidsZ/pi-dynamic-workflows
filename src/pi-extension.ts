@@ -139,12 +139,12 @@ export default function extension(pi: ExtensionAPI) {
   if (previousRuntime) manager.reconfigureAfterReload(managerOptions);
 
   // Stable effort object: /effort and keyword arming close over this reference.
-  // When a handoff brings a different EffortState, copy the level in place
-  // rather than rebinding the local binding.
-  const effort: EffortState = (previousRuntime ?? runtimeClaim.versionMismatch)?.effort ?? createEffortState();
-  if (previousRuntime?.effort && previousRuntime.effort !== effort) {
-    effort.level = previousRuntime.effort.level;
-  }
+  // A handoff retains that same object and its user-selected in-memory level.
+  const handedOffEffort = (previousRuntime ?? runtimeClaim.versionMismatch)?.effort;
+  const effort: EffortState = handedOffEffort ?? createEffortState();
+  // A compatible runtime has already had a user-visible session. Keep its
+  // current in-memory choice rather than applying a setting again on reload.
+  let effortInitialized = handedOffEffort !== undefined;
 
   const getManager = () => manager;
   const getCwd = () => cwd;
@@ -280,6 +280,15 @@ export default function extension(pi: ExtensionAPI) {
       storage = createWorkflowStorage(cwd);
       managerOptions = buildManagerOptions(cwd, storage);
       manager.reconfigureAfterReload(managerOptions);
+    }
+
+    // Factory-time process.cwd() can be the launch directory after /resume.
+    // Initialize only once, after ctx.cwd has selected the actual project, so
+    // the project overlay is applied without overwriting /effort changes on a
+    // later session_start or a compatible runtime handoff.
+    if (!effortInitialized) {
+      effort.level = loadWorkflowSettings({ cwd: sessionCwd }).defaultEffort ?? "off";
+      effortInitialized = true;
     }
 
     // First registration (and post-rebuild catch-up for target-only names).

@@ -14,6 +14,11 @@ export interface WorkflowSettings {
   keywordTriggerEnabled?: boolean;
   /** Literal keyword that arms workflows mode from interactive input. */
   keywordTriggerWord?: string;
+  /**
+   * Initial in-memory orchestration effort for a fresh Pi session. Omitted
+   * (the default) is "off"; slash commands never write this preference.
+   */
+  defaultEffort?: "off" | "high" | "ultra";
   defaultAgentTimeoutMs?: number | null;
   /**
    * Default hard token budget applied to runs that don't pass their own
@@ -137,6 +142,9 @@ function normalizeSettings(value: unknown): WorkflowSettings {
   }
   const keywordTriggerWord = normalizeKeywordTriggerWord(raw.keywordTriggerWord);
   if (keywordTriggerWord !== undefined) settings.keywordTriggerWord = keywordTriggerWord;
+  if (raw.defaultEffort === "off" || raw.defaultEffort === "high" || raw.defaultEffort === "ultra") {
+    settings.defaultEffort = raw.defaultEffort;
+  }
   if (raw.defaultAgentTimeoutMs === null) {
     settings.defaultAgentTimeoutMs = null;
   } else if (
