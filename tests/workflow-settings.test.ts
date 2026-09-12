@@ -59,6 +59,20 @@ describe("workflow settings", () => {
     });
   });
 
+  it("saves and normalizes default session effort", () => {
+    withSettingsPath((settingsPath) => {
+      mkdirSync(dirname(settingsPath), { recursive: true });
+
+      saveWorkflowSettings({ defaultEffort: "high" }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { defaultEffort: "high" });
+
+      for (const defaultEffort of ["HIGH", "medium", "", true, null]) {
+        writeFileSync(settingsPath, JSON.stringify({ defaultEffort }), "utf-8");
+        assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+      }
+    });
+  });
+
   it("saves and loads default agent timeout preference", () => {
     withSettingsPath((settingsPath) => {
       saveWorkflowSettings({ defaultAgentTimeoutMs: 600000 }, settingsPath);
@@ -132,16 +146,24 @@ describe("workflow settings", () => {
       withFakeHome(fakeHome, () => {
         const globalPath = getWorkflowSettingsPath();
         const projectPath = getWorkflowProjectSettingsPath(cwd);
-        saveWorkflowSettings({ keywordTriggerEnabled: true, defaultAgentTimeoutMs: 600000 }, globalPath);
-        saveWorkflowSettings({ keywordTriggerEnabled: false }, { cwd, settingsPath: globalPath, scope: "project" });
+        saveWorkflowSettings(
+          { keywordTriggerEnabled: true, defaultAgentTimeoutMs: 600000, defaultEffort: "high" },
+          globalPath,
+        );
+        saveWorkflowSettings(
+          { keywordTriggerEnabled: false, defaultEffort: "ultra" },
+          { cwd, settingsPath: globalPath, scope: "project" },
+        );
 
         assert.deepEqual(loadWorkflowSettings(globalPath), {
           keywordTriggerEnabled: true,
           defaultAgentTimeoutMs: 600000,
+          defaultEffort: "high",
         });
         assert.deepEqual(loadWorkflowSettings({ cwd, settingsPath: globalPath, projectSettingsPath: projectPath }), {
           keywordTriggerEnabled: false,
           defaultAgentTimeoutMs: 600000,
+          defaultEffort: "ultra",
         });
       });
     } finally {

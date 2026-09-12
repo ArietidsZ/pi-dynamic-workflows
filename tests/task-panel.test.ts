@@ -1290,8 +1290,6 @@ describe("installResultDelivery", () => {
     const pi = createMockPi();
     const run = makeRun();
     const manager = createMockManager(run);
-    let details: { deliveryId?: string } | undefined;
-
     mod._registerHostSessionForTests({
       isStreaming: true,
       isIdle: false,
@@ -1305,10 +1303,7 @@ describe("installResultDelivery", () => {
         },
       },
       subscribe: () => () => {},
-      sendCustomMessage: (message: { details?: { deliveryId?: string } }) => {
-        details = message.details;
-        return Promise.resolve();
-      },
+      sendCustomMessage: () => Promise.resolve(),
     });
     mod.installResultDelivery(pi, manager);
     manager.setSessionId(SESSION);

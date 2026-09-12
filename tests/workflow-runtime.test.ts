@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
@@ -48,6 +52,18 @@ function createDeferred<T = void>(): { promise: Promise<T>; resolve: (value: T |
     resolve = r;
   });
   return { promise, resolve };
+}
+
+function createGitRepo(prefix: string): string {
+  const repo = mkdtempSync(join(tmpdir(), prefix));
+  const git = (...args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "pipe" });
+  git("init", "-q");
+  git("config", "user.email", "t@t.t");
+  git("config", "user.name", "t");
+  writeFileSync(join(repo, "base.txt"), "base\n");
+  git("add", ".");
+  git("commit", "-q", "-m", "init");
+  return repo;
 }
 
 test("runWorkflow concurrency caps parallel agents", async () => {
@@ -666,6 +682,335 @@ test("resume replays cached results without re-running agents", async () => {
   });
   assert.equal(second.state.calls, 0, "no live runs on a full cache hit");
   assert.equal(JSON.stringify(r2.result), JSON.stringify(r1.result));
+});
+
+test("requested worktree isolation fails closed before starting a non-git agent", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-worktree-fail-closed-"));
+  let runs = 0;
+  let starts = 0;
+  try {
+    await assert.rejects(
+      runWorkflow(
+        `export const meta = { name: 'fail_closed', description: 'no shared fallback' }
+return await agent('must not run', { isolation: 'worktree' })`,
+        {
+          cwd,
+          agent: {
+            async run() {
+              runs++;
+              return "unexpected";
+            },
+          },
+          persistLogs: false,
+          onAgentStart: () => starts++,
+        },
+      ),
+      (error: unknown) =>
+        error instanceof WorkflowError &&
+        error.code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR &&
+        error.recoverable === false,
+    );
+    assert.equal(runs, 0, "isolation failure must not invoke the shared-checkout agent");
+    assert.equal(starts, 0, "the host must not observe an agent start before isolation succeeds");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a journal entry from isolation: false cannot replay after worktree isolation is requested", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-worktree-cache-mode-"));
+  const journal: JournalEntry[] = [];
+  let runs = 0;
+  const script = (isolation: string) => `export const meta = { name: 'cache_mode', description: 'isolation identity' }
+return await agent('same prompt', { label: 'same', isolation: ${isolation} })`;
+  try {
+    await runWorkflow(script("false"), {
+      cwd,
+      runId: "cache-mode",
+      persistLogs: false,
+      onAgentJournal: (entry) => journal.push(entry),
+      agent: {
+        async run() {
+          runs++;
+          return "cached without isolation";
+        },
+      },
+    });
+    await assert.rejects(
+      runWorkflow(script("'worktree'"), {
+        cwd,
+        runId: "cache-mode",
+        persistLogs: false,
+        resumeJournal: new Map(journal.map((entry) => [`${entry.runId}:${entry.index}`, entry])),
+        agent: {
+          async run() {
+            runs++;
+            return "must not run in a shared checkout";
+          },
+        },
+      }),
+      (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+    );
+    assert.equal(runs, 1, "the false-to-worktree cache miss must fail closed before agent.run");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("keepWorktree changes invalidate isolated journal entries while retained worktrees replay", async () => {
+  const repo = createGitRepo("pi-worktree-cache-retention-");
+  const journal: JournalEntry[] = [];
+  const script = (
+    keepWorktree: boolean,
+  ) => `export const meta = { name: 'cache_retention', description: 'retention identity' }
+return await agent('same prompt', { label: 'same', isolation: 'worktree', keepWorktree: ${keepWorktree} })`;
+  let runs = 0;
+  let liveCwd = "";
+  const runner = {
+    async run(_prompt: string, options: AgentRunOptions) {
+      runs++;
+      liveCwd = options.cwd ?? "";
+      return `live-${runs}`;
+    },
+  };
+  try {
+    await runWorkflow(script(false), {
+      cwd: repo,
+      runId: "cache-retention",
+      persistLogs: false,
+      onAgentJournal: (entry) => journal.push(entry),
+      agent: runner,
+    });
+    assert.equal(existsSync(liveCwd), false, "the first keepWorktree: false tree was removed");
+
+    await runWorkflow(script(true), {
+      cwd: repo,
+      runId: "cache-retention",
+      persistLogs: false,
+      resumeJournal: new Map(journal.map((entry) => [`${entry.runId}:${entry.index}`, entry])),
+      onAgentJournal: (entry) => journal.push(entry),
+      agent: runner,
+    });
+    assert.equal(runs, 2, "changing retention must not replay an entry whose tree was removed");
+    assert.ok(existsSync(liveCwd), "the keepWorktree: true live retry retains its new tree");
+
+    await runWorkflow(script(true), {
+      cwd: repo,
+      runId: "cache-retention",
+      persistLogs: false,
+      resumeJournal: new Map(journal.map((entry) => [`${entry.runId}:${entry.index}`, entry])),
+      agent: runner,
+    });
+    assert.equal(runs, 2, "an unchanged valid keepWorktree: true entry replays without agent.run");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("onAgentStart failure still honors worktree retention cleanup", async () => {
+  const repo = createGitRepo("pi-worktree-start-failure-");
+  const script = (keepWorktree: boolean) => `export const meta = { name: 'start_failure', description: 'start cleanup' }
+return await agent('same prompt', { label: 'same', isolation: 'worktree', keepWorktree: ${keepWorktree} })`;
+  try {
+    for (const keepWorktree of [false, true]) {
+      const logs: string[] = [];
+      let runs = 0;
+      await assert.rejects(
+        runWorkflow(script(keepWorktree), {
+          cwd: repo,
+          persistLogs: false,
+          onLog: (message) => logs.push(message),
+          onAgentStart: () => {
+            throw new Error("start callback failed");
+          },
+          agent: {
+            async run() {
+              runs++;
+              return "unexpected";
+            },
+          },
+        }),
+        /start callback failed/,
+      );
+      assert.equal(runs, 0, "a throwing start callback must prevent agent.run");
+      const kept = logs.find((message) => message.startsWith("worktree kept: "));
+      if (!keepWorktree) {
+        assert.equal(kept, undefined, "keepWorktree: false cleans up after the callback failure");
+      } else {
+        assert.ok(kept, "keepWorktree: true still records the retained path through onLog");
+        const cwd = kept?.slice("worktree kept: ".length).split(" (")[0] ?? "";
+        assert.ok(existsSync(cwd), "the logged retained path remains inspectable");
+      }
+    }
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("repeated live executions with the same run id and long slug retain independent worktrees", async () => {
+  const repo = createGitRepo("pi-worktree-repeat-");
+  const seen: string[] = [];
+  const script = `export const meta = { name: 'repeat_tree', description: 'unique retained worktrees' }
+return await agent('edit', { label: 'this-is-a-very-long-label-that-shares-the-entire-slug-prefix', isolation: 'worktree' })`;
+  try {
+    const runner = {
+      async run(_prompt: string, options: AgentRunOptions) {
+        const cwd = options.cwd ?? "";
+        seen.push(cwd);
+        if (seen.length === 1) writeFileSync(join(cwd, "first-only.txt"), "first\n");
+        return "ok";
+      },
+    };
+    await runWorkflow(script, { cwd: repo, runId: "same-run-id", agent: runner, persistLogs: false });
+    await runWorkflow(script, { cwd: repo, runId: "same-run-id", agent: runner, persistLogs: false });
+
+    assert.notEqual(seen[0], seen[1], "same run id and truncated slug must not reuse a retained tree");
+    assert.equal(readFileSync(join(seen[0] ?? "", "first-only.txt"), "utf8"), "first\n");
+    assert.equal(existsSync(join(seen[1] ?? "", "first-only.txt")), false);
+    assert.equal(existsSync(join(repo, "first-only.txt")), false);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("worktree success, failure, and abort are retained by default; keepWorktree false cleans up", async () => {
+  const repo = createGitRepo("pi-worktree-retention-");
+  const script = (
+    name: string,
+    options = "",
+  ) => `export const meta = { name: '${name}', description: 'worktree retention' }
+return await agent('${name}', { isolation: 'worktree'${options} })`;
+  try {
+    let successCwd = "";
+    await runWorkflow(script("success"), {
+      cwd: repo,
+      persistLogs: false,
+      agent: {
+        async run(_prompt, options) {
+          successCwd = options.cwd ?? "";
+          writeFileSync(join(successCwd, "success.txt"), "retained\n");
+          return "ok";
+        },
+      },
+    });
+    assert.ok(existsSync(successCwd), "successful worktree is retained");
+
+    let failureCwd = "";
+    await assert.rejects(
+      runWorkflow(script("failure"), {
+        cwd: repo,
+        persistLogs: false,
+        agent: {
+          async run(_prompt, options) {
+            failureCwd = options.cwd ?? "";
+            writeFileSync(join(failureCwd, "failure.txt"), "retained\n");
+            throw new WorkflowError("intentional", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, { recoverable: false });
+          },
+        },
+      }),
+      /intentional/,
+    );
+    assert.ok(existsSync(failureCwd), "failed worktree is retained for inspection");
+
+    const abort = new AbortController();
+    const started = createDeferred<void>();
+    let abortedCwd = "";
+    const abortedRun = runWorkflow(script("abort"), {
+      cwd: repo,
+      signal: abort.signal,
+      persistLogs: false,
+      agent: {
+        async run(_prompt, options) {
+          abortedCwd = options.cwd ?? "";
+          started.resolve();
+          return new Promise<string>((_resolve, reject) => {
+            options.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+          });
+        },
+      },
+    });
+    await started.promise;
+    abort.abort();
+    await assert.rejects(abortedRun, /aborted/);
+    assert.ok(existsSync(abortedCwd), "aborted worktree is retained for inspection");
+
+    let ephemeralCwd = "";
+    await runWorkflow(script("ephemeral", ", keepWorktree: false"), {
+      cwd: repo,
+      persistLogs: false,
+      agent: {
+        async run(_prompt, options) {
+          ephemeralCwd = options.cwd ?? "";
+          return "ok";
+        },
+      },
+    });
+    assert.equal(existsSync(ephemeralCwd), false, "explicit keepWorktree: false removes the worktree");
+    for (const name of ["success.txt", "failure.txt"]) {
+      assert.equal(existsSync(join(repo, name)), false, `${name} must not pollute the base checkout`);
+    }
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("replay does not create a worktree; a resume miss creates a fresh tree without base pollution", async () => {
+  const repo = createGitRepo("pi-worktree-resume-");
+  const journal: JournalEntry[] = [];
+  const script = (prompt: string) => `export const meta = { name: 'resume_tree', description: 'retained trees' }
+return await agent('${prompt}', { label: 'same-label', isolation: 'worktree' })`;
+  try {
+    let firstCwd = "";
+    await runWorkflow(script("first"), {
+      cwd: repo,
+      runId: "same-run-id",
+      persistLogs: false,
+      onAgentJournal: (entry) => journal.push(entry),
+      agent: {
+        async run(_prompt, options) {
+          firstCwd = options.cwd ?? "";
+          writeFileSync(join(firstCwd, "marker.txt"), "first\n");
+          return "first";
+        },
+      },
+    });
+
+    let replayCalls = 0;
+    await runWorkflow(script("first"), {
+      cwd: repo,
+      runId: "same-run-id",
+      persistLogs: false,
+      resumeJournal: new Map(journal.map((entry) => [`${entry.runId}:${entry.index}`, entry])),
+      agent: {
+        async run() {
+          replayCalls++;
+          return "unexpected";
+        },
+      },
+    });
+    assert.equal(replayCalls, 0, "a journal hit must not create or run an agent worktree");
+
+    let missCwd = "";
+    await runWorkflow(script("changed"), {
+      cwd: repo,
+      runId: "same-run-id",
+      persistLogs: false,
+      resumeJournal: new Map(journal.map((entry) => [`${entry.runId}:${entry.index}`, entry])),
+      agent: {
+        async run(_prompt, options) {
+          missCwd = options.cwd ?? "";
+          writeFileSync(join(missCwd, "marker.txt"), "miss\n");
+          return "miss";
+        },
+      },
+    });
+    assert.notEqual(missCwd, firstCwd, "a resume miss owns a new worktree despite the same run id and label");
+    assert.equal(readFileSync(join(firstCwd, "marker.txt"), "utf8"), "first\n", "replay history remains inspectable");
+    assert.equal(readFileSync(join(missCwd, "marker.txt"), "utf8"), "miss\n");
+    assert.equal(existsSync(join(repo, "marker.txt")), false, "neither live execution mutates the base checkout");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
 });
 
 test("unthreaded agent journal hashes remain compatible with pre-thread runs", async () => {

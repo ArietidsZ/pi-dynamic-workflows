@@ -1,18 +1,18 @@
 /**
- * Per-agent git worktree isolation. When an agent requests `isolation: "worktree"`,
- * it runs in a throwaway worktree on its own branch so parallel agents can edit the
- * same files without conflict. Results are NOT auto-merged — the path is surfaced for
- * the caller to inspect. Falls back to a logged no-op when isolation isn't possible.
+ * it runs in a git worktree on its own branch so parallel agents can edit the
+ * same files without conflict. Results are NOT auto-merged. The path is logged
+ * and kept by default (`keepWorktree: false` deletes after the call).
  */
 
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
 
 export interface Worktree {
-  /** True when a real worktree was created; false means "ran in the shared tree". */
+  /** True when a real worktree was created; false means isolation failed. */
   isolated: boolean;
   /** cwd the agent should run in (worktree path when isolated, else the base cwd). */
   cwd: string;
@@ -35,11 +35,12 @@ function slug(name: string): string {
 
 /**
  * Create an isolated worktree under `<repoRoot>/.pi/worktrees/<name>` on branch
- * `pi/wf/<name>`. The `name` must be deterministic (derived from runId + call index,
- * never wall-clock) so resume keys stay stable. Returns a no-op Worktree on any failure.
+ * `pi/wf/<name>`. A unique suffix gives each live execution its own ownership;
+ * retained results from earlier executions are never reused or overwritten.
+ * Journal identity is independent of this path. Returns a failed Worktree on error.
  */
 export async function createWorktree(baseCwd: string, name: string): Promise<Worktree> {
-  const id = slug(name);
+  const id = `${slug(name)}-${randomUUID()}`;
   let repoRoot: string;
   try {
     const { stdout } = await exec("git", ["-C", baseCwd, "rev-parse", "--show-toplevel"]);
@@ -64,7 +65,8 @@ export async function removeWorktree(wt: Worktree): Promise<void> {
   try {
     await exec("git", ["-C", wt.repoRoot, "worktree", "remove", "--force", wt.cwd]);
   } catch {
-    // already gone / locked — fall through
+    // A failed removal (e.g. a locked tree) does not authorize deleting its branch.
+    return;
   }
   if (wt.branch) {
     try {

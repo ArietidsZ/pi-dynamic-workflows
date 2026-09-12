@@ -78,7 +78,7 @@ return await agent(
 - **Real parallel orchestration** — fan out up to 16 concurrent and 1000 total subagents from one orchestration script.
 - **Per-agent model routing** — use `small`, `medium`, or `big` tiers, or choose an exact provider/model and thinking level.
 - **Journaled resume** — replay completed agents after interruption without rerunning them or spending their tokens again. The orchestrator can also resume with an **edited script** (`resumeFromRunId`): unchanged `agent()` calls replay from cache and only edited/new ones re-run — so a single bad prompt no longer means paying to re-run the whole workflow.
-- **Git worktree isolation** — let parallel agents edit safely on throwaway branches with `isolation: "worktree"`.
+- **Git worktree isolation** — parallel agents edit on separate branches with `isolation: "worktree"`. Kept by default for merge; pass `keepWorktree: false` to delete (tests).
 - **Measured usage** — report real tokens and cost from each subagent session; add run, phase, or agent budgets only when you want them.
 - **Visible background runs** — track phases, agents, models, fresh/cache tokens, cost, and live tok/s from the progress panel or `/workflows` navigator.
 - **Quality patterns** — compose `verify()`, `judgePanel()`, `loopUntilDry()`, and `completenessCheck()` instead of rebuilding review loops.
@@ -91,7 +91,7 @@ The installed extension generates this compact index from its executable capabil
 <!-- BEGIN GENERATED SUPPORTED WORKFLOW CAPABILITIES -->
 | Name | Classification | Signature | Options and defaults |
 | --- | --- | --- | --- |
-| agent | runtime-global | `agent(prompt, options?) => Promise<string \| structured value \| null>` | `label`: string (optional; default: derived from phase and call count)<br>`phase`: string (optional; default: current phase)<br>`schema`: plain JSON Schema (optional)<br>`model`: string (optional)<br>`tier`: string (optional)<br>`isolation`: "worktree" (optional)<br>`thread`: string (optional)<br>`agentType`: string (optional)<br>`timeoutMs`: number \| null (optional; default: run timeout; null disables)<br>`retries`: number (optional; default: run retry count) |
+| agent | runtime-global | `agent(prompt, options?) => Promise<string \| structured value \| null>` | `label`: string (optional; default: derived from phase and call count)<br>`phase`: string (optional; default: current phase)<br>`schema`: plain JSON Schema (optional)<br>`model`: string (optional)<br>`tier`: string (optional)<br>`isolation`: "worktree" \| false (optional)<br>`keepWorktree`: boolean (optional; default: true)<br>`thread`: string (optional)<br>`agentType`: string (optional)<br>`timeoutMs`: number \| null (optional; default: run timeout; null disables)<br>`retries`: number (optional; default: run retry count) |
 | parallel | runtime-global | `parallel(thunks) => Promise<Array<unknown \| null>>` | — |
 | pipeline | runtime-global | `pipeline(items, ...stages) => Promise<Array<unknown \| null>>` | — |
 | workflow | runtime-global | `workflow(savedName, childArgs?) => Promise<unknown>` | — |
@@ -192,7 +192,8 @@ Agent details use a compact summary by default: completed agents show their fina
 | `tier` | `small`, `medium`, or `big` model routing |
 | `model` | Exact `provider/modelId` or `provider/modelId:thinking`; overrides `tier` |
 | `agentType` | Named role, tool, and model definition |
-| `isolation` | Use `"worktree"` for conflict-free parallel edits |
+| `isolation` | `"worktree"` for conflict-free parallel edits; `false` opts out of an agentType default |
+| `keepWorktree` | Default `true` (kept for merge). `false` deletes after the call (test runs) |
 | `schema` | JSON Schema for a validated structured result |
 | `label` / `phase` | Display label and phase override |
 | `timeoutMs` / `retries` | Optional per-agent timeout and recoverable-failure retries |
@@ -235,7 +236,9 @@ Use `/workflows-models` to edit them interactively; it is cwd-aware and can save
 
 Omitted `tokenBudget` and `agentTimeoutMs` values use configured `defaultTokenBudget` and `defaultAgentTimeoutMs` settings; without them, runs are unlimited and have no hard per-agent timeout. Add per-run or per-agent values when you need explicit gates. `concurrency` is clamped to 16; `agentRetries` retries only recoverable failures. Defaults live in `~/.pi/workflows/settings.json`; `defaultTokenBudget` is a soft pre-call gate, and a project-level override of `null` cancels a global budget.
 
-A schema-less agent call that comes back as whitespace-only text is a recoverable `AGENT_EMPTY_OUTPUT` failure and retries like any other. Some models occasionally hit this on an otherwise-fine first attempt; if a fleet is built on one of them, set `agentRetries: 1-2` rather than treating an isolated empty output as a failed run.
+Set `"defaultEffort": "high"` or `"ultra"` in that settings file to opt a fresh session into the corresponding orchestration effort (`"off"` is the default). Project settings overlay the global value. This is an initial in-memory value only: `/effort` and `/ultracode` change the current session without writing settings, and reload/new/fork/session switches retain their existing in-process effort.
+
+A schema-less agent call that comes back as whitespace-only text is a recoverable `AGENT_EMPTY_OUTPUT` failure and retries like any other. Some models occasionally hit this on an otherwise-fine first attempt; if a fleet is built on one of them, set `agentRetries: 1-2` rather than treating an isolated empty output as a failed run. Because an exhausted recoverable failure resolves to `null` rather than throwing, a run whose **every** agent came back empty still reports `completed`; when that happens the runtime logs a prominent `⚠ Workflow produced no usable results` warning (naming the empty agents and pointing at `agentRetries` and output-token limits) so an all-null fleet can't be mistaken for success.
 
 Pausing and resuming a run keeps the limits it started with — `maxAgents`, `agentTimeoutMs`, `concurrency`, and `agentRetries` carry over instead of falling back to defaults, and `tokenBudget` tracking is cumulative across the pause, so a run can't reset its spend by pausing and resuming.
 
@@ -251,6 +254,8 @@ Extension state lives outside the repository under `~/.pi/workflows`:
 - older project-local `.pi/workflows/runs` and `.pi/workflows/saved` remain readable as fallbacks
 
 Subagents are in-memory by default. Set `persistAgentSessions: true` to retain full transcripts in Pi's standard session directory. This creates one file per unthreaded call or named thread and may store sensitive material that an agent read, so enable it deliberately.
+
+`PI_WORKFLOW_AGENT_CACHE_RETENTION` sets the prompt-cache retention tier for agent sessions, overriding `PI_CACHE_RETENTION` for them only. Anthropic charges more per cache write on the 1h tier than the 5m one; a long-lived parent conversation earns that back by surviving idle gaps, but agent sessions are short-lived and rarely idle long enough to claim the longer window, so a wide fan-out pays the higher write price without the benefit. Set `PI_CACHE_RETENTION=long PI_WORKFLOW_AGENT_CACHE_RETENTION=short` to keep the longer window for your own conversation only. Unset by default, so agents inherit the parent's retention and behaviour is unchanged unless you opt in. The override is applied to each agent session's own stream function rather than to `process.env`, so a background run cannot change retention for a parent turn streaming at the same time.
 
 Completed background runs persist their full result in the project run JSON. The conversation delivery includes a pointer to that file when the visible summary is shortened. Other Pi extensions can subscribe to the exported `WORKFLOW_LIFECYCLE_EVENT` through `pi.events`. Background workflows emit `{ status, runId, name }` and include `sessionId` when the originating Pi session is known, where `status` is `started`, `resumed`, `paused`, `completed`, `failed`, or `stopped`.
 
@@ -315,6 +320,33 @@ Two behavior changes to know about:
 
 - **Subagents no longer load host extensions by default.** Each run now builds one shared, extension-free resource loader for all of its subagents (a memory-leak mitigation). Skills, prompts, and `AGENTS.md` context still load, and the coding tools and any toolset (e.g. `web-research`) you hand a subagent are unaffected. What subagents lose is **host-extension-registered tools** — MCP bridges, browser tools, or anything else another installed extension adds. If an `agentType` names one of those tools in its allowlist, that entry now matches nothing. This also means a subagent can no longer recurse into another orchestration extension, even one not covered by the existing tool denylist.
 - **Checkpoints persisted before this release re-run once.** `checkpoint()`'s resume-identity hash now also covers `default`, `headless`, and `timeoutMs`, so changing any of them between runs correctly invalidates a stale cached answer. This is a one-time effect: any checkpoint cached under the old hash simply re-prompts once and then caches normally again.
+
+## Host: customize worker model before session creation
+
+An independent Pi extension (or embedder) can register one process-wide policy that runs **after** Dynamic Workflows resolves `model` / `tier` / phase intent and **before** `createAgentSession`. The policy may leave routing unchanged, override the concrete model, or reject the spawn. With no policy registered, routing is unchanged.
+
+```ts
+import { setPreSpawnModelResolver } from "@quintinshaw/pi-dynamic-workflows";
+
+export default function (_pi) {
+  // Example host policy — not required DW behavior.
+  setPreSpawnModelResolver(async (ctx) => {
+    // ctx.modelSource is "explicit" | "tier" | "phase" | "default" | "session"
+    if (ctx.modelSource === "explicit" || ctx.modelSource === "tier" || ctx.modelSource === "phase") {
+      return { action: "unchanged" };
+    }
+    // Only untagged default / session fallback is overridden in this example.
+    return { action: "use", model: "provider/model-id" };
+    // return { action: "reject", reason: "policy refused this spawn" };
+  });
+}
+```
+
+Unexpected policy errors do not fall back to the parent/session model.
+
+**Resolver precedence (highest wins):** per-run `AgentRunOptions.preSpawnModel` > instance `WorkflowAgentOptions.preSpawnModel` > process `setPreSpawnModelResolver`.
+
+**Process-wide, single resolver.** Registration is stored on `globalThis` under `Symbol.for("@quintinshaw/pi-dynamic-workflows.preSpawnModelResolver")` so an independent extension and the packaged/dist workflow runtime share one slot even if Node loaded two copies of this package. There is no middleware chain, priority, or registry: the last `setPreSpawnModelResolver` call wins; pass `undefined` to clear. The resolver is not serialized into worker context and does not cross process boundaries.
 
 ## Development
 
