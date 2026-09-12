@@ -25,7 +25,13 @@ export type { AgentUsage } from "./agent-usage.js";
 
 import { applyToolPolicy } from "./agent-registry.js";
 import { classifyProviderLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
-import { canonicalModelSpec, resolveModelSpecWithThinking } from "./model-spec.js";
+import {
+  canonicalModelSpec,
+  formatModelSpecWithThinking,
+  type ModelThinkingLevel,
+  resolveModelSpecWithThinking,
+  validateThinkingLevel,
+} from "./model-spec.js";
 import {
   formatTierFallbackNotice,
   loadModelTierConfig,
@@ -532,6 +538,11 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    */
   model?: string;
   /**
+   * Pi thinking level. Used when `model` has no `:thinking` suffix.
+   * A model-id suffix still wins.
+   */
+  thinking?: ModelThinkingLevel;
+  /**
    * Model tier name (e.g. "small", "medium", "big"). When set (and no explicit
    * `model` is given), the model is resolved from the user's model-tiers.json
    * config before `run()` starts, falling back to the session's main model when
@@ -880,6 +891,7 @@ export class WorkflowAgent {
     prompt: string,
     options: AgentRunOptions<TSchemaDef> = {},
   ): Promise<AgentRunResult<TSchemaDef>> {
+    validateThinkingLevel(options.thinking);
     const thread = options.thread;
     if (thread && this.activeThreads.has(thread)) {
       throw new WorkflowError(
@@ -971,6 +983,7 @@ export class WorkflowAgent {
     if (resolver) {
       const decision = await applyPreSpawnModel(resolver, {
         requestedModel: options.model,
+        ...(options.thinking !== undefined ? { requestedThinking: options.thinking } : {}),
         tier: options.tier,
         resolvedModel: modelSpec,
         modelSource,
@@ -1030,10 +1043,18 @@ export class WorkflowAgent {
         }
       } else {
         resolvedModel = resolved.model;
-        resolvedThinkingLevel = resolved.thinkingLevel;
-        options.onModelResolved?.(resolved.resolvedSpec ?? canonicalModelSpec(resolved.model));
+        resolvedThinkingLevel = resolved.thinkingLevel ?? options.thinking;
+        options.onModelResolved?.(
+          resolved.thinkingLevel !== undefined || options.thinking === undefined
+            ? (resolved.resolvedSpec ?? canonicalModelSpec(resolved.model))
+            : formatModelSpecWithThinking(
+                resolved.resolvedSpec ?? canonicalModelSpec(resolved.model),
+                options.thinking,
+              ),
+        );
       }
     }
+    resolvedThinkingLevel ??= options.thinking;
 
     const agentDir = getAgentDir();
     // Key persisted sessions by the runner's project cwd (this.cwd), NOT the
