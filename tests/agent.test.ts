@@ -31,7 +31,10 @@ type WorkflowAgentPrivates = {
   buildPrompt(prompt: string, options: AgentRunOptions<any>, structured: boolean): string;
   lastAssistantText(messages: unknown[]): string;
   finalAssistantText(messages: unknown[]): string;
-  createSessionManager(thread?: string): {
+  createSessionManager(
+    thread?: string,
+    cwd?: string,
+  ): {
     isPersisted(): boolean;
     getCwd(): string;
     getSessionId(): string;
@@ -131,6 +134,31 @@ test("WorkflowAgent retains one session manager per named thread", () => {
   const nextInvocation = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
   assert.notEqual(nextInvocation.createSessionManager("implementer").getSessionId(), first.getSessionId());
   assert.notEqual(agent.createSessionManager(), agent.createSessionManager(), "unthreaded calls remain one-shot");
+});
+
+test("WorkflowAgent rejects a named thread when its canonical cwd changes", () => {
+  const firstCwd = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-thread-cwd-first-"));
+  const secondCwd = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-thread-cwd-second-"));
+  try {
+    const agent = new WorkflowAgent({ cwd: firstCwd }) as unknown as WorkflowAgentPrivates;
+    const first = agent.createSessionManager("implementer", firstCwd);
+    assert.equal(
+      agent.createSessionManager("implementer", firstCwd),
+      first,
+      "same canonical cwd retains the conversation",
+    );
+    assert.throws(
+      () => agent.createSessionManager("implementer", secondCwd),
+      (error: unknown) => {
+        assert.ok(error instanceof WorkflowError);
+        assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+        return true;
+      },
+    );
+  } finally {
+    rmSync(firstCwd, { recursive: true, force: true });
+    rmSync(secondCwd, { recursive: true, force: true });
+  }
 });
 
 test("WorkflowAgent restores a failed named turn to its previous leaf", () => {

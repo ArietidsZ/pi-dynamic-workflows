@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { unlinkSync, writeFileSync } from "node:fs";
+import { realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AssistantMessage, Model, TextContent } from "@earendil-works/pi-ai";
 import {
@@ -601,6 +601,12 @@ export const DEFAULT_EXCLUDED_SUBAGENT_TOOLS = ["workflow", "workflow_control"];
 /** Process-global subagent id counter: unique across concurrent workflow runs. */
 let workflowAgentSeq = 0;
 
+interface ThreadSession {
+  manager: SessionManager;
+  /** Canonical cwd fixed when this named conversation starts. */
+  cwd: string;
+}
+
 /**
  * The full subagent tool denylist: the always-on defaults plus any names the
  * caller added (via WorkflowAgentOptions.excludeTools) or set on the injected
@@ -650,7 +656,7 @@ export class WorkflowAgent {
    * one instance per workflow invocation; embedders that inject and reuse an
    * agent are responsible for choosing the longer thread lifetime deliberately.
    */
-  private readonly threadSessions = new Map<string, SessionManager>();
+  private readonly threadSessions = new Map<string, ThreadSession>();
   private readonly activeThreads = new Set<string>();
   /** Unique per-instance identity: agent ids must never collide across WorkflowAgent instances. */
   private readonly agentInstanceId = randomUUID();
@@ -778,10 +784,27 @@ export class WorkflowAgent {
    * agent to an in-memory session instead — the run continues, just without a
    * persisted transcript.
    */
-  private createSessionManager(thread?: string): SessionManager {
+  private createSessionManager(thread?: string, cwd?: string): SessionManager {
     if (thread) {
+      // runTurn always supplies its already-canonical runCwd. Keep the legacy
+      // direct helper path (used by embedders that let SessionManager create a
+      // project directory lazily) intact when no per-call cwd was supplied.
+      const threadCwd = cwd === undefined ? this.cwd : realpathSync(cwd);
       const existing = this.threadSessions.get(thread);
-      if (existing) return existing;
+      if (existing) {
+        if (existing.cwd !== threadCwd) {
+          throw new WorkflowError(
+            `agent thread "${thread}" cannot change cwd from "${existing.cwd}" to "${threadCwd}"`,
+            WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+            { recoverable: false },
+          );
+        }
+        return existing.manager;
+      }
+
+      const manager = this.createSessionManager();
+      this.threadSessions.set(thread, { manager, cwd: threadCwd });
+      return manager;
     }
 
     let manager: SessionManager;
@@ -801,8 +824,6 @@ export class WorkflowAgent {
         manager = SessionManager.inMemory();
       }
     }
-
-    if (thread) this.threadSessions.set(thread, manager);
     return manager;
   }
 
@@ -857,7 +878,7 @@ export class WorkflowAgent {
     const capture: StructuredOutputCapture<any> = { called: false, value: undefined };
     // Per-call cwd (e.g. a worktree) needs coding tools bound to that directory,
     // since tools capture their cwd at construction and can't be relocated.
-    const runCwd = options.cwd ?? this.cwd;
+    const runCwd = realpathSync(options.cwd ?? this.cwd);
     const baseTools = runCwd === this.cwd ? this.baseTools : createCodingTools(runCwd);
     // Apply the agentType tool policy BEFORE adding structured_output, so a
     // restrictive allowlist never strips the schema tool.
@@ -957,7 +978,7 @@ export class WorkflowAgent {
     // per-call runCwd: agents working in short-lived git worktrees should still
     // group under the project's session dir instead of scattering across
     // temporary worktree paths.
-    const sessionManager = this.createSessionManager(options.thread);
+    const sessionManager = this.createSessionManager(options.thread, runCwd);
     const threadLeaf = options.thread ? sessionManager.getLeafId() : null;
     // Host split: pi >= 0.80.8 createAgentSession takes modelRuntime, not a
     // registry — hand over the registry's backing runtime so subagents share

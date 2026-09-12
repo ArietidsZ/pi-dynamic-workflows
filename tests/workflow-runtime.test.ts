@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
@@ -49,6 +52,107 @@ function createDeferred<T = void>(): { promise: Promise<T>; resolve: (value: T |
   });
   return { promise, resolve };
 }
+
+test("agent cwd is normalized before dispatch and invalid cwd does not reserve capacity", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-agent-cwd-"));
+  const linked = join(root, "linked");
+  symlinkSync(root, linked);
+  const seen: string[] = [];
+  const runner = {
+    async run(_prompt: string, options: AgentRunOptions) {
+      seen.push(options.cwd ?? "");
+      return "ok";
+    },
+  };
+  try {
+    const script = `export const meta = { name: 'cwd', description: 'cwd validation' }
+return await agent('inspect', { cwd: ${JSON.stringify(linked)} })`;
+    await runWorkflow(script, { agent: runner, persistLogs: false });
+    assert.deepEqual(seen, [realpathSync(root)], "runner receives the canonical realpath");
+
+    await assert.rejects(
+      () =>
+        runWorkflow(
+          `export const meta = { name: 'bad_cwd', description: 'bad cwd' }
+await agent('never runs', { cwd: 'relative-path' })`,
+          { agent: runner, persistLogs: false, maxAgents: 0 },
+        ),
+      /cwd must be an absolute directory/,
+      "cwd validation precedes capacity reservation",
+    );
+    assert.equal(seen.length, 1, "invalid cwd never dispatches an agent");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("agent cwd cannot be combined with worktree isolation", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-agent-cwd-isolation-"));
+  try {
+    await assert.rejects(
+      () =>
+        runWorkflow(
+          `export const meta = { name: 'cwd_isolation', description: 'cwd and isolation' }
+await agent('never runs', { cwd: ${JSON.stringify(root)}, isolation: 'worktree' })`,
+          { agent: countingAgent().runner, persistLogs: false },
+        ),
+      /cwd cannot be combined with worktree isolation/,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("agent cwd participates in resume identity while omitted cwd preserves cache replay", async () => {
+  const firstDir = mkdtempSync(join(tmpdir(), "pi-agent-cwd-first-"));
+  const secondDir = mkdtempSync(join(tmpdir(), "pi-agent-cwd-second-"));
+  const calls: string[] = [];
+  const journal = new Map<string, JournalEntry>();
+  const runner = {
+    async run(_prompt: string, options: AgentRunOptions) {
+      calls.push(options.cwd ?? "default");
+      return `ran:${options.cwd ?? "default"}`;
+    },
+  };
+  const script = (cwd?: string) => `export const meta = { name: 'cwd_resume', description: 'cwd resume identity' }
+return await agent('inspect', { label: 'inspect'${cwd ? `, cwd: ${JSON.stringify(cwd)}` : ""} })`;
+  try {
+    await runWorkflow(script(), {
+      agent: runner,
+      persistLogs: false,
+      runId: "cwd-resume",
+      onAgentJournal: (entry) => journal.set(`${entry.runId}:${entry.index}`, entry),
+    });
+    await runWorkflow(script(), {
+      agent: runner,
+      persistLogs: false,
+      runId: "cwd-resume",
+      resumeJournal: journal,
+    });
+    assert.deepEqual(calls, ["default"], "omitted cwd retains the existing resume hash");
+
+    await runWorkflow(script(firstDir), {
+      agent: runner,
+      persistLogs: false,
+      runId: "cwd-resume",
+      resumeJournal: journal,
+    });
+    await runWorkflow(script(secondDir), {
+      agent: runner,
+      persistLogs: false,
+      runId: "cwd-resume",
+      resumeJournal: journal,
+    });
+    assert.deepEqual(
+      calls,
+      ["default", realpathSync(firstDir), realpathSync(secondDir)],
+      "each canonical cwd invalidates the prior journal entry",
+    );
+  } finally {
+    rmSync(firstDir, { recursive: true, force: true });
+    rmSync(secondDir, { recursive: true, force: true });
+  }
+});
 
 test("runWorkflow concurrency caps parallel agents", async () => {
   let active = 0;
