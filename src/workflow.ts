@@ -729,7 +729,14 @@ export async function runWorkflow<T = unknown>(
     // Deterministic resume key: assigned at lexical call time, before the limiter,
     // so parallel()/pipeline() fan-out is reproducible for a fixed script.
     const callIndex = state.callSeq++;
-    const callHash = hashAgentCall(prompt, modelSpec, assignedPhase, agentOptions, agentDefinitionKey(agentDef));
+    const callHash = hashAgentCall(
+      prompt,
+      modelSpec,
+      assignedPhase,
+      agentOptions,
+      agentDefinitionKey(agentDef),
+      resolvedIsolation,
+    );
     // Store delta key: callIndex alone is NOT run-unique. A nested workflow()
     // call (see workflowFn below) shares this run's SharedStore instance but
     // restarts its own callSeq at 0, so a parent agent and a concurrently
@@ -795,14 +802,19 @@ export async function runWorkflow<T = unknown>(
       const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
       const maxAttempts = retryAttempts + 1;
 
-      options.onAgentStart?.({ id: deltaKey, label, phase: assignedPhase, prompt, model: displayModel });
-
-      // Optional per-agent worktree isolation (deterministic name -> stable resume keys).
+      // Requested isolation is mandatory for this call; retained trees belong
+      // to their original execution, not a later retry/resume.
       // Precedence: isolation: false opts out; else call-site isolation > agentDef isolation.
       let worktree: Worktree | undefined;
       if (resolvedIsolation === "worktree") {
         worktree = await createWorktree(baseCwd, `${runId}-${callIndex}-${label}`);
-        if (!worktree.isolated) log(`isolation ignored for "${label}" (${worktree.reason})`);
+        if (!worktree.isolated) {
+          throw new WorkflowError(
+            `worktree isolation failed for "${label}": ${worktree.reason}`,
+            WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+            { recoverable: false },
+          );
+        }
       }
       const runCwd = worktree?.isolated ? worktree.cwd : undefined;
 
@@ -817,6 +829,7 @@ export async function runWorkflow<T = unknown>(
       });
 
       try {
+        options.onAgentStart?.({ id: deltaKey, label, phase: assignedPhase, prompt, model: displayModel });
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
           const attemptUsage = usageTracker.startAttempt();
           const externalSignal = options.signal;
@@ -1688,6 +1701,7 @@ function hashAgentCall(
   phase: string | undefined,
   options: AgentOptions,
   agentDefKey: string | null,
+  resolvedIsolation?: "worktree",
 ): string {
   const identity = JSON.stringify({
     prompt,
@@ -1700,6 +1714,8 @@ function hashAgentCall(
     // this call's cached result on a later resume.
     agentDef: agentDefKey,
     schema: options.schema ?? null,
+    ...(options.isolation !== undefined ? { isolation: options.isolation } : {}),
+    ...(resolvedIsolation === "worktree" ? { keepWorktree: options.keepWorktree !== false } : {}),
   });
   return createHash("sha256").update(identity).digest("hex");
 }
