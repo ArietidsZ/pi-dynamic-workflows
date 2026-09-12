@@ -140,6 +140,43 @@ test("U4 resolver use overrides the model actually spawned", async () => {
   });
 });
 
+test("separate thinking reaches policy and model suffix wins over it", async () => {
+  await withFauxAgent(async (agent, provider, modelId) => {
+    const policyThinking: Array<string | undefined> = [];
+    const resolved: string[] = [];
+    const text = await agent.run("task", {
+      model: `${provider}/${modelId}:high`,
+      thinking: "low",
+      preSpawnModel: (ctx) => {
+        policyThinking.push(ctx.requestedThinking);
+        return { action: "use", model: `${provider}/${modelId}:low` };
+      },
+      onModelResolved: (id) => resolved.push(id),
+    });
+    assert.match(String(text), /spawn-ok/);
+    assert.deepEqual(policyThinking, ["low"], "policy receives separate requested thinking");
+    assert.ok(
+      resolved.some((id) => id.endsWith(":low")),
+      `resolved=${JSON.stringify(resolved)}`,
+    );
+  });
+});
+
+test("separate low thinking is applied when the selected model has no suffix", async () => {
+  await withFauxAgent(async (agent, provider, modelId) => {
+    const resolved: string[] = [];
+    await agent.run("task", {
+      model: `${provider}/${modelId}`,
+      thinking: "low",
+      onModelResolved: (id) => resolved.push(id),
+    });
+    assert.ok(
+      resolved.some((id) => id.endsWith(":low")),
+      `resolved=${JSON.stringify(resolved)}`,
+    );
+  });
+});
+
 test("U5 explicit reject throws MODEL_SPAWN_REJECTED and does not spawn", async () => {
   await withFauxAgent(async (agent, provider, modelId) => {
     await assert.rejects(
