@@ -6,6 +6,8 @@
  *    conversation so the paused task continues with the outcome.
  */
 
+import { randomUUID } from "node:crypto";
+import { closeSync, openSync, readSync } from "node:fs";
 import { join } from "node:path";
 import {
   AgentSession,
@@ -166,13 +168,19 @@ function deliveredMaxChars(opts: { loadSettings?: () => WorkflowSettings }): num
  * and never ACK on a durable append (that writes history without triggerTurn).
  */
 
-type DeliverySend = (
-  message: { customType: string; content: string; display: boolean },
-  options: { triggerTurn: boolean; deliverAs: "followUp" },
-) => unknown;
+type DeliveryMessage = {
+  customType: string;
+  content: string;
+  display: boolean;
+  details?: { deliveryId?: string };
+};
+
+type DeliverySend = (message: DeliveryMessage, options: { triggerTurn: boolean; deliverAs: "followUp" }) => unknown;
 
 interface SessionDeliveryEndpoint {
   sessionId: string;
+  reportWarning?: (message: string) => void;
+  warned?: boolean;
   /**
    * Session-stable send that MUST return a thenable for ACK. Captured from
    * the host AgentSession.sendCustomMessage (not the void actions.sendMessage
@@ -199,6 +207,17 @@ interface SessionDeliveryEndpoint {
 /** Process-wide: one live endpoint per pi session id. */
 const sessionEndpoints = new Map<string, SessionDeliveryEndpoint>();
 
+function warnDelivery(sessionId: string | undefined, message: string): void {
+  const endpoint = sessionId ? sessionEndpoints.get(sessionId) : undefined;
+  if (!endpoint || endpoint.warned || !endpoint.reportWarning) return;
+  endpoint.warned = true;
+  try {
+    endpoint.reportWarning(message);
+  } catch {
+    // Diagnostics must never affect delivery or write raw stderr over the TUI.
+  }
+}
+
 /**
  * Session-stable thenable sends (host AgentSession.sendCustomMessage). Keyed
  * by host sessionId only — workflow children (in-memory, noExtensions, or
@@ -206,9 +225,33 @@ const sessionEndpoints = new Map<string, SessionDeliveryEndpoint>();
  */
 const boundSessionSends = new Map<string, DeliverySend>();
 
-/** runId → token of the deliver-and-ack that owns the lock, so bind flush does not double-send. Ownership prevents a stale finally from releasing a newer send's lock. */
-const inFlightDeliveries = new Map<string, number>();
+type InFlightDelivery = { token: number; sessionId: string };
+
+/** Ownership-token locks prevent stale promise chains from releasing newer sends. */
+const inFlightDeliveries = new Map<string, InFlightDelivery>();
 let inFlightSeq = 0;
+
+const DEFAULT_STREAMING_ACK_TIMEOUT_MS = 60_000;
+let streamingAckTimeoutMs = DEFAULT_STREAMING_ACK_TIMEOUT_MS;
+
+interface ActiveStreamingWaiter {
+  sessionId: string;
+  deliveryId: string;
+  hasStarted: () => boolean;
+  cancel: (error: Error) => void;
+}
+const activeStreamingWaiters = new Set<ActiveStreamingWaiter>();
+
+const DELIVERY_RETRY_DELAYS_MS = [250, 1_000, 4_000] as const;
+type DeliveryRetry = {
+  attempt: number;
+  generation: number;
+  sessionId: string;
+  timer?: ReturnType<typeof setTimeout>;
+};
+const deliveryRetries = new Map<string, DeliveryRetry>();
+/** ACKed messages whose pending marker still needs to be cleared durably. */
+const deliveredAwaitingClear = new Map<string, { deliveryId: string; sessionId: string; generation: number }>();
 
 /**
  * Custom type for the session bind probe (see probeHostSessionSend). Sent
@@ -242,10 +285,9 @@ function probeHostSessionSend(pi: ExtensionAPI, sessionId: string): void {
   if (probedSessionIds.has(sessionId)) return;
   try {
     pi.sendMessage({ customType: DELIVERY_PROBE_CUSTOM_TYPE, content: "", display: false }, { triggerTurn: false });
-  } catch (err) {
+  } catch {
     // Probe is best-effort; bind stays fail-closed without a captured send.
     // Not marked probed — the next bindSessionDelivery retries.
-    console.warn(`[workflow-delivery] delivery probe failed on session ${sessionId}:`, err);
     return;
   }
   if (boundSessionSends.has(sessionId)) probedSessionIds.add(sessionId);
@@ -256,10 +298,27 @@ let bindCoreObserved = false;
 
 interface StealCandidate {
   sendCustomMessage?: DeliverySend;
+  isStreaming?: boolean;
+  isIdle?: boolean;
+  waitForIdle?: () => Promise<void>;
+  agent?: {
+    hasQueuedMessages?: () => boolean;
+  };
+  subscribe?: (
+    listener: (event: {
+      type?: string;
+      message?: { role?: string; customType?: string; details?: unknown };
+      followUp?: readonly unknown[];
+      steering?: readonly unknown[];
+    }) => void,
+  ) => () => void;
   sessionManager?: {
     persist?: boolean;
     getSessionId?: () => string;
     getSessionName?: () => string | undefined;
+    getEntries?: () => Array<{ type?: string; customType?: string; details?: unknown }>;
+    getBranch?: () => Array<{ id?: string; type?: string; customType?: string; details?: unknown }>;
+    getSessionFile?: () => string | undefined;
     isPersisted?: () => boolean;
     isSessionOnDisk?: () => boolean;
   };
@@ -304,10 +363,179 @@ function hostSessionIdToSteal(session: StealCandidate, probe?: boolean): string 
   return sid;
 }
 
+function deliveryIdFromDetails(details: unknown): string | undefined {
+  if (!details || typeof details !== "object") return undefined;
+  const deliveryId = (details as { deliveryId?: unknown }).deliveryId;
+  return typeof deliveryId === "string" && deliveryId ? deliveryId : undefined;
+}
+
+/** Scan the SDK's JSONL record without allocating the entire session history. */
+function sessionFileContainsEntry(path: string, entry: object): boolean {
+  const needle = Buffer.from(`\n${JSON.stringify(entry)}\n`);
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r");
+    const chunk = Buffer.allocUnsafe(64 * 1024);
+    let tail: Buffer = Buffer.alloc(0);
+    for (;;) {
+      const count = readSync(fd, chunk);
+      if (count === 0) return false;
+      const window = Buffer.concat([tail, chunk.subarray(0, count)]);
+      if (window.indexOf(needle) !== -1) return true;
+      tail = window.subarray(Math.max(0, window.length - needle.length + 1));
+    }
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function sessionHasDelivery(session: StealCandidate, deliveryId: string): boolean | undefined {
+  const sm = session.sessionManager;
+  if (typeof sm?.getBranch !== "function" || typeof sm.getSessionFile !== "function") return undefined;
+  try {
+    const entries = sm
+      .getBranch()
+      .filter(
+        (entry) =>
+          typeof entry.id === "string" &&
+          entry.type === "custom_message" &&
+          entry.customType === "workflow-result" &&
+          deliveryIdFromDetails(entry.details) === deliveryId,
+      );
+    const file = sm.getSessionFile();
+    // getEntries includes abandoned branches; even getBranch can contain a
+    // memory-only entry after a failed/lazy persist. Neither alone is an ACK.
+    return !!file && entries.some((entry) => sessionFileContainsEntry(file, entry));
+  } catch {
+    return undefined;
+  }
+}
+
 function captureHostSessionSend(session: StealCandidate, probe?: boolean): void {
   const sid = hostSessionIdToSteal(session, probe);
-  if (!sid) return;
-  boundSessionSends.set(sid, (message, options) => session.sendCustomMessage?.(message, options));
+  const send = session.sendCustomMessage;
+  if (!sid || typeof send !== "function") return;
+
+  boundSessionSends.set(sid, (message, options) => {
+    const deliveryId = deliveryIdFromDetails(message.details);
+    if (deliveryId && sessionHasDelivery(session, deliveryId) === true) return Promise.resolve();
+
+    if (!deliveryId) {
+      return send.call(session, message, options);
+    }
+    if (typeof session.subscribe !== "function" || sessionHasDelivery(session, deliveryId) === undefined) {
+      return Promise.reject(new Error("host cannot confirm workflow result delivery"));
+    }
+
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let started = false;
+      let waitingForIdle = false;
+      let unsubscribe = () => {};
+      let timer: ReturnType<typeof setTimeout> | undefined;
+
+      const finish = (error?: unknown) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        activeStreamingWaiters.delete(waiterRecord);
+        unsubscribe();
+        if (error) reject(error);
+        else resolve();
+      };
+
+      const waiterRecord: ActiveStreamingWaiter = {
+        sessionId: sid,
+        deliveryId,
+        hasStarted: () => started,
+        cancel: (err) => finish(err),
+      };
+      activeStreamingWaiters.add(waiterRecord);
+
+      if (streamingAckTimeoutMs > 0) {
+        timer = setTimeout(() => {
+          queueMicrotask(() => {
+            if (settled) return;
+            if (sessionHasDelivery(session, deliveryId) === true) finish();
+            // No host queue item exists before start, so a retry is safe. Once
+            // started, never infer non-delivery from elapsed time.
+            else if (!started) finish(new Error("timed out waiting for an idle host"));
+          });
+        }, streamingAckTimeoutMs);
+        timer.unref?.();
+      }
+
+      unsubscribe =
+        session.subscribe?.((event) => {
+          if (event.type === "message_end") {
+            // A fresh session may flush the input only when its first assistant
+            // message completes. Recheck disk, not just the custom input event.
+            queueMicrotask(() => {
+              if (settled) return;
+              const persisted = sessionHasDelivery(session, deliveryId);
+              if (persisted === true) finish();
+              // A persistence failure is not proof that a started prompt was
+              // cancelled. Its send promise remains the failure boundary.
+            });
+            return;
+          }
+
+          if (event.type === "agent_settled" || event.type === "compaction_end") {
+            // An unrelated queue_update only describes user text; it cannot
+            // establish ownership or consumption of a custom follow-up.
+            queueMicrotask(startWhenIdle);
+          }
+        }) ?? (() => {});
+
+      function startWhenIdle() {
+        if (!deliveryId || !send) return;
+        if (settled || started) return;
+        if (session.isStreaming || session.isIdle === false) {
+          if (!waitingForIdle && typeof session.waitForIdle === "function") {
+            waitingForIdle = true;
+            void session.waitForIdle().then(() => {
+              waitingForIdle = false;
+              startWhenIdle();
+            }, finish);
+          }
+          return;
+        }
+        if (session.sessionManager?.getSessionId?.() !== sid) {
+          finish(new Error("host session identity changed before delivery"));
+          return;
+        }
+        if (sessionHasDelivery(session, deliveryId) === true) {
+          finish();
+          return;
+        }
+        // No await between idle inspection and send: this path never installs
+        // a custom message in the host's unobservable follow-up queue.
+        started = true;
+        if (timer) clearTimeout(timer);
+        try {
+          const pending = send.call(session, message, options);
+          if (pending == null || typeof (pending as { then?: unknown }).then !== "function") {
+            finish(new Error("workflow result send did not return a thenable"));
+            return;
+          }
+          Promise.resolve(pending).then(
+            () =>
+              finish(
+                sessionHasDelivery(session, deliveryId) === true
+                  ? undefined
+                  : new Error("host send settled without persisting workflow result"),
+              ),
+            (error) => finish(sessionHasDelivery(session, deliveryId) === true ? undefined : error),
+          );
+        } catch (error) {
+          finish(error);
+        }
+      }
+      startWhenIdle();
+    });
+  });
 }
 
 /**
@@ -403,6 +631,7 @@ export interface WorkflowLifecycleEvent {
 
 type DeliveryManager = WorkflowManager & {
   __deliveryInstalled?: boolean;
+  __deliveryTurnEndInstalled?: boolean;
   __lifecycleEventInstalled?: boolean;
   __lifecycleEventEmitter?: (data: WorkflowLifecycleEvent) => void;
   /** Last loadSettings seen on install — used when binding endpoints. */
@@ -419,43 +648,69 @@ function resolveDeliverySessionId(run: ManagedRun, manager: WorkflowManager): st
   return run.sessionId ?? manager.getSessionId?.();
 }
 
-function markRunPending(run: ManagedRun, marker: PendingDeliveryMarker): void {
-  run.pendingDelivery = marker;
+function sameDelivery(a: PendingDeliveryMarker | undefined, b: PendingDeliveryMarker): boolean {
+  return a?.kind === b.kind && (a.kind !== "text" || (b.kind === "text" && a.text === b.text));
 }
 
-function clearRunPending(manager: WorkflowManager, runId: string, run?: ManagedRun): void {
-  if (run?.pendingDelivery) {
-    run.pendingDelivery = undefined;
-  }
-  // Also clear on disk for runs already written / evicted from memory. Best-effort:
-  // a missing persistence layer (unit tests) is fine — memory clear is enough.
+function markerWithId(marker: PendingDeliveryMarker, existing?: PendingDeliveryMarker): PendingDeliveryMarker {
+  const deliveryId = sameDelivery(existing, marker) ? existing?.deliveryId : undefined;
+  return { ...marker, deliveryId: deliveryId ?? marker.deliveryId ?? randomUUID() };
+}
+
+function markRunPending(run: ManagedRun, marker: PendingDeliveryMarker): PendingDeliveryMarker {
+  const identified = markerWithId(marker, run.pendingDelivery);
+  if (run.pendingDelivery?.deliveryId !== identified.deliveryId) deliveredAwaitingClear.delete(run.runId);
+  run.pendingDelivery = identified;
+  return identified;
+}
+
+type ClearPendingResult = "cleared" | "stale" | "failed";
+
+function clearRunPending(
+  manager: WorkflowManager,
+  runId: string,
+  deliveryId: string,
+  run?: ManagedRun,
+): ClearPendingResult {
+  // Clear disk first. If that fails, retain the live marker so the delivered
+  // message remains visible to the bounded clear retry instead of being lost.
   try {
-    const persistence = manager.getPersistence?.();
-    if (!persistence) return;
-    const state = persistence.load(runId);
-    if (!state?.pendingDelivery) return;
-    const { pendingDelivery: _drop, ...rest } = state;
-    persistence.save(rest as PersistedRunState);
-    // If the live run still exists, keep it aligned without a full persistRace.
     const live = run ?? manager.getRun(runId);
+    if (live?.pendingDelivery?.deliveryId && live.pendingDelivery.deliveryId !== deliveryId) return "stale";
+
+    const persistence = manager.getPersistence?.();
+    if (persistence) {
+      const state = persistence.load(runId);
+      if (!state) throw new Error("persisted run disappeared before delivery ACK");
+      if (state.pendingDelivery?.deliveryId && state.pendingDelivery.deliveryId !== deliveryId) return "stale";
+      if (state.pendingDelivery) {
+        const { pendingDelivery: _drop, ...rest } = state;
+        persistence.save(rest as PersistedRunState);
+      }
+    }
     if (live) live.pendingDelivery = undefined;
+    return "cleared";
   } catch {
-    // ignore persistence errors — conversation delivery already succeeded
+    warnDelivery(
+      run?.sessionId ?? manager.getSessionId?.(),
+      `Workflow ${runId}: result delivered, but its pending marker could not be cleared.`,
+    );
+    return "failed";
   }
 }
 
-function persistRunPendingBestEffort(manager: WorkflowManager, run: ManagedRun): void {
+function persistRunPending(manager: WorkflowManager, run: ManagedRun): boolean {
   try {
     // Prefer merging into an existing on-disk record so we don't clobber the
     // manager's richer write that follows the complete/error emit. When no
     // record exists yet (complete fires before manager.persistRun), seed a
     // minimal marker-bearing record; the subsequent manager write overwrites.
     const persistence = manager.getPersistence?.();
-    if (!persistence) return;
+    if (!persistence) return true;
     const existing = persistence.load(run.runId);
     if (existing) {
       persistence.save({ ...existing, pendingDelivery: run.pendingDelivery, sessionId: run.sessionId });
-      return;
+      return true;
     }
     if (run.pendingDelivery) {
       persistence.save({
@@ -475,8 +730,13 @@ function persistRunPendingBestEffort(manager: WorkflowManager, run: ManagedRun):
         pendingDelivery: run.pendingDelivery,
       });
     }
+    return true;
   } catch {
-    // best-effort
+    warnDelivery(
+      run.sessionId,
+      `Workflow ${run.runId}: delivery deferred because its pending marker could not be saved.`,
+    );
+    return false;
   }
 }
 
@@ -522,7 +782,7 @@ function contentForPending(
  * fire-and-forget sends and durable appends are NOT success (append writes
  * history without triggerTurn). Does not clear pending markers.
  */
-function tryDeliverEndpoint(endpoint: SessionDeliveryEndpoint, content: string): Promise<boolean> {
+function tryDeliverEndpoint(endpoint: SessionDeliveryEndpoint, content: string, deliveryId: string): Promise<boolean> {
   if (endpoint.suspended) return Promise.resolve(false);
   if (endpoint.sessionId && sessionEndpoints.get(endpoint.sessionId) !== endpoint) {
     // Stale endpoint object after rebind/drop.
@@ -533,7 +793,7 @@ function tryDeliverEndpoint(endpoint: SessionDeliveryEndpoint, content: string):
   if (typeof endpoint.send === "function") {
     try {
       const ret = endpoint.send(
-        { customType: "workflow-result", content, display: true },
+        { customType: "workflow-result", content, display: true, details: { deliveryId } },
         { triggerTurn: true, deliverAs: "followUp" },
       );
       if (ret != null && typeof (ret as { then?: unknown }).then === "function") {
@@ -547,7 +807,7 @@ function tryDeliverEndpoint(endpoint: SessionDeliveryEndpoint, content: string):
           },
           (err: unknown) => {
             const msg = err instanceof Error ? err.message : String(err);
-            console.warn(`[workflow-delivery] async send failed; left pending on disk: ${msg}`);
+            warnDelivery(sessionId, `Workflow result remains pending: ${msg}`);
             const current = sessionEndpoints.get(sessionId);
             // If a newer generation already bound, caller may re-flush; signal failure.
             if (current && current.generation !== startedGeneration && !current.suspended) {
@@ -558,13 +818,14 @@ function tryDeliverEndpoint(endpoint: SessionDeliveryEndpoint, content: string):
         );
       }
       // Non-thenable send (void fire-and-forget) — do not trust as ACK.
-      console.warn(
+      warnDelivery(
+        endpoint.sessionId,
         `[workflow-delivery] send for session ${endpoint.sessionId} did not return a thenable; ` +
           "not treating as delivered (fail closed).",
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.warn(`[workflow-delivery] send failed; left pending on disk: ${msg}`);
+      warnDelivery(endpoint.sessionId, `Workflow result remains pending: ${msg}`);
       return Promise.resolve(false);
     }
   }
@@ -572,45 +833,150 @@ function tryDeliverEndpoint(endpoint: SessionDeliveryEndpoint, content: string):
   return Promise.resolve(false);
 }
 
+function cancelDeliveryRetry(runId: string): void {
+  const retry = deliveryRetries.get(runId);
+  if (retry?.timer) clearTimeout(retry.timer);
+  deliveryRetries.delete(runId);
+}
+
+function cancelSessionDeliveryState(sessionId: string): void {
+  for (const [runId, retry] of deliveryRetries) {
+    if (retry.sessionId === sessionId) cancelDeliveryRetry(runId);
+  }
+  for (const [runId, delivered] of deliveredAwaitingClear) {
+    if (delivered.sessionId === sessionId) deliveredAwaitingClear.delete(runId);
+  }
+}
+
+function scheduleDeliveryRetry(manager: WorkflowManager, runId: string, sessionId: string, generation: number): void {
+  const current = deliveryRetries.get(runId);
+  if (current?.timer && current.generation === generation) return;
+  const attempt = current?.generation === generation ? current.attempt : 0;
+  if (attempt >= DELIVERY_RETRY_DELAYS_MS.length) {
+    warnDelivery(
+      sessionId,
+      `Workflow ${runId}: result remains pending after delivery retries. Open /workflows to inspect it.`,
+    );
+    return;
+  }
+
+  const retry: DeliveryRetry = { attempt: attempt + 1, generation, sessionId };
+  retry.timer = setTimeout(() => {
+    retry.timer = undefined;
+    if (deliveryRetries.get(runId) !== retry) return;
+    const endpoint = sessionEndpoints.get(sessionId);
+    if (!endpoint || endpoint.suspended || endpoint.generation !== generation) return;
+    flushSessionDiskPending(manager, sessionId, endpoint);
+  }, DELIVERY_RETRY_DELAYS_MS[attempt]);
+  retry.timer.unref?.();
+  deliveryRetries.set(runId, retry);
+}
+
+function releaseDelivery(runId: string, token: number): void {
+  if (inFlightDeliveries.get(runId)?.token === token) inFlightDeliveries.delete(runId);
+}
+
 function deliverAndAck(
   manager: WorkflowManager,
   runId: string,
   sessionId: string,
   content: string,
+  deliveryId: string,
   run?: ManagedRun,
 ): void {
   if (inFlightDeliveries.has(runId)) return;
   const endpoint = sessionEndpoints.get(sessionId);
-  if (!endpoint || endpoint.suspended || endpoint.sessionId !== sessionId) return;
+  if (!endpoint) {
+    return;
+  }
+  if (endpoint.suspended) {
+    return;
+  }
+  if (endpoint.sessionId !== sessionId) {
+    warnDelivery(
+      sessionId,
+      `[workflow-delivery] delivery for ${runId} deferred: endpoint sessionId ${endpoint.sessionId} !== ${sessionId}`,
+    );
+    return;
+  }
+
+  const delivered = deliveredAwaitingClear.get(runId);
+  if (
+    delivered?.deliveryId === deliveryId &&
+    delivered.sessionId === sessionId &&
+    delivered.generation === endpoint.generation
+  ) {
+    const clear = clearRunPending(manager, runId, deliveryId, run ?? manager.getRun?.(runId));
+    if (clear !== "failed") {
+      deliveredAwaitingClear.delete(runId);
+      cancelDeliveryRetry(runId);
+    } else {
+      scheduleDeliveryRetry(manager, runId, sessionId, endpoint.generation);
+    }
+    return;
+  }
+
   // Fail-closed (no send): keep the run pending on disk with NO lock, so a
   // synchronous re-bind + flush (e.g. probe retry on the next session_start)
   // is not locked out by a microtask that has not run yet.
-  if (typeof endpoint.send !== "function") return;
-  // Ownership token: a stale finally (from a superseded send) must never
-  // release the lock held by a newer delivery — that would let a third
-  // caller double-deliver the same result mid-flight.
-  const lockToken = ++inFlightSeq;
-  inFlightDeliveries.set(runId, lockToken);
+  if (typeof endpoint.send !== "function") {
+    warnDelivery(
+      sessionId,
+      `[workflow-delivery] delivery for ${runId} deferred: endpoint for session ${sessionId} has no thenable send function`,
+    );
+    return;
+  }
+
+  const token = ++inFlightSeq;
+  inFlightDeliveries.set(runId, { token, sessionId });
   const startedGeneration = endpoint.generation;
-  const release = () => {
-    if (inFlightDeliveries.get(runId) === lockToken) inFlightDeliveries.delete(runId);
-  };
-  void tryDeliverEndpoint(endpoint, content)
+  void tryDeliverEndpoint(endpoint, content, deliveryId)
     .then((ok) => {
       if (ok) {
-        clearRunPending(manager, runId, run ?? manager.getRun?.(runId));
+        cancelDeliveryRetry(runId);
+        const current = sessionEndpoints.get(sessionId);
+        if (!current || current.suspended || current.generation !== startedGeneration || current !== endpoint) {
+          return;
+        }
+        const clear = clearRunPending(manager, runId, deliveryId, run ?? manager.getRun?.(runId));
+        if (clear === "failed") {
+          deliveredAwaitingClear.set(runId, { deliveryId, sessionId, generation: startedGeneration });
+          scheduleDeliveryRetry(manager, runId, sessionId, startedGeneration);
+        } else if (clear === "stale") {
+          // This send belonged to an older marker. Release before flushing the
+          // newer delivery, and let the ownership token protect its lock.
+          releaseDelivery(runId, token);
+          const active = sessionEndpoints.get(sessionId);
+          if (active && !active.suspended && active.manager) {
+            flushSessionDiskPending(active.manager, sessionId, active);
+          }
+        }
         return;
       }
-      // Release the in-flight lock before a generation-change retry so flush
-      // can actually pick this run back up. If the retry re-arms the lock with
-      // a new token before this handler's release runs, the release is a no-op.
-      release();
+
+      releaseDelivery(runId, token);
       const current = sessionEndpoints.get(sessionId);
-      if (current && !current.suspended && current.generation !== startedGeneration && current.manager) {
+      if (!current || current.suspended || !current.manager) return;
+      if (current.generation !== startedGeneration) {
+        cancelDeliveryRetry(runId);
         flushSessionDiskPending(current.manager, sessionId, current);
+      } else {
+        scheduleDeliveryRetry(manager, runId, sessionId, startedGeneration);
       }
     })
-    .finally(release);
+    .finally(() => {
+      releaseDelivery(runId, token);
+      const liveRun = manager.getRun?.(runId);
+      const owner = liveRun
+        ? resolveDeliverySessionId(liveRun, manager)
+        : (manager.getPersistence?.().load(runId)?.sessionId ?? sessionId);
+      const current = owner ? sessionEndpoints.get(owner) : undefined;
+      // A rebind may have tried to flush while this send still owned the lock.
+      // Hand off after either settlement, including a successful stale ACK.
+      if (current && !current.suspended && current.manager && current !== endpoint) {
+        flushSessionDiskPending(current.manager, current.sessionId, current);
+      }
+    });
 }
 
 function routeBackgroundDelivery(
@@ -619,18 +985,28 @@ function routeBackgroundDelivery(
   marker: PendingDeliveryMarker,
   content: string,
 ): void {
-  // 1. Mark pending first (fail closed / crash safe).
-  markRunPending(run, marker);
-  persistRunPendingBestEffort(manager, run);
+  // 1. Mark pending first (fail closed / crash safe). Repeated lifecycle
+  // events reuse the same id so host-session history can deduplicate retries.
+  const pending = markRunPending(run, marker);
+  const deliveryId = pending.deliveryId;
+  if (!deliveryId) return;
+  const persisted = persistRunPending(manager, run);
 
   const sessionId = resolveDeliverySessionId(run, manager);
   if (!sessionId) {
-    console.warn(`[workflow-delivery] run ${run.runId} has no sessionId; leaving pending on disk (fail closed).`);
+    return;
+  }
+
+  if (!persisted) {
+    const endpoint = sessionEndpoints.get(sessionId);
+    if (endpoint && !endpoint.suspended) {
+      scheduleDeliveryRetry(manager, run.runId, sessionId, endpoint.generation);
+    }
     return;
   }
 
   // 2. Deliver only via the originating session's endpoint; clear after ACK.
-  deliverAndAck(manager, run.runId, sessionId, content, run);
+  deliverAndAck(manager, run.runId, sessionId, content, deliveryId, run);
 }
 
 /**
@@ -647,6 +1023,8 @@ export function bindSessionDelivery(
   pi: ExtensionAPI,
   opts: {
     loadSettings?: () => WorkflowSettings;
+    /** UI-safe, rate-limited warning for actionable delivery failures only. */
+    reportWarning?: (message: string) => void;
     manager?: WorkflowManager;
     /**
      * Optional explicit thenable send (tests / DI). Wins over the process-wide
@@ -676,7 +1054,6 @@ export function bindSessionDelivery(
   try {
     const liveId = opts.sessionManager?.getSessionId?.();
     if (liveId && liveId !== sessionId) {
-      console.warn(`[workflow-delivery] refusing bind: sessionManager id ${liveId} !== endpoint ${sessionId}`);
       return;
     }
   } catch {
@@ -693,14 +1070,14 @@ export function bindSessionDelivery(
     stolen = boundSessionSends.get(sessionId);
   }
 
-  if (!stolen) {
-    console.warn(
-      `[workflow-delivery] no session-stable thenable send for session ${sessionId}; ` +
-        "endpoint registered fail-closed (completions stay on disk until a host send is captured).",
-    );
-  }
-
   const prev = sessionEndpoints.get(sessionId);
+  // Retire unsent waits from the previous endpoint. Already-started sends keep
+  // their lock until actual settlement; reload is not an SDK abort barrier.
+  for (const waiter of activeStreamingWaiters) {
+    if (waiter.sessionId === sessionId && !waiter.hasStarted()) {
+      waiter.cancel(new Error("session delivery rebound before send"));
+    }
+  }
   const endpoint: SessionDeliveryEndpoint = {
     sessionId,
     send: stolen,
@@ -708,6 +1085,7 @@ export function bindSessionDelivery(
     suspended: false,
     generation: (prev?.generation ?? 0) + 1,
     manager: opts.manager ?? prev?.manager,
+    reportWarning: opts.reportWarning ?? prev?.reportWarning,
   };
   sessionEndpoints.set(sessionId, endpoint);
 
@@ -722,6 +1100,18 @@ export function suspendSessionDelivery(sessionId: string | undefined): void {
   if (!sessionId) return;
   const endpoint = sessionEndpoints.get(sessionId);
   if (endpoint) endpoint.suspended = true;
+
+  // Only an unsent wait is safe to cancel. A started send can still persist
+  // after shutdown/reload, so retain ownership until its real outcome is known.
+  for (const waiter of activeStreamingWaiters) {
+    if (waiter.sessionId === sessionId && !waiter.hasStarted()) {
+      waiter.cancel(new Error("session delivery suspended"));
+    }
+  }
+
+  for (const [runId, retry] of deliveryRetries) {
+    if (retry.sessionId === sessionId) cancelDeliveryRetry(runId);
+  }
 }
 
 /**
@@ -731,6 +1121,8 @@ export function suspendSessionDelivery(sessionId: string | undefined): void {
  */
 export function dropSessionDelivery(sessionId: string | undefined): void {
   if (!sessionId) return;
+  suspendSessionDelivery(sessionId);
+  cancelSessionDeliveryState(sessionId);
   sessionEndpoints.delete(sessionId);
   boundSessionSends.delete(sessionId);
   // A dropped session may be rebound fresh (e.g. replaced id): forget probe
@@ -756,9 +1148,28 @@ function flushSessionDiskPending(manager: WorkflowManager, sessionId: string, en
 
   const tryOne = (runId: string, marker: PendingDeliveryMarker, run?: ManagedRun, persisted?: PersistedRunState) => {
     if (inFlightDeliveries.has(runId)) return;
-    const content = contentForPending(manager, runId, marker, endpoint.loadSettings, run, persisted);
+    let identified = marker;
+    if (!identified.deliveryId) {
+      identified = markerWithId(marker);
+      if (run) run.pendingDelivery = identified;
+      try {
+        const persistence = manager.getPersistence?.();
+        const state = persisted ?? persistence?.load(runId);
+        if (persistence && state) persistence.save({ ...state, pendingDelivery: identified });
+      } catch {
+        warnDelivery(sessionId, `Workflow ${runId}: delivery deferred because its marker could not be saved.`);
+        return;
+      }
+    }
+    const deliveryId = identified.deliveryId;
+    if (!deliveryId) return;
+    if (run && !persistRunPending(manager, run)) {
+      scheduleDeliveryRetry(manager, runId, sessionId, endpoint.generation);
+      return;
+    }
+    const content = contentForPending(manager, runId, identified, endpoint.loadSettings, run, persisted);
     if (content === undefined) return;
-    deliverAndAck(manager, runId, sessionId, content, run);
+    deliverAndAck(manager, runId, sessionId, content, deliveryId, run);
   };
 
   // Live in-memory runs for this session. Null sessionId is claimable only for
@@ -867,6 +1278,37 @@ export function installResultDelivery(
     manager.on("stopped", emitLifecycle("stopped"));
   }
 
+  if (!m.__deliveryTurnEndInstalled) {
+    m.__deliveryTurnEndInstalled = true;
+    pi.on?.("turn_end", (_event: unknown, ctx?: { sessionManager?: { getSessionId?: () => string } }) => {
+      let sid: string | undefined;
+      try {
+        sid = ctx?.sessionManager?.getSessionId?.() ?? manager.getSessionId?.();
+      } catch {
+        sid = manager.getSessionId?.();
+      }
+      if (!sid) return;
+
+      let endpoint = sessionEndpoints.get(sid);
+      if (!endpoint || typeof endpoint.send !== "function") {
+        probeHostSessionSend(pi, sid);
+        const stolen = boundSessionSends.get(sid);
+        if (stolen) {
+          bindSessionDelivery(sid, pi, {
+            loadSettings: opts.loadSettings ?? m.__deliveryLoadSettings,
+            manager,
+            sessionManager: ctx?.sessionManager,
+          });
+          endpoint = sessionEndpoints.get(sid);
+        }
+      }
+
+      if (endpoint && !endpoint.suspended && endpoint.manager) {
+        flushSessionDiskPending(endpoint.manager, sid, endpoint);
+      }
+    });
+  }
+
   if (m.__deliveryInstalled) {
     // Listeners survive session replacement. Refresh loadSettings / manager
     // pointers only — do NOT mutate send, generation, or suspended here.
@@ -938,10 +1380,23 @@ export function installResultDelivery(
 
 /** @internal test helper — reset process-wide delivery registries between cases. */
 export function _resetDeliveryRegistriesForTests(): void {
+  for (const waiter of activeStreamingWaiters) {
+    waiter.cancel(new Error("test reset"));
+  }
+  activeStreamingWaiters.clear();
+  streamingAckTimeoutMs = DEFAULT_STREAMING_ACK_TIMEOUT_MS;
   sessionEndpoints.clear();
   boundSessionSends.clear();
   inFlightDeliveries.clear();
+  for (const retry of deliveryRetries.values()) if (retry.timer) clearTimeout(retry.timer);
+  deliveryRetries.clear();
+  deliveredAwaitingClear.clear();
+  inFlightSeq = 0;
   probedSessionIds.clear();
+}
+
+export function _setStreamingAckTimeoutForTests(timeoutMs: number): void {
+  streamingAckTimeoutMs = timeoutMs;
 }
 
 /** @internal test helper — register a thenable session-stable send (steal map). */
@@ -982,7 +1437,8 @@ export function _getSessionDeliveryEndpointForTests(
 export function renderPanel(manager: WorkflowManager, theme: Theme, width?: number): string[] {
   const all = manager.listRuns();
   const active = all.filter((r) => r.status === "running" || r.status === "paused");
-  if (!active.length) return [];
+  const pending = all.filter((r) => r.status !== "running" && r.status !== "paused" && r.pendingDelivery);
+  if (!active.length && !pending.length) return [];
   const rows = active.map((r) => {
     const live = manager.getRun(r.runId);
     const agents = live?.snapshot.agents ?? r.agents;
@@ -991,16 +1447,20 @@ export function renderPanel(manager: WorkflowManager, theme: Theme, width?: numb
     const phase = live?.snapshot.currentPhase ? ` · ${live.snapshot.currentPhase}` : "";
     return `  ${icon} ${r.workflowName}  ${done}/${agents.length} agents${phase}`;
   });
+  const pendingRows = pending.map((r) => `  ⏳ ${r.workflowName}  ${r.status}, result delivery pending`);
   // Finished runs leave this live panel but are kept in the navigator. Tell the
   // user so a completed run doesn't look like it vanished.
-  const finished = all.filter((r) => r.status !== "running" && r.status !== "paused").length;
+  const finished = all.filter((r) => r.status !== "running" && r.status !== "paused" && !r.pendingDelivery).length;
   const hint = theme.fg(
     "dim",
     finished > 0
       ? `  /workflows — open navigator (${finished} finished kept in history)`
       : "  /workflows — open navigator",
   );
-  return [theme.bold(`Workflows running (${active.length}):`), ...rows, hint].map((line) => fitLine(line, width));
+  const header = active.length
+    ? theme.bold(`Workflows running (${active.length}):`)
+    : theme.bold(`Workflows pending delivery (${pending.length}):`);
+  return [header, ...rows, ...pendingRows, hint].map((line) => fitLine(line, width));
 }
 
 // ─── Detailed mode: live token rate ────────────────────────────────────────────
@@ -1121,9 +1581,13 @@ export function renderPanelDetailed(
 ): string[] {
   const all = manager.listRuns();
   const active = all.filter((r) => r.status === "running" || r.status === "paused");
-  if (!active.length) return [];
+  const pending = all.filter((r) => r.status !== "running" && r.status !== "paused" && r.pendingDelivery);
+  if (!active.length && !pending.length) return [];
   const dim = (t: string) => theme.fg("dim", t);
-  const out: string[] = [theme.bold(`Workflows running (${active.length}):`)];
+  const header = active.length
+    ? theme.bold(`Workflows running (${active.length}):`)
+    : theme.bold(`Workflows pending delivery (${pending.length}):`);
+  const out: string[] = [header];
 
   for (const r of active) {
     const live = manager.getRun(r.runId);
@@ -1153,7 +1617,11 @@ export function renderPanelDetailed(
     if (snap) out.push(...renderRunBody(snap, agents, maxAgents, theme));
   }
 
-  const finished = all.filter((r) => r.status !== "running" && r.status !== "paused").length;
+  for (const r of pending) {
+    out.push(`  ⏳ ${theme.bold(r.workflowName)}  ${dim(`${r.status}, result delivery pending`)}`);
+  }
+
+  const finished = all.filter((r) => r.status !== "running" && r.status !== "paused" && !r.pendingDelivery).length;
   out.push(
     dim(
       finished > 0
