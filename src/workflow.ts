@@ -339,7 +339,9 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    * no configured entry it falls back to the session's main model.
    */
   tier?: string;
-  isolation?: "worktree";
+  isolation?: "worktree" | false;
+  /** Default true. False deletes the isolation worktree after the call (test runs). */
+  keepWorktree?: boolean;
   /**
    * Re-enter a named subagent conversation during this workflow invocation.
    * Calls using the same name must be sequential. Thread state is never resumed
@@ -696,9 +698,11 @@ export async function runWorkflow<T = unknown>(
 
     // Resolve a named agentType to its bound definition (tools/model/prompt).
     const agentDef = resolveAgentType(agentOptions.agentType, agentRegistry);
-    if (agentOptions.thread && (agentOptions.isolation === "worktree" || agentDef?.isolation === "worktree")) {
+    const resolvedIsolation =
+      agentOptions.isolation === false ? undefined : (agentOptions.isolation ?? agentDef?.isolation);
+    if (agentOptions.thread && resolvedIsolation === "worktree") {
       throw new WorkflowError(
-        `agent thread "${agentOptions.thread}" cannot use worktree isolation because worktrees are removed after each call`,
+        `agent thread "${agentOptions.thread}" cannot use worktree isolation`,
         WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
         { recoverable: false },
       );
@@ -725,7 +729,14 @@ export async function runWorkflow<T = unknown>(
     // Deterministic resume key: assigned at lexical call time, before the limiter,
     // so parallel()/pipeline() fan-out is reproducible for a fixed script.
     const callIndex = state.callSeq++;
-    const callHash = hashAgentCall(prompt, modelSpec, assignedPhase, agentOptions, agentDefinitionKey(agentDef));
+    const callHash = hashAgentCall(
+      prompt,
+      modelSpec,
+      assignedPhase,
+      agentOptions,
+      agentDefinitionKey(agentDef),
+      resolvedIsolation,
+    );
     // Store delta key: callIndex alone is NOT run-unique. A nested workflow()
     // call (see workflowFn below) shares this run's SharedStore instance but
     // restarts its own callSeq at 0, so a parent agent and a concurrently
@@ -791,18 +802,19 @@ export async function runWorkflow<T = unknown>(
       const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
       const maxAttempts = retryAttempts + 1;
 
-      options.onAgentStart?.({ id: deltaKey, label, phase: assignedPhase, prompt, model: displayModel });
-
-      // Optional per-agent worktree isolation (deterministic name -> stable resume keys).
-      // Precedence: explicit call-site isolation > agentDef isolation.
-      // Note: passing { isolation: undefined } falls through ?? to the def's value — there
-      // is no sentinel to suppress a def's isolation at the call site. Remove the agentType
-      // or override with a def that has no isolation field if opt-out is needed.
+      // Requested isolation is mandatory for this call; retained trees belong
+      // to their original execution, not a later retry/resume.
+      // Precedence: isolation: false opts out; else call-site isolation > agentDef isolation.
       let worktree: Worktree | undefined;
-      const resolvedIsolation = agentOptions.isolation ?? agentDef?.isolation;
       if (resolvedIsolation === "worktree") {
         worktree = await createWorktree(baseCwd, `${runId}-${callIndex}-${label}`);
-        if (!worktree.isolated) log(`isolation ignored for "${label}" (${worktree.reason})`);
+        if (!worktree.isolated) {
+          throw new WorkflowError(
+            `worktree isolation failed for "${label}": ${worktree.reason}`,
+            WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+            { recoverable: false },
+          );
+        }
       }
       const runCwd = worktree?.isolated ? worktree.cwd : undefined;
 
@@ -817,6 +829,7 @@ export async function runWorkflow<T = unknown>(
       });
 
       try {
+        options.onAgentStart?.({ id: deltaKey, label, phase: assignedPhase, prompt, model: displayModel });
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
           const attemptUsage = usageTracker.startAttempt();
           const externalSignal = options.signal;
@@ -1013,8 +1026,13 @@ export async function runWorkflow<T = unknown>(
         }
         return null;
       } finally {
-        // Always tear down the worktree, even on timeout/abort.
-        if (worktree?.isolated) await removeWorktree(worktree);
+        if (worktree?.isolated) {
+          if (agentOptions.keepWorktree === false) {
+            await removeWorktree(worktree);
+          } else {
+            log(`worktree kept: ${worktree.cwd}${worktree.branch ? ` (${worktree.branch})` : ""}`);
+          }
+        }
       }
     });
   };
@@ -1692,6 +1710,7 @@ function hashAgentCall(
   phase: string | undefined,
   options: AgentOptions,
   agentDefKey: string | null,
+  resolvedIsolation?: "worktree",
 ): string {
   const identity = JSON.stringify({
     prompt,
@@ -1704,6 +1723,8 @@ function hashAgentCall(
     // this call's cached result on a later resume.
     agentDef: agentDefKey,
     schema: options.schema ?? null,
+    ...(options.isolation !== undefined ? { isolation: options.isolation } : {}),
+    ...(resolvedIsolation === "worktree" ? { keepWorktree: options.keepWorktree !== false } : {}),
   });
   return createHash("sha256").update(identity).digest("hex");
 }
