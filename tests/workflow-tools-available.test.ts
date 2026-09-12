@@ -1019,7 +1019,7 @@ describe("workflow extension - control tool availability", () => {
           },
           sendMessage: () => {},
         } as unknown as ExtensionAPI;
-        const { default: installExtension } = await import("../extensions/workflow.js");
+        const { default: installExtension } = await import("../src/pi-extension.js");
         installExtension(pi);
 
         const context = {
