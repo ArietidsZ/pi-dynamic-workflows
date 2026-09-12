@@ -323,6 +323,7 @@ export default function extension(pi: ExtensionAPI) {
     if (sessionId) {
       bindSessionDelivery(sessionId, pi, {
         loadSettings: () => loadWorkflowSettings({ cwd: getCwd() }),
+        reportWarning: (message) => ctx.ui.notify(message, "warning"),
         manager,
         sessionManager: ctx.sessionManager,
       });

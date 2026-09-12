@@ -7,6 +7,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { closeSync, openSync, readSync } from "node:fs";
 import { join } from "node:path";
 import {
   AgentSession,
@@ -178,6 +179,8 @@ type DeliverySend = (message: DeliveryMessage, options: { triggerTurn: boolean; 
 
 interface SessionDeliveryEndpoint {
   sessionId: string;
+  reportWarning?: (message: string) => void;
+  warned?: boolean;
   /**
    * Session-stable send that MUST return a thenable for ACK. Captured from
    * the host AgentSession.sendCustomMessage (not the void actions.sendMessage
@@ -204,6 +207,17 @@ interface SessionDeliveryEndpoint {
 /** Process-wide: one live endpoint per pi session id. */
 const sessionEndpoints = new Map<string, SessionDeliveryEndpoint>();
 
+function warnDelivery(sessionId: string | undefined, message: string): void {
+  const endpoint = sessionId ? sessionEndpoints.get(sessionId) : undefined;
+  if (!endpoint || endpoint.warned || !endpoint.reportWarning) return;
+  endpoint.warned = true;
+  try {
+    endpoint.reportWarning(message);
+  } catch {
+    // Diagnostics must never affect delivery or write raw stderr over the TUI.
+  }
+}
+
 /**
  * Session-stable thenable sends (host AgentSession.sendCustomMessage). Keyed
  * by host sessionId only — workflow children (in-memory, noExtensions, or
@@ -223,6 +237,7 @@ let streamingAckTimeoutMs = DEFAULT_STREAMING_ACK_TIMEOUT_MS;
 interface ActiveStreamingWaiter {
   sessionId: string;
   deliveryId: string;
+  hasStarted: () => boolean;
   cancel: (error: Error) => void;
 }
 const activeStreamingWaiters = new Set<ActiveStreamingWaiter>();
@@ -270,10 +285,9 @@ function probeHostSessionSend(pi: ExtensionAPI, sessionId: string): void {
   if (probedSessionIds.has(sessionId)) return;
   try {
     pi.sendMessage({ customType: DELIVERY_PROBE_CUSTOM_TYPE, content: "", display: false }, { triggerTurn: false });
-  } catch (err) {
+  } catch {
     // Probe is best-effort; bind stays fail-closed without a captured send.
     // Not marked probed — the next bindSessionDelivery retries.
-    console.warn(`[workflow-delivery] delivery probe failed on session ${sessionId}:`, err);
     return;
   }
   if (boundSessionSends.has(sessionId)) probedSessionIds.add(sessionId);
@@ -285,6 +299,8 @@ let bindCoreObserved = false;
 interface StealCandidate {
   sendCustomMessage?: DeliverySend;
   isStreaming?: boolean;
+  isIdle?: boolean;
+  waitForIdle?: () => Promise<void>;
   agent?: {
     hasQueuedMessages?: () => boolean;
   };
@@ -301,6 +317,8 @@ interface StealCandidate {
     getSessionId?: () => string;
     getSessionName?: () => string | undefined;
     getEntries?: () => Array<{ type?: string; customType?: string; details?: unknown }>;
+    getBranch?: () => Array<{ id?: string; type?: string; customType?: string; details?: unknown }>;
+    getSessionFile?: () => string | undefined;
     isPersisted?: () => boolean;
     isSessionOnDisk?: () => boolean;
   };
@@ -351,17 +369,45 @@ function deliveryIdFromDetails(details: unknown): string | undefined {
   return typeof deliveryId === "string" && deliveryId ? deliveryId : undefined;
 }
 
-function sessionHasDelivery(session: StealCandidate, deliveryId: string): boolean | undefined {
-  if (typeof session.sessionManager?.getEntries !== "function") return undefined;
+/** Scan the SDK's JSONL record without allocating the entire session history. */
+function sessionFileContainsEntry(path: string, entry: object): boolean {
+  const needle = Buffer.from(`\n${JSON.stringify(entry)}\n`);
+  let fd: number | undefined;
   try {
-    return session.sessionManager
-      .getEntries()
-      .some(
+    fd = openSync(path, "r");
+    const chunk = Buffer.allocUnsafe(64 * 1024);
+    let tail: Buffer = Buffer.alloc(0);
+    for (;;) {
+      const count = readSync(fd, chunk);
+      if (count === 0) return false;
+      const window = Buffer.concat([tail, chunk.subarray(0, count)]);
+      if (window.indexOf(needle) !== -1) return true;
+      tail = window.subarray(Math.max(0, window.length - needle.length + 1));
+    }
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function sessionHasDelivery(session: StealCandidate, deliveryId: string): boolean | undefined {
+  const sm = session.sessionManager;
+  if (typeof sm?.getBranch !== "function" || typeof sm.getSessionFile !== "function") return undefined;
+  try {
+    const entries = sm
+      .getBranch()
+      .filter(
         (entry) =>
+          typeof entry.id === "string" &&
           entry.type === "custom_message" &&
           entry.customType === "workflow-result" &&
           deliveryIdFromDetails(entry.details) === deliveryId,
       );
+    const file = sm.getSessionFile();
+    // getEntries includes abandoned branches; even getBranch can contain a
+    // memory-only entry after a failed/lazy persist. Neither alone is an ACK.
+    return !!file && entries.some((entry) => sessionFileContainsEntry(file, entry));
   } catch {
     return undefined;
   }
@@ -376,16 +422,17 @@ function captureHostSessionSend(session: StealCandidate, probe?: boolean): void 
     const deliveryId = deliveryIdFromDetails(message.details);
     if (deliveryId && sessionHasDelivery(session, deliveryId) === true) return Promise.resolve();
 
-    // An idle triggerTurn send resolves only after the message has been appended
-    // and its turn has settled. A streaming follow-up resolves immediately after
-    // queueing, so wait for the matching message_end instead; replacement can
-    // otherwise discard the queue after we have already cleared pendingDelivery.
-    if (!deliveryId || !session.isStreaming || typeof session.subscribe !== "function") {
+    if (!deliveryId) {
       return send.call(session, message, options);
+    }
+    if (typeof session.subscribe !== "function" || sessionHasDelivery(session, deliveryId) === undefined) {
+      return Promise.reject(new Error("host cannot confirm workflow result delivery"));
     }
 
     return new Promise<void>((resolve, reject) => {
       let settled = false;
+      let started = false;
+      let waitingForIdle = false;
       let unsubscribe = () => {};
       let timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -402,6 +449,7 @@ function captureHostSessionSend(session: StealCandidate, probe?: boolean): void 
       const waiterRecord: ActiveStreamingWaiter = {
         sessionId: sid,
         deliveryId,
+        hasStarted: () => started,
         cancel: (err) => finish(err),
       };
       activeStreamingWaiters.add(waiterRecord);
@@ -411,7 +459,9 @@ function captureHostSessionSend(session: StealCandidate, probe?: boolean): void 
           queueMicrotask(() => {
             if (settled) return;
             if (sessionHasDelivery(session, deliveryId) === true) finish();
-            else finish(new Error("timed out waiting for follow-up message_end"));
+            // No host queue item exists before start, so a retry is safe. Once
+            // started, never infer non-delivery from elapsed time.
+            else if (!started) finish(new Error("timed out waiting for an idle host"));
           });
         }, streamingAckTimeoutMs);
         timer.unref?.();
@@ -419,59 +469,71 @@ function captureHostSessionSend(session: StealCandidate, probe?: boolean): void 
 
       unsubscribe =
         session.subscribe?.((event) => {
-          if (
-            event.type === "message_end" &&
-            event.message?.role === "custom" &&
-            event.message.customType === "workflow-result" &&
-            deliveryIdFromDetails(event.message.details) === deliveryId
-          ) {
-            // AgentSession persists a custom message immediately after message_end
-            // listeners run. Check on the next microtask so the ACK is durable.
+          if (event.type === "message_end") {
+            // A fresh session may flush the input only when its first assistant
+            // message completes. Recheck disk, not just the custom input event.
             queueMicrotask(() => {
               if (settled) return;
               const persisted = sessionHasDelivery(session, deliveryId);
               if (persisted === true) finish();
-              else finish(new Error("workflow result was not persisted after message_end"));
+              // A persistence failure is not proof that a started prompt was
+              // cancelled. Its send promise remains the failure boundary.
             });
             return;
           }
 
-          // If the agent run ended without persisting the follow-up, it cannot land.
-          if (event.type === "agent_end" || event.type === "agent_settled") {
-            queueMicrotask(() => {
-              if (settled) return;
-              if (sessionHasDelivery(session, deliveryId) === true) finish();
-              else finish(new Error(`agent turn ended without delivering follow-up (${event.type})`));
-            });
-            return;
-          }
-
-          if (event.type === "queue_update") {
-            const followUp = (event as { followUp?: unknown[] }).followUp;
-            const queueEmptied =
-              followUp === undefined ||
-              (Array.isArray(followUp) && followUp.length === 0) ||
-              (typeof session.agent?.hasQueuedMessages === "function" && !session.agent.hasQueuedMessages());
-            if (queueEmptied) {
-              queueMicrotask(() => {
-                if (settled) return;
-                if (sessionHasDelivery(session, deliveryId) === true) finish();
-                else finish(new Error("follow-up discarded from queue (queue_update)"));
-              });
-            }
+          if (event.type === "agent_settled" || event.type === "compaction_end") {
+            // An unrelated queue_update only describes user text; it cannot
+            // establish ownership or consumption of a custom follow-up.
+            queueMicrotask(startWhenIdle);
           }
         }) ?? (() => {});
 
-      try {
-        const queued = send.call(session, message, options);
-        if (queued == null || typeof (queued as { then?: unknown }).then !== "function") {
-          finish(new Error("workflow result send did not return a thenable"));
+      function startWhenIdle() {
+        if (!deliveryId || !send) return;
+        if (settled || started) return;
+        if (session.isStreaming || session.isIdle === false) {
+          if (!waitingForIdle && typeof session.waitForIdle === "function") {
+            waitingForIdle = true;
+            void session.waitForIdle().then(() => {
+              waitingForIdle = false;
+              startWhenIdle();
+            }, finish);
+          }
           return;
         }
-        Promise.resolve(queued).catch(finish);
-      } catch (error) {
-        finish(error);
+        if (session.sessionManager?.getSessionId?.() !== sid) {
+          finish(new Error("host session identity changed before delivery"));
+          return;
+        }
+        if (sessionHasDelivery(session, deliveryId) === true) {
+          finish();
+          return;
+        }
+        // No await between idle inspection and send: this path never installs
+        // a custom message in the host's unobservable follow-up queue.
+        started = true;
+        if (timer) clearTimeout(timer);
+        try {
+          const pending = send.call(session, message, options);
+          if (pending == null || typeof (pending as { then?: unknown }).then !== "function") {
+            finish(new Error("workflow result send did not return a thenable"));
+            return;
+          }
+          Promise.resolve(pending).then(
+            () =>
+              finish(
+                sessionHasDelivery(session, deliveryId) === true
+                  ? undefined
+                  : new Error("host send settled without persisting workflow result"),
+              ),
+            (error) => finish(sessionHasDelivery(session, deliveryId) === true ? undefined : error),
+          );
+        } catch (error) {
+          finish(error);
+        }
       }
+      startWhenIdle();
     });
   });
 }
@@ -628,8 +690,11 @@ function clearRunPending(
     }
     if (live) live.pendingDelivery = undefined;
     return "cleared";
-  } catch (error) {
-    console.warn(`[workflow-delivery] failed to clear pending marker for ${runId}:`, error);
+  } catch {
+    warnDelivery(
+      run?.sessionId ?? manager.getSessionId?.(),
+      `Workflow ${runId}: result delivered, but its pending marker could not be cleared.`,
+    );
     return "failed";
   }
 }
@@ -666,8 +731,11 @@ function persistRunPending(manager: WorkflowManager, run: ManagedRun): boolean {
       });
     }
     return true;
-  } catch (error) {
-    console.warn(`[workflow-delivery] failed to persist pending marker for ${run.runId}:`, error);
+  } catch {
+    warnDelivery(
+      run.sessionId,
+      `Workflow ${run.runId}: delivery deferred because its pending marker could not be saved.`,
+    );
     return false;
   }
 }
@@ -739,7 +807,7 @@ function tryDeliverEndpoint(endpoint: SessionDeliveryEndpoint, content: string, 
           },
           (err: unknown) => {
             const msg = err instanceof Error ? err.message : String(err);
-            console.warn(`[workflow-delivery] async send failed; left pending on disk: ${msg}`);
+            warnDelivery(sessionId, `Workflow result remains pending: ${msg}`);
             const current = sessionEndpoints.get(sessionId);
             // If a newer generation already bound, caller may re-flush; signal failure.
             if (current && current.generation !== startedGeneration && !current.suspended) {
@@ -750,13 +818,14 @@ function tryDeliverEndpoint(endpoint: SessionDeliveryEndpoint, content: string, 
         );
       }
       // Non-thenable send (void fire-and-forget) — do not trust as ACK.
-      console.warn(
+      warnDelivery(
+        endpoint.sessionId,
         `[workflow-delivery] send for session ${endpoint.sessionId} did not return a thenable; ` +
           "not treating as delivered (fail closed).",
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.warn(`[workflow-delivery] send failed; left pending on disk: ${msg}`);
+      warnDelivery(endpoint.sessionId, `Workflow result remains pending: ${msg}`);
       return Promise.resolve(false);
     }
   }
@@ -784,7 +853,10 @@ function scheduleDeliveryRetry(manager: WorkflowManager, runId: string, sessionI
   if (current?.timer && current.generation === generation) return;
   const attempt = current?.generation === generation ? current.attempt : 0;
   if (attempt >= DELIVERY_RETRY_DELAYS_MS.length) {
-    console.warn(`[workflow-delivery] delivery for ${runId} remains pending after retries`);
+    warnDelivery(
+      sessionId,
+      `Workflow ${runId}: result remains pending after delivery retries. Open /workflows to inspect it.`,
+    );
     return;
   }
 
@@ -815,15 +887,14 @@ function deliverAndAck(
   if (inFlightDeliveries.has(runId)) return;
   const endpoint = sessionEndpoints.get(sessionId);
   if (!endpoint) {
-    console.warn(`[workflow-delivery] delivery for ${runId} deferred: missing endpoint for session ${sessionId}`);
     return;
   }
   if (endpoint.suspended) {
-    console.warn(`[workflow-delivery] delivery for ${runId} deferred: endpoint for session ${sessionId} is suspended`);
     return;
   }
   if (endpoint.sessionId !== sessionId) {
-    console.warn(
+    warnDelivery(
+      sessionId,
       `[workflow-delivery] delivery for ${runId} deferred: endpoint sessionId ${endpoint.sessionId} !== ${sessionId}`,
     );
     return;
@@ -849,7 +920,8 @@ function deliverAndAck(
   // synchronous re-bind + flush (e.g. probe retry on the next session_start)
   // is not locked out by a microtask that has not run yet.
   if (typeof endpoint.send !== "function") {
-    console.warn(
+    warnDelivery(
+      sessionId,
       `[workflow-delivery] delivery for ${runId} deferred: endpoint for session ${sessionId} has no thenable send function`,
     );
     return;
@@ -892,7 +964,19 @@ function deliverAndAck(
         scheduleDeliveryRetry(manager, runId, sessionId, startedGeneration);
       }
     })
-    .finally(() => releaseDelivery(runId, token));
+    .finally(() => {
+      releaseDelivery(runId, token);
+      const liveRun = manager.getRun?.(runId);
+      const owner = liveRun
+        ? resolveDeliverySessionId(liveRun, manager)
+        : (manager.getPersistence?.().load(runId)?.sessionId ?? sessionId);
+      const current = owner ? sessionEndpoints.get(owner) : undefined;
+      // A rebind may have tried to flush while this send still owned the lock.
+      // Hand off after either settlement, including a successful stale ACK.
+      if (current && !current.suspended && current.manager && current !== endpoint) {
+        flushSessionDiskPending(current.manager, current.sessionId, current);
+      }
+    });
 }
 
 function routeBackgroundDelivery(
@@ -910,12 +994,10 @@ function routeBackgroundDelivery(
 
   const sessionId = resolveDeliverySessionId(run, manager);
   if (!sessionId) {
-    console.warn(`[workflow-delivery] run ${run.runId} has no sessionId; leaving pending on disk (fail closed).`);
     return;
   }
 
   if (!persisted) {
-    console.warn(`[workflow-delivery] delivery for ${run.runId} deferred: marker could not be persisted`);
     const endpoint = sessionEndpoints.get(sessionId);
     if (endpoint && !endpoint.suspended) {
       scheduleDeliveryRetry(manager, run.runId, sessionId, endpoint.generation);
@@ -941,6 +1023,8 @@ export function bindSessionDelivery(
   pi: ExtensionAPI,
   opts: {
     loadSettings?: () => WorkflowSettings;
+    /** UI-safe, rate-limited warning for actionable delivery failures only. */
+    reportWarning?: (message: string) => void;
     manager?: WorkflowManager;
     /**
      * Optional explicit thenable send (tests / DI). Wins over the process-wide
@@ -970,7 +1054,6 @@ export function bindSessionDelivery(
   try {
     const liveId = opts.sessionManager?.getSessionId?.();
     if (liveId && liveId !== sessionId) {
-      console.warn(`[workflow-delivery] refusing bind: sessionManager id ${liveId} !== endpoint ${sessionId}`);
       return;
     }
   } catch {
@@ -987,14 +1070,14 @@ export function bindSessionDelivery(
     stolen = boundSessionSends.get(sessionId);
   }
 
-  if (!stolen) {
-    console.warn(
-      `[workflow-delivery] no session-stable thenable send for session ${sessionId}; ` +
-        "endpoint registered fail-closed (completions stay on disk until a host send is captured).",
-    );
-  }
-
   const prev = sessionEndpoints.get(sessionId);
+  // Retire unsent waits from the previous endpoint. Already-started sends keep
+  // their lock until actual settlement; reload is not an SDK abort barrier.
+  for (const waiter of activeStreamingWaiters) {
+    if (waiter.sessionId === sessionId && !waiter.hasStarted()) {
+      waiter.cancel(new Error("session delivery rebound before send"));
+    }
+  }
   const endpoint: SessionDeliveryEndpoint = {
     sessionId,
     send: stolen,
@@ -1002,6 +1085,7 @@ export function bindSessionDelivery(
     suspended: false,
     generation: (prev?.generation ?? 0) + 1,
     manager: opts.manager ?? prev?.manager,
+    reportWarning: opts.reportWarning ?? prev?.reportWarning,
   };
   sessionEndpoints.set(sessionId, endpoint);
 
@@ -1017,21 +1101,14 @@ export function suspendSessionDelivery(sessionId: string | undefined): void {
   const endpoint = sessionEndpoints.get(sessionId);
   if (endpoint) endpoint.suspended = true;
 
-  // Cancel any active streaming waiters for this session so zombie waiters
-  // cannot ACK a later generation that reused the same deliveryId.
+  // Only an unsent wait is safe to cancel. A started send can still persist
+  // after shutdown/reload, so retain ownership until its real outcome is known.
   for (const waiter of activeStreamingWaiters) {
-    if (waiter.sessionId === sessionId) {
+    if (waiter.sessionId === sessionId && !waiter.hasStarted()) {
       waiter.cancel(new Error("session delivery suspended"));
     }
   }
 
-  // A streaming follow-up ACK may still be waiting for message_end. Replacement
-  // can discard that queue, so release only this session's ownership-token locks;
-  // stale promise chains cannot release a newer generation's lock.
-  for (const [runId, inFlight] of inFlightDeliveries) {
-    if (inFlight.sessionId !== sessionId) continue;
-    inFlightDeliveries.delete(runId);
-  }
   for (const [runId, retry] of deliveryRetries) {
     if (retry.sessionId === sessionId) cancelDeliveryRetry(runId);
   }
@@ -1079,8 +1156,8 @@ function flushSessionDiskPending(manager: WorkflowManager, sessionId: string, en
         const persistence = manager.getPersistence?.();
         const state = persisted ?? persistence?.load(runId);
         if (persistence && state) persistence.save({ ...state, pendingDelivery: identified });
-      } catch (error) {
-        console.warn(`[workflow-delivery] failed to assign delivery id for ${runId}:`, error);
+      } catch {
+        warnDelivery(sessionId, `Workflow ${runId}: delivery deferred because its marker could not be saved.`);
         return;
       }
     }
@@ -1370,7 +1447,7 @@ export function renderPanel(manager: WorkflowManager, theme: Theme, width?: numb
     const phase = live?.snapshot.currentPhase ? ` · ${live.snapshot.currentPhase}` : "";
     return `  ${icon} ${r.workflowName}  ${done}/${agents.length} agents${phase}`;
   });
-  const pendingRows = pending.map((r) => `  ⏳ ${r.workflowName}  Completed, result delivery pending`);
+  const pendingRows = pending.map((r) => `  ⏳ ${r.workflowName}  ${r.status}, result delivery pending`);
   // Finished runs leave this live panel but are kept in the navigator. Tell the
   // user so a completed run doesn't look like it vanished.
   const finished = all.filter((r) => r.status !== "running" && r.status !== "paused" && !r.pendingDelivery).length;
@@ -1541,7 +1618,7 @@ export function renderPanelDetailed(
   }
 
   for (const r of pending) {
-    out.push(`  ⏳ ${theme.bold(r.workflowName)}  ${dim("Completed, result delivery pending")}`);
+    out.push(`  ⏳ ${theme.bold(r.workflowName)}  ${dim(`${r.status}, result delivery pending`)}`);
   }
 
   const finished = all.filter((r) => r.status !== "running" && r.status !== "paused" && !r.pendingDelivery).length;
