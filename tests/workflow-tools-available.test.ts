@@ -27,6 +27,7 @@ import {
 } from "../src/extension-reload.js";
 import { _registerBoundSessionSendForTests, _resetDeliveryRegistriesForTests } from "../src/task-panel.js";
 import { buildArmedWorkflowPrompt, WORKFLOW_TOOL_NAME, type WorkflowModeState } from "../src/workflow-editor.js";
+import { saveWorkflowSettings } from "../src/workflow-settings.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 // ---------------------------------------------------------------------------
@@ -365,6 +366,7 @@ describe("workflow extension - control tool availability", () => {
     try {
       await withFakeHomeAsync(fakeHome, async () => {
         discardWorkflowRuntime(process.cwd());
+        saveWorkflowSettings({ defaultEffort: "high" });
         const registeredTools: string[] = [];
         const activeTools = ["bash", "read"];
         const handlers: Record<string, Array<(...args: any[]) => any>> = {};
@@ -405,7 +407,8 @@ describe("workflow extension - control tool availability", () => {
         handlers.session_shutdown?.[0]?.({ reason: "reload" });
         const staged = takeWorkflowRuntime(process.cwd());
         assert.ok(staged, "session_shutdown(reload) stages the live manager for the next extension generation");
-        staged.effort.level = "high";
+        assert.equal(staged.effort.level, "high", "a fresh session applies the configured default effort");
+        staged.effort.level = "ultra";
         handoffWorkflowRuntime(staged);
 
         const secondHandlers: Record<string, Array<(...args: any[]) => any>> = {};
@@ -440,7 +443,7 @@ describe("workflow extension - control tool availability", () => {
         secondHandlers.session_shutdown?.[0]?.({ reason: "reload" });
         const restaged = takeWorkflowRuntime(process.cwd());
         assert.equal(restaged?.manager, staged.manager, "a compatible generation keeps the exact live manager");
-        assert.equal(restaged?.effort.level, "high", "session effort survives with the compatible runtime");
+        assert.equal(restaged?.effort.level, "ultra", "session effort survives with the compatible runtime");
         discardWorkflowRuntime(process.cwd());
       });
     } finally {
@@ -989,6 +992,58 @@ describe("workflow extension - control tool availability", () => {
       });
     } finally {
       rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  it("loads default effort from the real session cwd only on its first start", async () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-default-effort-"));
+    const otherProject = mkdtempSync(join(tmpdir(), "pi-dw-default-effort-project-"));
+    try {
+      await withFakeHomeAsync(fakeHome, async () => {
+        discardWorkflowRuntime(process.cwd());
+        saveWorkflowSettings({ defaultEffort: "high" });
+        saveWorkflowSettings({ defaultEffort: "ultra" }, { cwd: otherProject, scope: "project" });
+        const activeTools = ["bash", "read"];
+        const handlers: Record<string, Array<(...args: any[]) => any>> = {};
+        const pi = {
+          registerTool: () => {},
+          registerCommand: () => {},
+          getCommands: () => [],
+          on: (event: string, handler: (...args: any[]) => any) => {
+            if (!handlers[event]) handlers[event] = [];
+            handlers[event].push(handler);
+          },
+          getActiveTools: () => [...activeTools],
+          setActiveTools: (tools: string[]) => {
+            activeTools.splice(0, activeTools.length, ...tools);
+          },
+          sendMessage: () => {},
+        } as unknown as ExtensionAPI;
+        const { default: installExtension } = await import("../src/pi-extension.js");
+        installExtension(pi);
+
+        const context = {
+          cwd: otherProject,
+          model: undefined,
+          modelRegistry: {},
+          sessionManager: { getSessionId: () => "default-effort-session" },
+          ui: { setWidget: () => {}, notify: () => {} },
+        };
+        handlers.session_start[0]({}, context);
+        handlers.session_start[0]({}, context);
+        handlers.session_shutdown?.[0]?.({ reason: "reload" });
+
+        const staged = takeWorkflowRuntime(process.cwd());
+        assert.equal(
+          staged?.effort.level,
+          "ultra",
+          "ctx.cwd project settings win over the factory process.cwd settings and are not reset on repeat start",
+        );
+        discardWorkflowRuntime();
+      });
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+      rmSync(otherProject, { recursive: true, force: true });
     }
   });
 
