@@ -341,7 +341,9 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    * no configured entry it falls back to the session's main model.
    */
   tier?: string;
-  isolation?: "worktree";
+  isolation?: "worktree" | false;
+  /** Default true. False deletes the isolation worktree after the call (test runs). */
+  keepWorktree?: boolean;
   /**
    * Bind this call to an existing absolute directory. The runtime resolves it
    * to its real path before dispatch so coding tools and agent identity agree.
@@ -661,8 +663,10 @@ export async function runWorkflow<T = unknown>(
     // slot. Invalid local configuration must not perturb the run's capacity or
     // scheduling state.
     const agentDef = resolveAgentType(agentOptions.agentType, agentRegistry);
+    const resolvedIsolation =
+      agentOptions.isolation === false ? undefined : (agentOptions.isolation ?? agentDef?.isolation);
     const requestedCwd = resolveAgentCwd(agentOptions.cwd);
-    if (requestedCwd && (agentOptions.isolation === "worktree" || agentDef?.isolation === "worktree")) {
+    if (requestedCwd && resolvedIsolation === "worktree") {
       throw new WorkflowError(
         "agent cwd cannot be combined with worktree isolation",
         WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
@@ -715,9 +719,9 @@ export async function runWorkflow<T = unknown>(
 
     const requestedLabel = agentOptions.label?.trim();
 
-    if (agentOptions.thread && (agentOptions.isolation === "worktree" || agentDef?.isolation === "worktree")) {
+    if (agentOptions.thread && resolvedIsolation === "worktree") {
       throw new WorkflowError(
-        `agent thread "${agentOptions.thread}" cannot use worktree isolation because worktrees are removed after each call`,
+        `agent thread "${agentOptions.thread}" cannot use worktree isolation`,
         WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
         { recoverable: false },
       );
@@ -751,6 +755,7 @@ export async function runWorkflow<T = unknown>(
       agentOptions,
       agentDefinitionKey(agentDef),
       requestedCwd,
+      resolvedIsolation,
     );
     // Store delta key: callIndex alone is NOT run-unique. A nested workflow()
     // call (see workflowFn below) shares this run's SharedStore instance but
@@ -817,18 +822,19 @@ export async function runWorkflow<T = unknown>(
       const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
       const maxAttempts = retryAttempts + 1;
 
-      options.onAgentStart?.({ id: deltaKey, label, phase: assignedPhase, prompt, model: displayModel });
-
-      // Optional per-agent worktree isolation (deterministic name -> stable resume keys).
-      // Precedence: explicit call-site isolation > agentDef isolation.
-      // Note: passing { isolation: undefined } falls through ?? to the def's value — there
-      // is no sentinel to suppress a def's isolation at the call site. Remove the agentType
-      // or override with a def that has no isolation field if opt-out is needed.
+      // Requested isolation is mandatory for this call; retained trees belong
+      // to their original execution, not a later retry/resume.
+      // Precedence: isolation: false opts out; else call-site isolation > agentDef isolation.
       let worktree: Worktree | undefined;
-      const resolvedIsolation = agentOptions.isolation ?? agentDef?.isolation;
       if (resolvedIsolation === "worktree") {
         worktree = await createWorktree(baseCwd, `${runId}-${callIndex}-${label}`);
-        if (!worktree.isolated) log(`isolation ignored for "${label}" (${worktree.reason})`);
+        if (!worktree.isolated) {
+          throw new WorkflowError(
+            `worktree isolation failed for "${label}": ${worktree.reason}`,
+            WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+            { recoverable: false },
+          );
+        }
       }
       const runCwd = requestedCwd ?? (worktree?.isolated ? worktree.cwd : undefined);
 
@@ -843,6 +849,7 @@ export async function runWorkflow<T = unknown>(
       });
 
       try {
+        options.onAgentStart?.({ id: deltaKey, label, phase: assignedPhase, prompt, model: displayModel });
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
           const attemptUsage = usageTracker.startAttempt();
           const externalSignal = options.signal;
@@ -964,7 +971,7 @@ export async function runWorkflow<T = unknown>(
               result,
               tokens: usageCommit.tokens,
               tokenUsage: usageCommit.tokenUsage,
-              worktree: runCwd,
+              worktree: worktree?.isolated ? worktree.cwd : undefined,
               model: displayModel,
             });
             return result;
@@ -1015,7 +1022,7 @@ export async function runWorkflow<T = unknown>(
               result: null,
               tokens: usageCommit.tokens,
               tokenUsage: usageCommit.tokenUsage,
-              worktree: runCwd,
+              worktree: worktree?.isolated ? worktree.cwd : undefined,
               model: displayModel,
               error: workflowError.message,
               errorCode: workflowError.code,
@@ -1039,8 +1046,13 @@ export async function runWorkflow<T = unknown>(
         }
         return null;
       } finally {
-        // Always tear down the worktree, even on timeout/abort.
-        if (worktree?.isolated) await removeWorktree(worktree);
+        if (worktree?.isolated) {
+          if (agentOptions.keepWorktree === false) {
+            await removeWorktree(worktree);
+          } else {
+            log(`worktree kept: ${worktree.cwd}${worktree.branch ? ` (${worktree.branch})` : ""}`);
+          }
+        }
       }
     });
   };
@@ -1719,6 +1731,7 @@ function hashAgentCall(
   options: AgentOptions,
   agentDefKey: string | null,
   cwd: string | undefined,
+  resolvedIsolation?: "worktree",
 ): string {
   const identity = JSON.stringify({
     prompt,
@@ -1734,6 +1747,8 @@ function hashAgentCall(
     // Omit the field entirely when cwd was not supplied so journals generated by
     // older releases retain their exact hash and resume behavior.
     ...(cwd === undefined ? {} : { cwd }),
+    ...(options.isolation !== undefined ? { isolation: options.isolation } : {}),
+    ...(resolvedIsolation === "worktree" ? { keepWorktree: options.keepWorktree !== false } : {}),
   });
   return createHash("sha256").update(identity).digest("hex");
 }
