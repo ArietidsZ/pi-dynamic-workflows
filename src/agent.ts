@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { unlinkSync, writeFileSync } from "node:fs";
+import { realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AssistantMessage, Model, TextContent } from "@earendil-works/pi-ai";
 import {
@@ -235,7 +235,10 @@ export interface WorkflowAgentOptions {
    * so a workflow subagent can't fan out through them either (#107).
    */
   excludeTools?: string[];
-  /** Override any createAgentSession option (model, modelRegistry, resourceLoader, etc.). */
+  /**
+   * Override createAgentSession dependencies (model, settingsManager, resourceLoader, etc.).
+   * An explicit per-call cwd and the computed agent identity remain authoritative.
+   */
   session?: Partial<CreateAgentSessionOptions>;
   /** Extra system guidance prepended to every subagent task. */
   instructions?: string;
@@ -633,6 +636,12 @@ export const DEFAULT_EXCLUDED_SUBAGENT_TOOLS = ["workflow", "workflow_control"];
 /** Process-global subagent id counter: unique across concurrent workflow runs. */
 let workflowAgentSeq = 0;
 
+interface ThreadSession {
+  manager: SessionManager;
+  /** Canonical cwd fixed when this named conversation starts. */
+  cwd: string;
+}
+
 /**
  * The full subagent tool denylist: the always-on defaults plus any names the
  * caller added (via WorkflowAgentOptions.excludeTools) or set on the injected
@@ -665,10 +674,10 @@ export class WorkflowAgent {
    */
   private tierConfigBox?: { value: ModelTierConfig | null };
   /**
-   * Shared resource loader for every subagent of this run, built once. See
+   * Resource loaders shared by subagents using the same directory in this run. See
    * getSharedResourceLoader — this is the #109 memory mitigation.
    */
-  private sharedResourceLoaderPromise?: Promise<DefaultResourceLoader>;
+  private readonly resourceLoaders = new Map<string, Promise<DefaultResourceLoader>>();
   /**
    * Emitted at most once per instance (~= once per run, see the class-level
    * lifetime note above): the untagged/default "medium" tier resolved to a
@@ -683,7 +692,7 @@ export class WorkflowAgent {
    * one instance per workflow invocation; embedders that inject and reuse an
    * agent are responsible for choosing the longer thread lifetime deliberately.
    */
-  private readonly threadSessions = new Map<string, SessionManager>();
+  private readonly threadSessions = new Map<string, ThreadSession>();
   private readonly activeThreads = new Set<string>();
   /** Unique per-instance identity: agent ids must never collide across WorkflowAgent instances. */
   private readonly agentInstanceId = randomUUID();
@@ -701,7 +710,7 @@ export class WorkflowAgent {
   }
 
   /**
-   * A resource loader shared by every subagent of this run, built once (#109).
+   * A resource loader shared per directory within this run (#109).
    *
    * Without a resourceLoader, createAgentSession() builds a fresh
    * DefaultResourceLoader per subagent and reloads it — re-running EVERY installed
@@ -723,28 +732,30 @@ export class WorkflowAgent {
    * #107 denylist — and must be release-noted. `createAgentSession` with a shared
    * resourceLoader is a supported embedding pattern. runWorkflow builds one
    * WorkflowAgent per run, so this loader's lifetime is exactly one run: built
-   * once, reused by all its subagents, then dropped with the agent.
+   * once per directory, reused there, then dropped with the agent.
    */
-  private getSharedResourceLoader(agentDir: string): Promise<DefaultResourceLoader> {
-    if (!this.sharedResourceLoaderPromise) {
-      this.sharedResourceLoaderPromise = (async () => {
-        const loader = new DefaultResourceLoader({
-          cwd: this.cwd,
-          agentDir,
-          settingsManager: SettingsManager.create(this.cwd, agentDir),
-          noExtensions: true,
-        });
-        await loader.reload();
-        return loader;
-      })().catch((err) => {
-        // Don't let a transient build failure (e.g. EMFILE during reload's disk
-        // I/O) poison every subagent AND every retry of this run — clear the memo
-        // so the next caller rebuilds instead of replaying the same rejection.
-        this.sharedResourceLoaderPromise = undefined;
-        throw err;
+  private getSharedResourceLoader(agentDir: string, cwd = this.cwd): Promise<DefaultResourceLoader> {
+    const key = JSON.stringify([agentDir, cwd]);
+    const existing = this.resourceLoaders.get(key);
+    if (existing) return existing;
+    const pending = (async () => {
+      const loader = new DefaultResourceLoader({
+        cwd,
+        agentDir,
+        settingsManager: this.sessionOptions.settingsManager ?? SettingsManager.create(cwd, agentDir),
+        noExtensions: true,
       });
-    }
-    return this.sharedResourceLoaderPromise;
+      await loader.reload();
+      return loader;
+    })().catch((err) => {
+      // Don't let a transient build failure (e.g. EMFILE during reload's disk
+      // I/O) poison every subagent AND every retry of this run — clear the memo
+      // so the next caller rebuilds instead of replaying the same rejection.
+      this.resourceLoaders.delete(key);
+      throw err;
+    });
+    this.resourceLoaders.set(key, pending);
+    return pending;
   }
 
   /**
@@ -812,10 +823,27 @@ export class WorkflowAgent {
    * agent to an in-memory session instead — the run continues, just without a
    * persisted transcript.
    */
-  private createSessionManager(thread?: string): SessionManager {
+  private createSessionManager(thread?: string, cwd?: string): SessionManager {
     if (thread) {
+      // runTurn always supplies its already-canonical runCwd. Keep the legacy
+      // direct helper path (used by embedders that let SessionManager create a
+      // project directory lazily) intact when no per-call cwd was supplied.
+      const threadCwd = cwd === undefined ? this.cwd : realpathSync(cwd);
       const existing = this.threadSessions.get(thread);
-      if (existing) return existing;
+      if (existing) {
+        if (existing.cwd !== threadCwd) {
+          throw new WorkflowError(
+            `agent thread "${thread}" cannot change cwd from "${existing.cwd}" to "${threadCwd}"`,
+            WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+            { recoverable: false },
+          );
+        }
+        return existing.manager;
+      }
+
+      const manager = this.createSessionManager();
+      this.threadSessions.set(thread, { manager, cwd: threadCwd });
+      return manager;
     }
 
     let manager: SessionManager;
@@ -835,8 +863,6 @@ export class WorkflowAgent {
         manager = SessionManager.inMemory();
       }
     }
-
-    if (thread) this.threadSessions.set(thread, manager);
     return manager;
   }
 
@@ -892,8 +918,15 @@ export class WorkflowAgent {
     const capture: StructuredOutputCapture<any> = { called: false, value: undefined };
     // Per-call cwd (e.g. a worktree) needs coding tools bound to that directory,
     // since tools capture their cwd at construction and can't be relocated.
-    const runCwd = options.cwd ?? this.cwd;
-    const baseTools = runCwd === this.cwd ? this.baseTools : createCodingTools(runCwd);
+    const runCwd = realpathSync(options.cwd ?? this.cwd);
+    let usesBaseDirectory = false;
+    try {
+      usesBaseDirectory = runCwd === realpathSync(this.cwd);
+    } catch {
+      // An explicitly selected existing directory can outlive the constructor's
+      // original directory. Its tools must not depend on that old path existing.
+    }
+    const baseTools = usesBaseDirectory ? this.baseTools : createCodingTools(runCwd);
     // Apply the agentType tool policy BEFORE adding structured_output, so a
     // restrictive allowlist never strips the schema tool.
     const customTools: ToolDefinition[] = applyToolPolicy(
@@ -1028,7 +1061,7 @@ export class WorkflowAgent {
     // per-call runCwd: agents working in short-lived git worktrees should still
     // group under the project's session dir instead of scattering across
     // temporary worktree paths.
-    const sessionManager = this.createSessionManager(options.thread);
+    const sessionManager = this.createSessionManager(options.thread, runCwd);
     const threadLeaf = options.thread ? sessionManager.getLeafId() : null;
     // Host split: pi >= 0.80.8 createAgentSession takes modelRuntime, not a
     // registry — hand over the registry's backing runtime so subagents share
@@ -1047,18 +1080,19 @@ export class WorkflowAgent {
         // SettingsManager.inMemory() doesn't load ~/.pi/settings.json, so subagents
         // would fall back to the first available model (e.g. openai-codex) which may
         // not have valid auth, causing silent empty responses.
-        settingsManager: SettingsManager.create(this.cwd, agentDir),
+        settingsManager: SettingsManager.create(runCwd, agentDir),
         customTools,
         // Shared per-run loader with no host extensions (#109) — see
         // getSharedResourceLoader. An injected resourceLoader (tests / embedders)
         // wins and skips the shared build entirely; the ...this.sessionOptions
         // spread below re-applies the same injected value harmlessly.
-        resourceLoader: this.sessionOptions.resourceLoader ?? (await this.getSharedResourceLoader(agentDir)),
+        resourceLoader: this.sessionOptions.resourceLoader ?? (await this.getSharedResourceLoader(agentDir, runCwd)),
         // Host split (see modelRuntime above): stock pi takes modelRuntime;
         // omp's fork takes modelRegistry. Spread-cast keeps the runtime value
         // while satisfying the upstream CreateAgentSessionOptions type.
         ...(modelRuntime ? { modelRuntime } : { modelRegistry }),
         ...this.sessionOptions,
+        ...(options.cwd !== undefined ? { cwd: runCwd } : {}),
         // The computed AgentRegistry id must win over any injected
         // sessionOptions value: a stable embedder-supplied agentId would
         // collide across runs in the process-global registry. `agentId` is

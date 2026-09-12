@@ -1,11 +1,21 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
+import type { AgentDefinition } from "../src/agent-registry.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { type JournalEntry, parseWorkflowScript, runWorkflow } from "../src/workflow.js";
 
@@ -54,6 +64,173 @@ function createDeferred<T = void>(): { promise: Promise<T>; resolve: (value: T |
   return { promise, resolve };
 }
 
+test("agent cwd is normalized before dispatch and invalid cwd does not reserve capacity", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-agent-cwd-"));
+  const linked = join(root, "linked");
+  symlinkSync(root, linked);
+  const seen: string[] = [];
+  const runner = {
+    async run(_prompt: string, options: AgentRunOptions) {
+      seen.push(options.cwd ?? "");
+      return "ok";
+    },
+  };
+  try {
+    const script = `export const meta = { name: 'cwd', description: 'cwd validation' }
+return await agent('inspect', { cwd: ${JSON.stringify(linked)} })`;
+    await runWorkflow(script, { agent: runner, persistLogs: false });
+    assert.deepEqual(seen, [realpathSync(root)], "runner receives the canonical realpath");
+
+    await assert.rejects(
+      () =>
+        runWorkflow(
+          `export const meta = { name: 'bad_cwd', description: 'bad cwd' }
+await agent('never runs', { cwd: 'relative-path' })`,
+          { agent: runner, persistLogs: false, maxAgents: 0 },
+        ),
+      /cwd must be an absolute directory/,
+      "cwd validation precedes capacity reservation",
+    );
+    assert.equal(seen.length, 1, "invalid cwd never dispatches an agent");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("script agent cwd preserves a directory's significant trailing space", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-agent-cwd-space-"));
+  const target = join(root, "directory ");
+  mkdirSync(join(root, "directory"));
+  mkdirSync(target);
+  try {
+    let seen: string | undefined;
+    await runWorkflow(
+      `export const meta = { name: 'cwd_space', description: 'literal directory binding' }
+return await agent('inspect', { cwd: ${JSON.stringify(target)} })`,
+      {
+        agent: {
+          async run(_prompt, options) {
+            seen = options?.cwd;
+            return "ok";
+          },
+        },
+        persistLogs: false,
+      },
+    );
+    assert.equal(seen, realpathSync(target));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("explicit cwd can opt out of agent-type isolation without claiming worktree ownership", async () => {
+  const target = mkdtempSync(join(tmpdir(), "pi-agent-cwd-optout-"));
+  const registry = new Map([
+    [
+      "isolated",
+      {
+        name: "isolated",
+        prompt: "inspect",
+        isolation: "worktree",
+        source: "project",
+      } as AgentDefinition,
+    ],
+  ]);
+  const script = `export const meta = { name: 'cwd_optout', description: 'existing directory ownership' }
+return await agent('inspect', { cwd: ${JSON.stringify(target)}, agentType: 'isolated', isolation: false })`;
+  try {
+    for (const fail of [false, true]) {
+      const ended: Array<string | undefined> = [];
+      const run = runWorkflow(script, {
+        persistLogs: false,
+        agentRegistry: registry,
+        agent: {
+          async run(_prompt, options) {
+            assert.equal(options?.cwd, realpathSync(target));
+            if (fail)
+              throw new WorkflowError("test failure", WorkflowErrorCode.AGENT_EXECUTION_ERROR, { recoverable: false });
+            return "ok";
+          },
+        },
+        onAgentEnd: (event) => ended.push(event.worktree),
+      });
+      if (fail) await assert.rejects(run, /test failure/);
+      else await run;
+      assert.deepEqual(ended, [undefined], "an existing directory is not an owned worktree");
+      assert.ok(existsSync(target));
+    }
+  } finally {
+    rmSync(target, { recursive: true, force: true });
+  }
+});
+
+test("agent cwd cannot be combined with worktree isolation", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-agent-cwd-isolation-"));
+  try {
+    await assert.rejects(
+      () =>
+        runWorkflow(
+          `export const meta = { name: 'cwd_isolation', description: 'cwd and isolation' }
+await agent('never runs', { cwd: ${JSON.stringify(root)}, isolation: 'worktree' })`,
+          { agent: countingAgent().runner, persistLogs: false },
+        ),
+      /cwd cannot be combined with worktree isolation/,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("agent cwd participates in resume identity while omitted cwd preserves cache replay", async () => {
+  const firstDir = mkdtempSync(join(tmpdir(), "pi-agent-cwd-first-"));
+  const secondDir = mkdtempSync(join(tmpdir(), "pi-agent-cwd-second-"));
+  const calls: string[] = [];
+  const journal = new Map<string, JournalEntry>();
+  const runner = {
+    async run(_prompt: string, options: AgentRunOptions) {
+      calls.push(options.cwd ?? "default");
+      return `ran:${options.cwd ?? "default"}`;
+    },
+  };
+  const script = (cwd?: string) => `export const meta = { name: 'cwd_resume', description: 'cwd resume identity' }
+return await agent('inspect', { label: 'inspect'${cwd ? `, cwd: ${JSON.stringify(cwd)}` : ""} })`;
+  try {
+    await runWorkflow(script(), {
+      agent: runner,
+      persistLogs: false,
+      runId: "cwd-resume",
+      onAgentJournal: (entry) => journal.set(`${entry.runId}:${entry.index}`, entry),
+    });
+    await runWorkflow(script(), {
+      agent: runner,
+      persistLogs: false,
+      runId: "cwd-resume",
+      resumeJournal: journal,
+    });
+    assert.deepEqual(calls, ["default"], "omitted cwd retains the existing resume hash");
+
+    await runWorkflow(script(firstDir), {
+      agent: runner,
+      persistLogs: false,
+      runId: "cwd-resume",
+      resumeJournal: journal,
+    });
+    await runWorkflow(script(secondDir), {
+      agent: runner,
+      persistLogs: false,
+      runId: "cwd-resume",
+      resumeJournal: journal,
+    });
+    assert.deepEqual(
+      calls,
+      ["default", realpathSync(firstDir), realpathSync(secondDir)],
+      "each canonical cwd invalidates the prior journal entry",
+    );
+  } finally {
+    rmSync(firstDir, { recursive: true, force: true });
+    rmSync(secondDir, { recursive: true, force: true });
+  }
+});
 function createGitRepo(prefix: string): string {
   const repo = mkdtempSync(join(tmpdir(), prefix));
   const git = (...args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "pipe" });
