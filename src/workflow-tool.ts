@@ -159,6 +159,9 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
   const defaults = resolveWorkflowToolDefaults(options, fallbackCwd);
   const fallbackManager =
     options.manager ??
+    // Manager-less fallback: legacy routing only — no mainModel/inheritMainModel
+    // plumbing (and no main model to inherit), so untagged agents follow the
+    // implicit medium tier / settings default.
     new WorkflowManager({
       cwd: options.cwd,
       concurrency: defaults.concurrency,
