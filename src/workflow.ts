@@ -245,10 +245,10 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    * Backoff (ms) before retry attempt N (1-based — the attempt that just
    * failed). Default: min(250 * 2^(N-1), 2000) — immediate retries let a whole
    * parallel() batch hammer the provider synchronously. The retry keeps its
-   * concurrency slot during the backoff. Return 0 to disable; non-positive or
-   * NaN returns fall back to the default, a throwing callback is ignored
-   * (default used), and large values are clamped to 2^31-1. Abort latency
-   * during the wait is bounded by the returned value.
+   * concurrency slot during the backoff. Return 0 to disable; negative,
+   * NaN, or non-finite returns fall back to the default; a throwing callback
+   * is ignored (default used). Finite positive values are honored as-is —
+   * abort latency during the wait is bounded by the returned value.
    */
   agentRetryBackoffMs?: (failedAttempt: number) => number;
   /** Internal: shared runtime inherited by a nested workflow() call. */
@@ -507,15 +507,19 @@ export async function runWorkflow<T = unknown>(
   // Per-phase model routing from meta.phases[].model, with meta.model as the default.
   const routingConfig = parseModelRoutingFromMeta(meta.phases, meta.model);
   const maxAgents = options.maxAgents ?? MAX_AGENTS_PER_RUN;
-  const agentTimeoutMs = options.agentTimeoutMs !== undefined ? options.agentTimeoutMs : DEFAULT_AGENT_TIMEOUT_MS;
-  if (agentTimeoutMs !== null && (typeof agentTimeoutMs !== "number" || agentTimeoutMs <= 0)) {
-    throw new WorkflowError(
-      "agentTimeoutMs must be a positive number of milliseconds (or null)",
-      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
-      {
-        recoverable: false,
-      },
+  // A persisted legacy agentTimeoutMs of 0/NaN would make an old run
+  // unresumable if rejected outright — coerce to the default and log instead.
+  // Call-level timeoutMs IS rejected (see agent()); the run-level option is
+  // also a persisted-resume surface, which the call level is not.
+  let agentTimeoutMs = options.agentTimeoutMs !== undefined ? options.agentTimeoutMs : DEFAULT_AGENT_TIMEOUT_MS;
+  if (
+    agentTimeoutMs !== null &&
+    (typeof agentTimeoutMs !== "number" || !Number.isFinite(agentTimeoutMs) || agentTimeoutMs < 1)
+  ) {
+    options.onLog?.(
+      `ignoring invalid agentTimeoutMs (${String(options.agentTimeoutMs)}); using the default ${DEFAULT_AGENT_TIMEOUT_MS}ms`,
     );
+    agentTimeoutMs = DEFAULT_AGENT_TIMEOUT_MS;
   }
   const runId = options.runId ?? `run-${started.toString(36)}`;
   const baseCwd = options.cwd ?? process.cwd();
@@ -693,18 +697,19 @@ export async function runWorkflow<T = unknown>(
     if (
       agentOptions.timeoutMs !== undefined &&
       agentOptions.timeoutMs !== null &&
-      (typeof agentOptions.timeoutMs !== "number" || agentOptions.timeoutMs <= 0)
+      (typeof agentOptions.timeoutMs !== "number" ||
+        !Number.isFinite(agentOptions.timeoutMs) ||
+        agentOptions.timeoutMs < 1 ||
+        agentOptions.timeoutMs > 2_147_483_647)
     ) {
-      // timeoutMs: 0 would spawn-then-instantly-abort a real session on every
-      // retry attempt (audit2 #8) — reject instead of burning sessions.
-      return Promise.reject(
-        new WorkflowError(
-          "agent() timeoutMs must be a positive number of milliseconds",
-          WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
-          {
-            recoverable: false,
-          },
-        ),
+      // timeoutMs <= 0 / NaN / Infinity / overflow would spawn-then-instantly-
+      // abort a real session on every retry attempt (#8) — fail fast instead of
+      // burning sessions. Throw SYNCHRONOUSLY: a fire-and-forget `void
+      // agent(...)` call must not surface this as an unhandled rejection.
+      throw new WorkflowError(
+        "agent() timeoutMs must be a finite number of milliseconds in [1, 2^31-1]",
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
       );
     }
     const rawThread = agentOptions.thread;
@@ -1116,8 +1121,15 @@ export async function runWorkflow<T = unknown>(
               if (options.agentRetryBackoffMs) {
                 try {
                   const injected = options.agentRetryBackoffMs(attempt);
+                  // 0 disables (documented); negative/NaN/Infinity fall back to
+                  // the default — a non-finite value clamped to 2^31-1 would
+                  // otherwise park the retry for ~24.8 days.
                   backoffMs =
-                    typeof injected === "number" && injected > 0 ? Math.min(injected, 2_147_483_647) : defaultBackoffMs;
+                    injected === 0
+                      ? 0
+                      : typeof injected === "number" && Number.isFinite(injected) && injected > 0
+                        ? injected
+                        : defaultBackoffMs;
                 } catch {
                   backoffMs = defaultBackoffMs; // a throwing callback must not abandon the retry
                 }

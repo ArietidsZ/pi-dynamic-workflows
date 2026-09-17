@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
-import type { AgentDefinition, AgentRegistry } from "../src/agent-registry.js";
+import type { AgentDefinition } from "../src/agent-registry.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { type JournalEntry, parseWorkflowScript, runWorkflow } from "../src/workflow.js";
 
@@ -2372,9 +2372,6 @@ test("nested workflow() frames use the run's registry snapshot (audit2 #6)", asy
   // <cwd>/.pi/agents at run start. The fake runner DELETES the .md mid-run
   // (during the parent's first call); the nested frame must still resolve the
   // sentinel definition from the forwarded snapshot, not re-load from disk.
-  const { mkdirSync, mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
-  const { tmpdir } = await import("node:os");
-  const { join } = await import("node:path");
   const cwd = mkdtempSync(join(tmpdir(), "pdw-registry-"));
   const agentsDir = join(cwd, ".pi", "agents");
   mkdirSync(agentsDir, { recursive: true });
@@ -2475,14 +2472,33 @@ return await agent('x', { timeoutMs: 0 })`;
     () => runWorkflow(script, { agent: fakeAgent({}), persistLogs: false }),
     (e: unknown) => e instanceof WorkflowError && e.code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
   );
-  await assert.rejects(
-    () =>
-      runWorkflow(`export const meta = { name: 't2', description: 't2' }\nreturn await agent('x')`, {
-        agent: fakeAgent({}),
-        agentTimeoutMs: 0,
-        persistLogs: false,
-      }),
-    (e: unknown) => e instanceof WorkflowError && e.code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+  // Call-level NaN/Infinity/sub-1/overflow are rejected too (all spawn-then-instant-abort).
+  for (const bad of ["NaN", "Infinity", "0.5", "2 ** 32"]) {
+    const badScript = `export const meta = { name: 'bt', description: 'bt' }
+return await agent('x', { timeoutMs: ${bad} })`;
+    await assert.rejects(
+      () => runWorkflow(badScript, { agent: fakeAgent({}), persistLogs: false }),
+      (e: unknown) => e instanceof WorkflowError && e.code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      `timeoutMs ${bad} rejected`,
+    );
+  }
+});
+
+test("a run-level invalid agentTimeoutMs coerces to the default (legacy resume compatibility)", async () => {
+  // A persisted legacy 0 must not make an old run unresumable; coerce + log.
+  const script = `export const meta = { name: 't3', description: 't3' }
+return await agent('x')`;
+  const logs: string[] = [];
+  const result = await runWorkflow<string>(script, {
+    agent: fakeAgent({}),
+    agentTimeoutMs: 0,
+    persistLogs: false,
+    onLog: (m) => logs.push(m),
+  });
+  assert.equal(result.result, "ok");
+  assert.ok(
+    logs.some((l) => l.includes("ignoring invalid agentTimeoutMs")),
+    "the coercion is logged",
   );
 });
 
@@ -2507,4 +2523,53 @@ return await agent('x')`;
   });
   assert.equal(result.result, poisoned, "the agent call itself succeeded — an eager stringify would have failed it");
   assert.equal(result.tokenUsage?.total, 10, "real usage committed without ever stringifying the result");
+});
+
+test("agentRetryBackoffMs guard: 0 disables, Infinity/throwing fall back to the default", async () => {
+  const script = `export const meta = { name: 'bo_guard', description: 'bo guard' }
+return await agent('flaky')`;
+  const flaky = () => {
+    let attempts = 0;
+    return {
+      state: { attempts: 0 },
+      async run() {
+        attempts++;
+        this.state.attempts = attempts;
+        if (attempts === 1) {
+          throw new WorkflowError("empty", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, { recoverable: true });
+        }
+        return "recovered";
+      },
+    };
+  };
+  // 0 disables: no wait at all.
+  {
+    const started = Date.now();
+    const result = await runWorkflow<string>(script, {
+      agent: flaky(),
+      agentRetries: 1,
+      agentRetryBackoffMs: () => 0,
+      persistLogs: false,
+    });
+    assert.equal(result.result, "recovered");
+    assert.ok(Date.now() - started < 100, "0 disables the backoff");
+  }
+  // Infinity falls back to the default (a 2^31-1 clamp would park ~24.8 days).
+  for (const injected of [
+    () => Number.POSITIVE_INFINITY,
+    () => {
+      throw new Error("boom");
+    },
+  ]) {
+    const started = Date.now();
+    const result = await runWorkflow<string>(script, {
+      agent: flaky(),
+      agentRetries: 1,
+      agentRetryBackoffMs: injected as () => number,
+      persistLogs: false,
+    });
+    assert.equal(result.result, "recovered");
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed >= 240 && elapsed < 5_000, `default backoff used (${elapsed}ms)`);
+  }
 });
