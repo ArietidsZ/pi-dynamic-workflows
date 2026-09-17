@@ -278,12 +278,6 @@ export interface ExecOptions {
   initialTokenUsage?: AgentUsage;
   /** resume() only: persisted per-phase sub-budgets adopted by the resumed execution (audit2 #4). */
   initialPhaseBudgets?: Record<string, { budget: number; startSpent: number; warned?: boolean }>;
-  /**
-   * Per-phase sub-budgets declared so far in this run's lifetime — persisted
-   * so resume() can adopt the original baselines (audit2 #4). Written by the
-   * onPhaseBudgets callback; read into initialPhaseBudgets at resume.
-   */
-  phaseBudgets?: Record<string, { budget: number; startSpent: number; warned?: boolean }>;
 }
 
 export interface WorkflowResumeOptions {
@@ -936,7 +930,11 @@ export class WorkflowManager extends EventEmitter {
         initialTokenUsage,
         initialPhaseBudgets: initialPhaseBudgets ?? managed.phaseBudgets,
         onPhaseBudgets: (budgets) => {
-          managed.phaseBudgets = budgets;
+          // Merge, don't replace: nested workflow() frames share this flat
+          // table, and a child's first declaration carries only ITS entries —
+          // replacing would drop the parent's (re-introducing the per-resume
+          // re-base audit2 #4 fixes).
+          managed.phaseBudgets = { ...managed.phaseBudgets, ...budgets };
         },
         onAgentJournal: (entry) => {
           // Append (crash-safe-ish): keep the latest entry per (runId, index)
@@ -1827,6 +1825,10 @@ export class WorkflowManager extends EventEmitter {
           ),
       ),
       replayedAgentCalls: new Set(),
+      // Carry the persisted budgets into the managed record immediately —
+      // otherwise the persistRun below would write the field as undefined
+      // (a crash/load in that window loses the table).
+      phaseBudgets: persisted.phaseBudgets,
     };
     this.runs.set(runId, managed);
     // Persist before notifying renderers: listRuns() is their source of truth for

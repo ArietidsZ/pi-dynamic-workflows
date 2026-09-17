@@ -4795,3 +4795,31 @@ return { a, blocked }`;
     );
   }),
 );
+
+test(
+  "nested frames MERGE into the persisted phase-budget table (parent entries survive a child declaration)",
+  withTempCwd(async (cwd) => {
+    const child = `export const meta = { name: 'childwf', description: 'c' }
+phase('childphase', { budget: 50 })
+const r = await agent('child task')
+return { child: r }`;
+    const parent = `export const meta = { name: 'parentwf', description: 'p' }
+phase('parentphase', { budget: 100 })
+const a = await agent('parent task')
+const nested = await workflow('childwf')
+return { a, nested }`;
+    const manager = new WorkflowManager({
+      cwd,
+      agent: fakeAgent({ total: 10 }),
+      loadSavedWorkflow: (name: string) => (name === "childwf" ? child : undefined),
+    });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(parent);
+    await promise;
+    const persisted = manager.getPersistence().load(runId);
+    assert.ok(persisted?.phaseBudgets?.parentphase, "parent entry survives the child's declaration");
+    assert.ok(persisted?.phaseBudgets?.childphase, "child entry recorded");
+    assert.equal(persisted?.phaseBudgets?.parentphase?.budget, 100);
+    assert.equal(persisted?.phaseBudgets?.childphase?.budget, 50);
+  }),
+);

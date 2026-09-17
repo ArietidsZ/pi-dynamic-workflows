@@ -1616,10 +1616,10 @@ return { a, blocked }`;
 });
 
 test("runWorkflow initialTokenUsage integrates correctly with phase() sub-budgets (seeded baseline isn't corrupted)", async () => {
-  // phase()'s sub-budget deliberately re-bases from shared.spent AT the
-  // phase() call (see workflow.ts's phase(): "Re-declaring re-bases from the
-  // current spent"), so a seed doesn't make the phase's OWN ceiling trip any
-  // sooner than usual — it only shifts the visible baseline. This mirrors the
+  // phase()'s sub-budget bases itself on shared.spent AT the first
+  // declaration (first-declaration-wins; a persisted baseline is adopted on
+  // resume), so a seed doesn't make the phase's OWN ceiling trip any sooner
+  // than usual — it only shifts the visible baseline. This mirrors the
   // existing "phase sub-budget throws..." test's budget/spend shape exactly,
   // plus a seed, to confirm seeding doesn't corrupt that mechanism.
   const script = `export const meta = { name: 'seeded_phase_budget', description: 'seed' }
@@ -2396,6 +2396,7 @@ return 'script-done'`;
   assert.equal(calls, 1, "the sibling ran exactly once");
   assert.equal(flushes.length, 1, "exactly one final flush");
   assert.ok(flushes[0] > 0, "the drain-settled sibling's usage is in the final flush");
+  assert.equal(flushes[0], result.tokenUsage?.total, "the flush IS the final total (no partial/double accounting)");
 });
 
 test("runWorkflow initialPhaseBudgets adopts the persisted baseline instead of re-basing (audit2 #4)", async () => {
@@ -2448,4 +2449,57 @@ return { a, blocked }`;
   assert.equal(result.result.blocked, true, "the 999999 re-declaration must NOT re-base the budget away");
   assert.equal(events.length, 1, "exactly one budget notification (the first declaration)");
   assert.equal(events[0]?.p?.budget, 60);
+});
+
+test("a nested workflow() frame is NOT seeded from the parent's persisted phase table (audit2 r1 MAJOR)", async () => {
+  // The top level adopts the persisted seed (parentphase); the nested child
+  // frame must declare from an empty table — otherwise a title collision would
+  // silently adopt the other frame's baseline and the child's notification
+  // would carry parent entries.
+  const child = `export const meta = { name: 'child', description: 'c' }
+phase('childphase', { budget: 50 })
+const r = await agent('child task', { label: 'c' })
+return { child: r }`;
+  const parent = `export const meta = { name: 'parent', description: 'p' }
+phase('parentphase', { budget: 100 })
+const a = await agent('parent task', { label: 'p' })
+const nested = await workflow('child')
+return { a, nested }`;
+
+  const events: Array<Record<string, { budget: number; startSpent: number }>> = [];
+  await runWorkflow(parent, {
+    agent: fakeAgent({ input: 10, output: 0, total: 10, cost: 0 }),
+    persistLogs: false,
+    loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
+    initialPhaseBudgets: { parentphase: { budget: 100, startSpent: 0 } },
+    onPhaseBudgets: (budgets) => events.push(budgets),
+  });
+
+  assert.equal(
+    events.length,
+    1,
+    "only the child's NEW declaration fires (the parent's seeded phase is adopted, not re-declared)",
+  );
+  assert.deepEqual(
+    Object.keys(events[0] ?? {}),
+    ["childphase"],
+    "the child frame's table contains only its own declaration — no parent seed leakage",
+  );
+  assert.equal(events[0]?.childphase?.budget, 50);
+});
+
+test("the phase runtime event advertises the EFFECTIVE (first-declared) budget", async () => {
+  const script = `export const meta = { name: 'phase_evt', description: 'phase evt' }
+phase('p', { budget: 60 })
+phase('p', { budget: 999999 })
+return 'done'`;
+  const budgets: Array<number | null> = [];
+  await runWorkflow(script, {
+    agent: fakeAgent(),
+    persistLogs: false,
+    onRuntimeEvent: (event) => {
+      if (event.type === "phase") budgets.push(event.budget);
+    },
+  });
+  assert.deepEqual(budgets, [60, 60], "re-declaration reports the effective budget, not the ignored value");
 });

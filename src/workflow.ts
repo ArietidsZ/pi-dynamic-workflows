@@ -524,12 +524,18 @@ export async function runWorkflow<T = unknown>(
     // explicit phase() (or agent({ phase })) overrides this.
     phases: meta.phases?.[0]?.title ? [meta.phases[0].title] : [],
     currentPhase: meta.phases?.[0]?.title,
-    phaseBudgets: new Map(
-      Object.entries(options.initialPhaseBudgets ?? {}).map(([title, pb]) => [
-        title,
-        { budget: pb.budget, startSpent: pb.startSpent, warned: pb.warned ?? false },
-      ]),
-    ),
+    // Seeded ONLY on the fresh-SharedRuntime branch (same rule as spent/:545):
+    // a nested workflow() frame declares its own phases; seeding it from the
+    // parent's persisted table would cross-contaminate frames and let a child
+    // overwrite parent entries (the persisted table is flat by title).
+    phaseBudgets: options.sharedRuntime
+      ? new Map()
+      : new Map(
+          Object.entries(options.initialPhaseBudgets ?? {}).map(([title, pb]) => [
+            title,
+            { budget: pb.budget, startSpent: pb.startSpent, warned: pb.warned ?? false },
+          ]),
+        ),
     callSeq: 0,
     firstMiss: Number.POSITIVE_INFINITY,
   };
@@ -607,7 +613,7 @@ export async function runWorkflow<T = unknown>(
     options.onRuntimeEvent?.({
       type: "phase",
       title,
-      budget: typeof phaseOptions?.budget === "number" && phaseOptions.budget > 0 ? phaseOptions.budget : null,
+      budget: state.phaseBudgets.get(title)?.budget ?? null,
     });
   };
 
@@ -884,6 +890,7 @@ export async function runWorkflow<T = unknown>(
         }
         if (!pb.warned && phaseSpent >= pb.budget * 0.8) {
           pb.warned = true;
+          options.onPhaseBudgets?.(Object.fromEntries(state.phaseBudgets));
           log(`phase "${assignedPhase}" at ${Math.round((phaseSpent / pb.budget) * 100)}% of its token sub-budget`);
         }
       }
@@ -1725,7 +1732,12 @@ export async function runWorkflow<T = unknown>(
       // Success path only — error/abort accounting is owned by the catch
       // paths (e.g. the provisional-usage rollback), and firing here would
       // clobber their deliberately-empty records.
-      if (runSucceeded) options.onTokenUsage?.(shared.tokenUsage);
+      try {
+        if (runSucceeded) options.onTokenUsage?.(shared.tokenUsage);
+      } catch {
+        // Instrumentation must never break teardown (dispose below) or mask the
+        // run's own outcome.
+      }
       store.dispose();
     }
   }
