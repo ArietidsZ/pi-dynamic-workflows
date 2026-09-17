@@ -4774,6 +4774,14 @@ return await sibling`;
     // Resolves without throwing — previously this threw "still settling" after
     // a 1s wait whenever the drain outlasted the settle guard.
     await manager.attachCheckpointResponse(runId, "hold-1", { approved: true });
+    // A conflicting second attach DURING the drain (live path) is rejected…
+    await assert.rejects(
+      manager.attachCheckpointResponse(runId, "hold-1", { approved: false }),
+      /conflicting/,
+      "conflicting live attach rejected",
+    );
+    // …and the identical response is idempotent.
+    await manager.attachCheckpointResponse(runId, "hold-1", { approved: true });
 
     slowReleased();
     await promise.catch(() => {});
@@ -4788,11 +4796,64 @@ return await sibling`;
       "the response attached during the drain lands on disk (carried by the final persist)",
     );
     assert.deepEqual(persisted?.checkpoint?.response, { approved: true });
+    assert.equal(
+      persisted?.pauseReason,
+      "workflow_checkpoint",
+      "a live attach must not flip pauseReason to undefined (the run is still checkpoint-paused)",
+    );
+
     assert.equal(persisted?.status, "paused", "run pauses at the durable checkpoint");
     assert.equal(persisted?.checkpoint?.checkpointId, "hold-1");
     assert.ok(
       persisted?.journal?.some((entry) => entry.result === "slow-done"),
       "the in-flight sibling completed and journaled — not aborted by the suspension",
     );
+  }),
+);
+
+test(
+  "a usage-limit pause AFTER a consumed checkpoint persists pauseReason usage_limit (r3 MAJOR)",
+  withTempCwd(async (cwd) => {
+    const limitActive = true;
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          if (prompt.includes("second") && limitActive) {
+            throw new WorkflowError(
+              "Codex usage limit reached. Resets in ~3h.",
+              WorkflowErrorCode.PROVIDER_USAGE_LIMIT,
+              {
+                recoverable: false,
+                resetHint: "Resets in ~3h",
+              },
+            );
+          }
+          return "ok";
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'cp_then_quota', description: 'checkpoint then quota' }
+const a = await agent('first')
+await checkpoint({ kind: 'hold', checkpointId: 'g-1', payload: {} })
+const b = await agent('second')
+return { a, b }`;
+
+    const started = manager.startInBackground(script);
+    await assert.rejects(started.promise, /checkpoint/i);
+    await manager.attachCheckpointResponse(started.runId, "g-1", {});
+    const paused = once(manager, "paused");
+    assert.equal(await manager.resume(started.runId, { checkpointId: "g-1" }), true);
+    await paused;
+
+    const persisted = manager.listRuns().find((r) => r.runId === started.runId);
+    assert.equal(persisted?.status, "paused");
+    assert.equal(
+      persisted?.pauseReason,
+      "usage_limit",
+      "a consumed checkpoint must not mask the usage-limit pause cause (cold-start auto-resume filters on this)",
+    );
+    assert.equal(persisted?.checkpoint?.status, "consumed");
   }),
 );

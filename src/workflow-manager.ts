@@ -1516,8 +1516,12 @@ export class WorkflowManager extends EventEmitter {
         agentRetries: managed.agentRetries,
         pauseReason:
           managed.status === "paused"
-            ? managed.checkpoint?.status === "waiting"
-              ? "workflow_checkpoint"
+            ? managed.checkpoint?.status === "waiting" || managed.checkpoint?.status === "resuming"
+              ? // A LIVE checkpoint (waiting, or resuming after a live attach
+                // mid-drain) is what the pause is for. A CONSUMED checkpoint is
+                // history, not a pause cause — it must not mask a later
+                // usage-limit pause (coldStartRearm filters on this value).
+                "workflow_checkpoint"
               : managed.usageLimitPause
                 ? "usage_limit"
                 : undefined
@@ -1584,19 +1588,17 @@ export class WorkflowManager extends EventEmitter {
   }
 
   /**
-   * Resume an interrupted run: replay journaled results for the unchanged prefix
-   * and run the rest live. Returns false if there is nothing resumable.
+   * Attach a human/controller response to a durable checkpoint that is waiting
+   * (or resuming). Fail-closed: the response is durable on disk before this
+   * resolves, so it survives a process restart.
    *
-   * `opts.script` lets the orchestrating model resume with an EDITED script
-   * (cached-prefix reuse / iteration): unchanged agent() calls whose content
-   * hash still matches the journal entry at their run-qualified call identity
-   * replay from cache, while the first changed or newly inserted call — including
-   * downstream nested workflows — and everything after it re-runs live. When
-   * `opts.script` is omitted, resume behaves
-   * exactly as before and uses the persisted script (auto-resume, TUI resume);
-   * this keeps the existing single-arg `resume(runId)` callers (e.g. the
-   * UsageLimitScheduler) unchanged. `opts.args` overrides the persisted args
-   * only when provided; otherwise the persisted args are kept.
+   * While the suspended execution is still draining its in-flight siblings (the
+   * run is deliberately not sealed), the response is written through the LIVE
+   * managed record — the draining execution owns the lease and carries the
+   * response in its final persist — so attach works immediately instead of
+   * blocking on the 1s settle guard. resume() still refuses until the drain
+   * settles; hosts should attach first and resume on the "paused" event (the
+   * documented flow).
    */
   async attachCheckpointResponse(runId: string, checkpointId: string, responseValue: unknown): Promise<void> {
     const response = cloneDurableJsonValue(responseValue, "checkpoint response");
@@ -1643,7 +1645,23 @@ export class WorkflowManager extends EventEmitter {
         if (!active.checkpoint) throw new Error("run has no durable checkpoint");
         const next = buildResuming(active.checkpoint);
         if (next === undefined) return;
+        const previousCheckpoint = active.checkpoint;
         active.checkpoint = next;
+        try {
+          // Fail-closed durable write NOW: the manager owns this run's lease via
+          // the draining execution, and the checkpoint contract ("the response
+          // survives process restart") must hold even if the process dies
+          // mid-drain. The draining execution's later final persist reads
+          // managed.checkpoint live, so it carries this same resuming state.
+          this.persistRun(active, true);
+        } catch (error) {
+          // Roll the live record back: the caller is told the attach failed, so
+          // the in-memory state must not keep a response that never reached
+          // disk (a retry with a different response must not conflict, and the
+          // drain's final persist must not silently write it).
+          active.checkpoint = previousCheckpoint;
+          throw error;
+        }
         // Belt-and-suspenders: if the final persist already ran in the narrow
         // window between drain end and execution settlement, persist again once
         // settled so the response lands on disk either way.
@@ -1680,6 +1698,21 @@ export class WorkflowManager extends EventEmitter {
     }
   }
 
+  /**
+   * Resume an interrupted run: replay journaled results for the unchanged prefix
+   * and run the rest live. Returns false if there is nothing resumable.
+   *
+   * `opts.script` lets the orchestrating model resume with an EDITED script
+   * (cached-prefix reuse / iteration): unchanged agent() calls whose content
+   * hash still matches the journal entry at their run-qualified call identity
+   * replay from cache, while the first changed or newly inserted call — including
+   * downstream nested workflows — and everything after it re-runs live. When
+   * `opts.script` is omitted, resume behaves
+   * exactly as before and uses the persisted script (auto-resume, TUI resume);
+   * this keeps the existing single-arg `resume(runId)` callers (e.g. the
+   * UsageLimitScheduler) unchanged. `opts.args` overrides the persisted args
+   * only when provided; otherwise the persisted args are kept.
+   */
   async resume(runId: string, opts?: WorkflowResumeOptions): Promise<boolean> {
     const active = this.runs.get(runId);
     if (active?.status === "running" || active?.status === "aborted") return false;
