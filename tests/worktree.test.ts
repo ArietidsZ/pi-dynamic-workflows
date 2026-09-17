@@ -181,9 +181,12 @@ test("a timed-out worktree add cleans up the half-created branch and tree (audit
   const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
   const shimDir = mkdtempSync(join(tmpdir(), "pi-wt-shim2-"));
   const shimPath = join(shimDir, "git");
+  // The shim must leave REAL residue behind (r2: a pure-sleep shim made the
+  // cleanup assertions vacuous): run the real `worktree add`, THEN hang so
+  // the timeout kills us — the branch and tree exist when cleanup runs.
   writeFileSync(
     shimPath,
-    `#!/bin/sh\ncase "$*" in\n  *"worktree add"*) sleep 600 ;;\n  *) exec "${realGit}" "$@" ;;\nesac\n`,
+    `#!/bin/sh\ncase "$*" in\n  *"worktree add"*) "${realGit}" "$@" ; sleep 600 ;;\n  *) exec "${realGit}" "$@" ;;\nesac\n`,
   );
   execFileSync("chmod", ["+x", shimPath]);
 

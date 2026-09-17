@@ -6,6 +6,7 @@
 
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
@@ -107,8 +108,10 @@ async function cleanupFailedWorktreeAdd(repoRoot: string, path: string, branch: 
     // best-effort
   }
   try {
-    const { rm } = await import("node:fs/promises");
-    await rm(path, { recursive: true, force: true });
+    // maxRetries: a SIGTERM'd git can keep writing for a few hundred ms after
+    // the exec rejects — an unretried recursive rm aborts on the first
+    // ENOTEMPTY and leaves the partial tree behind (r2 MINOR).
+    await rm(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 });
   } catch {
     // best-effort
   }
