@@ -85,11 +85,13 @@ export function createAgentCallUsageTracker(onUpdate: (update: AgentCallUsageUpd
             emitProgress();
           }
         },
-        commitWithFallback(fallbackTotal: number) {
+        commitWithFallback(fallbackTotal: () => number) {
           if (terminalUsage && (terminalUsage.total > 0 || terminalUsage.cost > 0)) {
             return commitUsage(terminalUsage);
           }
-          return commitUsage({ ...createEmptyAgentUsage(), total: Math.max(0, fallbackTotal) });
+          // Lazy: the fallback estimate JSON.stringifies the full result+prompt
+          // — only pay that when the provider gave no terminal usage (audit2 #9).
+          return commitUsage({ ...createEmptyAgentUsage(), total: Math.max(0, fallbackTotal()) });
         },
         commitTerminalUsage() {
           if (!terminalUsage) {

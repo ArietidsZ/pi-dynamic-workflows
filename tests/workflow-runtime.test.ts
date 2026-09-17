@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
-import type { AgentDefinition } from "../src/agent-registry.js";
+import type { AgentDefinition, AgentRegistry } from "../src/agent-registry.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { type JournalEntry, parseWorkflowScript, runWorkflow } from "../src/workflow.js";
 
@@ -2365,4 +2365,94 @@ return main`;
   // the journal — neither runner.run() is invoked again.
   assert.equal(calls.stray, 1, "the un-awaited agent's cached result must replay, not re-run, on resume");
   assert.equal(calls.main, 1, "the awaited agent's cached result must replay, not re-run, on resume");
+});
+
+test("nested workflow() frames use the run's registry snapshot (audit2 #6)", async () => {
+  // A sentinel agentType that exists ONLY in the in-memory registry: if the
+  // nested frame re-loaded the registry from disk it would not resolve.
+  const registry: AgentRegistry = new Map([
+    ["sentinel-type", { name: "sentinel-type", description: "in-memory only" }],
+  ]);
+  const child = `export const meta = { name: 'child', description: 'c' }
+const r = await agent('child task', { agentType: 'sentinel-type' })
+return { child: r }`;
+  const parent = `export const meta = { name: 'parent', description: 'p' }
+const nested = await workflow('child')
+return { nested }`;
+  const result = await runWorkflow<{ nested: { child: string } }>(parent, {
+    agent: fakeAgent({}),
+    agentRegistry: registry,
+    loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
+    persistLogs: false,
+  });
+  assert.equal(result.result.nested.child, "ok", "the nested frame resolved the in-memory registry's type");
+});
+
+test("agent() retries back off between attempts (audit2 #7)", async () => {
+  const script = `export const meta = { name: 'retry_bo', description: 'retry backoff' }
+const r = await agent('flaky', { label: 'flaky' })
+return r`;
+  const backoffs: number[] = [];
+  let attempts = 0;
+  const started = Date.now();
+  const result = await runWorkflow<string>(script, {
+    agent: {
+      async run() {
+        attempts++;
+        if (attempts < 3) {
+          throw new WorkflowError("empty", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, { recoverable: true });
+        }
+        return "recovered";
+      },
+    },
+    agentRetries: 3,
+    agentRetryBackoffMs: (failedAttempt) => {
+      backoffs.push(failedAttempt);
+      return 40;
+    },
+    persistLogs: false,
+  });
+  assert.equal(result.result, "recovered");
+  assert.deepEqual(backoffs, [1, 2], "backoff consulted per failed attempt");
+  assert.ok(Date.now() - started >= 75, "the waits actually elapsed (2 × 40ms)");
+});
+
+test("agent() rejects timeoutMs <= 0 instead of spawn-aborting sessions (audit2 #8)", async () => {
+  const script = `export const meta = { name: 'bad_timeout', description: 'bad timeout' }
+return await agent('x', { timeoutMs: 0 })`;
+  await assert.rejects(
+    () => runWorkflow(script, { agent: fakeAgent({}), persistLogs: false }),
+    (e: unknown) => e instanceof WorkflowError && e.code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+  );
+  await assert.rejects(
+    () =>
+      runWorkflow(`export const meta = { name: 't2', description: 't2' }\nreturn await agent('x')`, {
+        agent: fakeAgent({}),
+        agentTimeoutMs: 0,
+        persistLogs: false,
+      }),
+    (e: unknown) => e instanceof WorkflowError && e.code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+  );
+});
+
+test("the usage fallback estimate is LAZY when the provider reported terminal usage (audit2 #9)", async () => {
+  // A result whose JSON.stringify throws: if the fallback estimate were
+  // computed eagerly, the run would crash even though real usage exists.
+  const script = `export const meta = { name: 'lazy_est', description: 'lazy estimate' }
+return await agent('x')`;
+  const poisoned = {
+    toJSON() {
+      throw new Error("stringify must not run");
+    },
+  };
+  const result = await runWorkflow(script, {
+    agent: {
+      async run(_p: string, o: { onUsage?: (u: AgentUsage) => void }) {
+        o.onUsage?.({ input: 5, output: 5, cacheRead: 0, cacheWrite: 0, total: 10, cost: 0 });
+        return poisoned;
+      },
+    },
+    persistLogs: false,
+  });
+  assert.equal(result.tokenUsage?.total, 10, "real usage committed without ever stringifying the result");
 });
