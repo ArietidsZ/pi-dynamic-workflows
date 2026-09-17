@@ -2560,6 +2560,7 @@ return await agent('flaky')`;
     () => {
       throw new Error("boom");
     },
+    () => 1e12, // finite but huge: clamped to the 2000ms cap, NOT a ~1ms overflow storm
   ]) {
     const started = Date.now();
     const result = await runWorkflow<string>(script, {

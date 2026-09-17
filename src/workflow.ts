@@ -247,8 +247,10 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    * parallel() batch hammer the provider synchronously. The retry keeps its
    * concurrency slot during the backoff. Return 0 to disable; negative,
    * NaN, or non-finite returns fall back to the default; a throwing callback
-   * is ignored (default used). Finite positive values are honored as-is —
-   * abort latency during the wait is bounded by the returned value.
+   * is ignored (default used). Finite positive values are honored up to
+   * 2000ms (above that, clamped — a multi-day park would ignore aborts for
+   * its whole duration); abort latency during the wait is bounded by the
+   * effective value.
    */
   agentRetryBackoffMs?: (failedAttempt: number) => number;
   /** Internal: shared runtime inherited by a nested workflow() call. */
@@ -1131,8 +1133,9 @@ export async function runWorkflow<T = unknown>(
                     injected === 0
                       ? 0
                       : typeof injected === "number" && Number.isFinite(injected) && injected > 0
-                        ? Math.min(injected, 2_147_483_647) // above that, setTimeout overflows to ~1ms
-                        : defaultBackoffMs;
+                        ? Math.min(injected, 2_000) // capped: setTimeout overflows >2^31-1, and a
+                        : // multi-day park would ignore aborts for its whole duration
+                          defaultBackoffMs;
                 } catch {
                   backoffMs = defaultBackoffMs; // a throwing callback must not abandon the retry
                 }
