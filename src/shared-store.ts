@@ -32,37 +32,51 @@ export class SharedStore {
   // `${runId}:${callIndex}` string (see class doc) so nested workflow() runs
   // sharing this store can't collide on a bare callIndex.
   private readonly agentDeltas = new Map<string, Record<string, unknown>>();
-  // Pre-write shadow values for the CURRENT delta-key's in-progress writes,
-  // so a failed retry attempt's mutations can be rolled back (see
-  // `discardDelta`) instead of leaking into the live store or a later
-  // successful attempt's recorded delta. Populated lazily by `trackPut` (only
-  // the first write to a given key within the current delta window is
-  // shadowed — later writes to the same key within the same attempt are
-  // already covered by that first shadow) and cleared whenever the delta is
-  // finalized, either way, via `commitDelta`/`discardDelta`.
-  private readonly priorValues = new Map<string, Map<string, { existed: boolean; value: unknown; stamp?: string }>>();
-  // Last tracked writer per key (`deltaKey`), stamped on every trackPut —
-  // including writes of an Object.is-EQUAL value, which are still writes.
-  // discardDelta's ownership guard keys off this stamp: value comparison
-  // cannot distinguish "the store still holds my write" from "a sibling
-  // overwrote my key with an equal value", and the latter must NOT be rolled
-  // back (#208). Untracked put()/restore()/applyDelta() clear the stamp
-  // (writer unknown or no live window).
-  private readonly writeStamps = new Map<string, string>();
-  // Windows discarded via discardDelta — needed so a later rollback whose
-  // shadow names a discarded window can cascade past its never-committed
-  // write (see restoreShadow).
-  private readonly discardedWindows = new Set<string>();
-  // Oldest shadow retired per key when a discard SKIPS the key because a
-  // later writer owns it. Without it, that later writer's own rollback would
-  // restore the discarded window's write — a value no journal records —
-  // diverging live state from resume replay (#208 both-fail chain).
-  private readonly retiredPriors = new Map<string, { existed: boolean; value: unknown; stamp?: string }>();
+  // Per-key write history implementing event-log undo semantics for
+  // discardDelta (#208): each tracked write pushes an entry tagged with its
+  // window; untracked put()/applyDelta() writes push untagged entries that no
+  // discard can remove. Discarding a window removes ITS entries, and the
+  // visible value recomputes as the last surviving write (or the captured
+  // base). Value/stamp comparisons cannot express this: a sibling's overwrite
+  // with an Object.is-equal value is still a write that must survive, and a
+  // discarded window's shadow must never resurface — the log makes both
+  // exact. Entries live until dispose(); the bound is the run's write count,
+  // the same order as the journal itself.
+  private readonly keyHistories = new Map<
+    string,
+    { base: { existed: boolean; value: unknown }; writes: Array<{ window?: string; value: unknown }> }
+  >();
+
+  private historyFor(key: string) {
+    let history = this.keyHistories.get(key);
+    if (!history) {
+      history = {
+        base: { existed: this.map.has(key), value: this.map.get(key) },
+        writes: [],
+      };
+      this.keyHistories.set(key, history);
+    }
+    return history;
+  }
+
+  /** Recompute a key's visible value as its last surviving write (or its base). */
+  private recompute(
+    key: string,
+    history: { base: { existed: boolean; value: unknown }; writes: Array<{ value: unknown }> },
+  ): void {
+    const top = history.writes.at(-1);
+    if (top) this.map.set(key, top.value);
+    else if (history.base.existed) this.map.set(key, history.base.value);
+    else this.map.delete(key);
+    // No live writes left: the base has been restored, so the log can go.
+    if (history.writes.length === 0) this.keyHistories.delete(key);
+  }
 
   /** Store a value under `key`. Overwrites any existing value. */
   put(key: string, value: unknown): void {
+    // Untracked (script-level) write: survives every window discard.
+    this.historyFor(key).writes.push({ value });
     this.map.set(key, value);
-    this.writeStamps.delete(key);
   }
 
   /**
@@ -72,23 +86,8 @@ export class SharedStore {
    * writes can be journaled and replayed independently.
    */
   trackPut(key: string, value: unknown, deltaKey: string): void {
-    let priors = this.priorValues.get(deltaKey);
-    if (!priors) {
-      priors = new Map();
-      this.priorValues.set(deltaKey, priors);
-    }
-    // Only shadow the value from BEFORE this delta window started writing to
-    // this key — a second write to the same key within the same attempt must
-    // not overwrite the shadow with its own (already-in-window) value.
-    if (!priors.has(key)) {
-      priors.set(key, {
-        existed: this.map.has(key),
-        value: this.map.get(key),
-        stamp: this.writeStamps.get(key),
-      });
-    }
+    this.historyFor(key).writes.push({ window: deltaKey, value });
     this.map.set(key, value);
-    this.writeStamps.set(key, deltaKey);
     let delta = this.agentDeltas.get(deltaKey);
     if (!delta) {
       delta = {};
@@ -114,17 +113,24 @@ export class SharedStore {
 
   /**
    * Extract and clear the write delta accumulated for `deltaKey`.
-   * Called after an agent completes to get the set of keys it wrote.
+   * Called after an agent completes to get the set of keys it wrote. The
+   * window's write-log entries stay: a committed write is permanent history
+   * that later discards must not remove (resume replay re-applies it). A
+   * later discardDelta for the same key is a no-op — the delta bookkeeping
+   * is gone — so committed entries are unreachable by rollbacks.
    */
   commitDelta(deltaKey: string): Record<string, unknown> {
     const delta = this.agentDeltas.get(deltaKey) ?? {};
     this.agentDeltas.delete(deltaKey);
-    this.priorValues.delete(deltaKey);
-    // A commit finalizes the value for every key this window still owns —
-    // retire any older retired shadow beneath it: no rollback may cascade
-    // past a committed write.
+    // Detach this window's surviving log entries (they are permanent history
+    // now) so a LATER write under the same deltaKey starts a fresh generation:
+    // a discard of that generation must never remove committed entries.
     for (const key of Object.keys(delta)) {
-      if (this.writeStamps.get(key) === deltaKey) this.retiredPriors.delete(key);
+      const history = this.keyHistories.get(key);
+      if (!history) continue;
+      for (const write of history.writes) {
+        if (write.window === deltaKey) write.window = undefined;
+      }
     }
     return delta;
   }
@@ -139,78 +145,40 @@ export class SharedStore {
    * failed attempt's mutations would silently survive into the run's live
    * state while being absent from the journaled delta that resume replay
    * reconstructs from, leaving live execution and replay permanently
-   * inconsistent. Each key touched during this delta window is restored to
-   * whatever it held immediately before the window started (or deleted, if
-   * it did not exist yet) — never to some other attempt's or caller's value.
+   * inconsistent.
    *
-   * Per-key guard: a key is only rolled back if this attempt is still its
-   * LAST tracked writer (checked against the per-key write stamp, not the
-   * value — a sibling that overwrote the key with an Object.is-equal value is
-   * still a later writer whose write must survive, #208). If a
-   * concurrently-running sibling (a different `deltaKey`, e.g. another agent
-   * in the same parallel() batch) overwrote the same key AFTER this attempt
-   * wrote it but BEFORE it failed, that sibling's write is left untouched —
-   * rolling back unconditionally would silently erase a live, unrelated write
-   * that this attempt never made and has no business undoing.
+   * Exact undo semantics (#208): the attempt's entries are removed from each
+   * key's write log and the visible value recomputes as the last SURVIVING
+   * write — a concurrent sibling's later write (even an Object.is-equal one)
+   * survives, an untracked put()/replay applyDelta() survives, and a shadowed
+   * write by an earlier window resurfaces only if that window itself is still
+   * live or committed.
    *
    * A no-op if `deltaKey` never wrote anything (nothing to roll back).
    */
   discardDelta(deltaKey: string): void {
     const delta = this.agentDeltas.get(deltaKey);
     if (!delta) return;
-    this.discardedWindows.add(deltaKey);
-    const priors = this.priorValues.get(deltaKey);
     for (const key of Object.keys(delta)) {
-      // Someone else already rewrote this key since our last write to it —
-      // leave their write in place instead of clobbering it with our rollback.
-      if (this.writeStamps.get(key) !== deltaKey) {
-        // Our shadow would otherwise be lost: keep the OLDEST retired shadow
-        // for the key so the new owner's later rollback cascades past this
-        // never-committed write instead of resurrecting it.
-        const prior = priors?.get(key);
-        if (prior && !this.retiredPriors.has(key)) this.retiredPriors.set(key, prior);
-        continue;
-      }
-      this.restoreShadow(key, priors?.get(key));
+      const history = this.keyHistories.get(key);
+      if (!history) continue;
+      history.writes = history.writes.filter((write) => write.window !== deltaKey);
+      this.recompute(key, history);
     }
     this.agentDeltas.delete(deltaKey);
-    this.priorValues.delete(deltaKey);
-  }
-
-  /**
-   * Restore a key to a window's shadow (value AND writer stamp). When the
-   * shadow's writer was itself discarded without committing, cascade to the
-   * oldest retired shadow for the key — otherwise the discarded window's
-   * write would resurface in the live store while replay never re-applies it.
-   */
-  private restoreShadow(key: string, prior: { existed: boolean; value: unknown; stamp?: string } | undefined): void {
-    let shadow = prior;
-    while (shadow?.stamp !== undefined && this.discardedWindows.has(shadow.stamp)) {
-      const retired = this.retiredPriors.get(key);
-      if (!retired) break;
-      this.retiredPriors.delete(key);
-      shadow = retired;
-    }
-    if (shadow?.existed) this.map.set(key, shadow.value);
-    else this.map.delete(key);
-    // Restore the pre-window writer stamp too, so an EARLIER window whose
-    // write we shadowed can still roll back its own value later.
-    if (shadow?.stamp === undefined) this.writeStamps.delete(key);
-    else this.writeStamps.set(key, shadow.stamp);
   }
 
   /**
    * Apply a write delta additively — sets each key without clearing others.
    * Used during resume replay so parallel-agent deltas applied in callSeq
    * order accumulate correctly regardless of original completion order.
+   * Replay writes are untagged log entries: they belong to no live window and
+   * no window's discard may remove them.
    */
   applyDelta(delta: Record<string, unknown>): void {
     for (const [k, v] of Object.entries(delta)) {
+      this.historyFor(k).writes.push({ value: v });
       this.map.set(k, v);
-      // A replay write belongs to no live delta window — clear the writer
-      // stamp so a window's rollback can't mistake it for its own write and
-      // erase journaled state (#208).
-      this.writeStamps.delete(k);
     }
   }
 
@@ -220,9 +188,7 @@ export class SharedStore {
    */
   restore(snap: Record<string, unknown>): void {
     this.map.clear();
-    this.writeStamps.clear();
-    // A full reset replaces every value the retired shadows refer to.
-    this.retiredPriors.clear();
+    this.keyHistories.clear();
     for (const [k, v] of Object.entries(snap)) {
       this.map.set(k, v);
     }
@@ -232,10 +198,7 @@ export class SharedStore {
   dispose(): void {
     this.map.clear();
     this.agentDeltas.clear();
-    this.priorValues.clear();
-    this.writeStamps.clear();
-    this.discardedWindows.clear();
-    this.retiredPriors.clear();
+    this.keyHistories.clear();
   }
 }
 

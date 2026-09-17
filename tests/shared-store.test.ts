@@ -806,3 +806,68 @@ test("resume replays parallel-agent deltas additively so no writes are lost", as
   assert.equal(writeCalls.alpha, "hello", "resume: alpha delta must survive replay");
   assert.equal(writeCalls.beta, "world", "resume: beta delta must survive replay");
 });
+
+test("SharedStore matches an event-log undo model under randomized interleavings (#208)", () => {
+  // Differential fuzz: the store's visible state after every op must equal a
+  // reference model where a discard removes exactly the discarded (and never
+  // committed) window's writes and the visible value is the last surviving
+  // write. Deterministic LCG so failures reproduce.
+  let state = 0x2f6e2b1;
+  const rand = () => (state = (state * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  const KEYS = ["x", "y"];
+  const WINDOWS = ["run-1:0", "run-1:1", "run-1:2"];
+
+  for (let trial = 0; trial < 400; trial++) {
+    const store = new SharedStore();
+    // Reference: per-key surviving writes in order; base is always absent here.
+    const refWrites = new Map<string, Array<{ window?: string; value: unknown }>>();
+    const committed = new Set<string>();
+    const discarded = new Set<string>();
+    const push = (key: string, entry: { window?: string; value: unknown }) => {
+      const list = refWrites.get(key) ?? [];
+      list.push(entry);
+      refWrites.set(key, list);
+    };
+    const refVisible = (key: string) => refWrites.get(key)?.at(-1)?.value;
+
+    for (let step = 0; step < 14; step++) {
+      const key = KEYS[Math.floor(rand() * KEYS.length)];
+      const window = WINDOWS[Math.floor(rand() * WINDOWS.length)];
+      const op = Math.floor(rand() * 5);
+      if (op === 0) {
+        store.put(key, `u${trial}:${step}`);
+        push(key, { value: `u${trial}:${step}` });
+      } else if (op === 1) {
+        store.applyDelta({ [key]: `r${trial}:${step}` });
+        push(key, { value: `r${trial}:${step}` });
+      } else if (op === 2) {
+        store.trackPut(key, `w${trial}:${step}`, window);
+        push(key, { window, value: `w${trial}:${step}` });
+      } else if (op === 3) {
+        store.commitDelta(window);
+        committed.add(window);
+        // Committed writes detach from the window: permanent history that no
+        // later discard of a same-keyed generation may remove.
+        for (const list of refWrites.values()) {
+          for (const e of list) {
+            if (e.window === window) e.window = undefined;
+          }
+        }
+      } else {
+        store.discardDelta(window);
+        discarded.add(window);
+        for (const [k, list] of refWrites) {
+          refWrites.set(
+            k,
+            list.filter((e) => e.window !== window),
+          );
+        }
+      }
+      assert.equal(
+        store.get(key),
+        refVisible(key),
+        `trial ${trial} step ${step}: key ${key} diverged (ops so far: committed=${[...committed]}, discarded=${[...discarded]})`,
+      );
+    }
+  }
+});
