@@ -950,9 +950,16 @@ export class WorkflowManager extends EventEmitter {
           // (`${runId}:${callIndex}`) and reused (ghost + live retry, edited
           // scripts shifting indices), and the latest row is the most recent
           // execution of that call.
-          const seeded = event.replayed
-            ? managed.snapshot.agents.findLast((agent) => agent.callId === event.id)
-            : undefined;
+          let seeded: WorkflowAgentSnapshot | undefined;
+          if (event.replayed) {
+            for (let i = managed.snapshot.agents.length - 1; i >= 0; i--) {
+              const candidate = managed.snapshot.agents[i];
+              if (candidate.callId === event.id) {
+                seeded = candidate;
+                break;
+              }
+            }
+          }
           let agentSnapshot: WorkflowAgentSnapshot;
           if (seeded) {
             // Keep the row's identity/history, refresh presentation fields from
