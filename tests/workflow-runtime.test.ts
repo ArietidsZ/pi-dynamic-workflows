@@ -2373,31 +2373,89 @@ test("an aborted run's drain abandons signal-ignoring agents after drainAbortGra
   const script = `export const meta = { name: 'hung_drain', description: 'hung drain' }
 void agent('wedged', { label: 'wedged' })
 return 'script-done'`;
+  for (const abortTiming of ["during-drain", "before-drain"] as const) {
+    const controller = new AbortController();
+    const logs: string[] = [];
+    const started = Date.now();
+    let agentStarted!: () => void;
+    const agentGate = new Promise<void>((resolve) => (agentStarted = resolve));
+    const pending = runWorkflow<string>(script, {
+      agent: {
+        async run() {
+          agentStarted();
+          return new Promise<string>(() => {}); // never settles, ignores signal
+        },
+      },
+      signal: controller.signal,
+      drainAbortGraceMs: 50,
+      persistLogs: false,
+      onLog: (m) => logs.push(m),
+    });
+    await agentGate; // the hung agent is in-flight
+    if (abortTiming === "before-drain") {
+      // Abort immediately: the script may not have returned yet — the drain
+      // starts already-aborted.
+      controller.abort();
+    } else {
+      // Wait for the drain to start (its log line), then abort mid-drain.
+      for (let i = 0; i < 2000 && !logs.some((l) => l.includes("outstanding agent()")); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+      controller.abort();
+    }
+    await pending.catch(() => {});
+    assert.ok(
+      Date.now() - started < 5_000,
+      `${abortTiming}: the run settles promptly after the grace instead of wedging`,
+    );
+    assert.ok(
+      logs.some((l) => l.includes("abandoning 1 outstanding agent()")),
+      `${abortTiming}: the abandonment is logged`,
+    );
+  }
+});
+
+test("drainAbortGraceMs: Infinity restores unbounded waiting (no busy-spin) (audit2 #3)", async () => {
+  const script = `export const meta = { name: 'hung_inf', description: 'hung inf' }
+void agent('wedged', { label: 'wedged' })
+return 'script-done'`;
   const controller = new AbortController();
-  const started = Date.now();
+  const logs: string[] = [];
+  let agentStarted!: () => void;
+  const agentGate = new Promise<void>((resolve) => (agentStarted = resolve));
   const pending = runWorkflow<string>(script, {
     agent: {
       async run() {
-        return new Promise<string>(() => {}); // never settles, ignores signal
+        agentStarted();
+        return new Promise<string>(() => {});
       },
     },
     signal: controller.signal,
-    drainAbortGraceMs: 50,
+    drainAbortGraceMs: Number.POSITIVE_INFINITY,
     persistLogs: false,
+    onLog: (m) => logs.push(m),
   });
-  // Let the agent start, then abort.
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  await agentGate;
   controller.abort();
-  await pending.catch(() => {});
-  assert.ok(
-    Date.now() - started < 5_000,
-    "the run settles promptly after the grace instead of wedging on the hung agent",
-  );
+  // With Infinity the drain must NOT abandon: it keeps waiting. Give it ample
+  // time to (wrongly) abandon or (wrongly) busy-spin, then confirm neither.
+  const settled = await Promise.race([
+    pending.then(
+      () => true,
+      () => true,
+    ),
+    new Promise((r) => setTimeout(() => r(false), 300)),
+  ]);
+  assert.equal(settled, false, "Infinity grace: the drain must not abandon the hung agent");
+  assert.ok(!logs.some((l) => l.includes("abandoning")), "no abandonment logged");
+  // Cleanup: not observable further (the run stays wedged by design) — the
+  // process exits because nothing else holds the loop (agent promise is not a
+  // handle).
 });
 
-test("a NON-abort drain still waits without a bound for a slow un-awaited agent (audit2 #3)", async () => {
-  // Success-path drains must not be grace-limited: the slow sibling's result
-  // is still wanted (the checkpoint-suspension drain relies on this).
+test("a NON-abort (success) drain still waits without a bound for a slow un-awaited agent (audit2 #3)", async () => {
+  // The success-path drain must not be grace-limited: the slow sibling's
+  // result is still wanted (it journals when it completes).
   const script = `export const meta = { name: 'slow_drain', description: 'slow drain' }
 const pending = agent('slow', { label: 'slow' })
 return 'script-done'`;

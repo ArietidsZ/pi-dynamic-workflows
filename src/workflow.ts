@@ -215,16 +215,21 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   /** Timeout per agent in milliseconds. null/omitted means no hard timeout. */
   agentTimeoutMs?: number | null;
   /**
-   * Grace period (ms) for the terminal drain ONCE this run's abort has fired
-   * (external abort or run-fatal seal). Agents are signaled at abort, but the
-   * signal is cooperative — a signal-ignoring runner would otherwise wedge the
-   * drain, and with it the run's terminal transition, forever (audit2 #3).
-   * After the grace expires the drain stops waiting: late results are dropped
-   * (the store is disposed and the manager's isCurrent() gating rejects stale
-   * writes). Does NOT apply to non-abort drains (success, durable checkpoint
-   * suspension) — those wait for in-flight agents without a bound, since their
-   * results are still wanted. Default 10_000; Infinity restores unbounded
-   * waiting.
+   * Grace period (ms) for the terminal drain once this run is ABORT-SIGNALED
+   * (external abort or the run-fatal seal — note the seal currently also fires
+   * for a durable checkpoint suspension, so suspension drains are bounded too
+   * until fix/checkpoint-suspension-seal lands). Agents are signaled at abort,
+   * but the signal is cooperative — a signal-ignoring runner would otherwise
+   * wedge the drain, and with it the run's terminal transition, forever
+   * (audit2 #3). After the grace expires the drain stops waiting: the store is
+   * disposed below (late writes re-populate a store nobody reads), no journal
+   * can follow (the completion path's abort check precedes journaling), and
+   * the manager's persist/emit paths are staleness-gated.
+   *
+   * Does NOT apply to the SUCCESS drain, which waits unbounded — those results
+   * are still wanted. Default 10_000; Infinity restores unbounded waiting for
+   * aborted runs too. Finite values are clamped to [1, 2^31-1]; invalid values
+   * (NaN, 0, negatives) fall back to the default.
    */
   drainAbortGraceMs?: number;
   /** Whether to persist logs to disk. Default: true */
@@ -1710,38 +1715,67 @@ export async function runWorkflow<T = unknown>(
       if (shared.inFlight.size > 0) {
         log(`waiting for ${shared.inFlight.size} outstanding agent() call(s) to settle before this run completes`);
       }
-      const drainAbortGraceMs = options.drainAbortGraceMs ?? 10_000;
+      const graceOption = options.drainAbortGraceMs;
+      const drainAbortGraceMs =
+        graceOption === undefined
+          ? 10_000
+          : graceOption === Number.POSITIVE_INFINITY
+            ? Number.POSITIVE_INFINITY
+            : typeof graceOption === "number" && graceOption >= 1 && graceOption <= 2_147_483_647
+              ? Math.floor(graceOption)
+              : 10_000; // NaN/0/negative/overflow → default
       // Wakes the drain loop the moment the run aborts (either source), so a
       // drain that started un-aborted re-enters promptly and the grace clock
       // starts instead of blocking on allSettled forever.
+      let wakeAbort: () => void = () => {};
       const abortWake = new Promise<void>((resolve) => {
-        options.signal?.addEventListener("abort", () => resolve(), { once: true });
-        shared.runFatalController.signal.addEventListener("abort", () => resolve(), { once: true });
+        wakeAbort = resolve;
       });
-      while (shared.inFlight.size > 0) {
-        const pending = Array.from(shared.inFlight);
-        if (!isAborted() || !Number.isFinite(drainAbortGraceMs)) {
-          await Promise.race([Promise.allSettled(pending), abortWake]);
-          continue;
+      const externalWake = () => wakeAbort();
+      const fatalWake = () => wakeAbort();
+      options.signal?.addEventListener("abort", externalWake, { once: true });
+      shared.runFatalController.signal.addEventListener("abort", fatalWake, { once: true });
+      try {
+        while (shared.inFlight.size > 0) {
+          const pending = Array.from(shared.inFlight);
+          if (!isAborted() || drainAbortGraceMs === Number.POSITIVE_INFINITY) {
+            // Not aborted: wait, but wake promptly if the abort fires
+            // mid-wait. Already-aborted with an unbounded grace: plain wait —
+            // racing the (already-resolved) abortWake here would busy-spin
+            // the microtask queue and starve the event loop (r1 B1).
+            if (isAborted()) {
+              await Promise.allSettled(pending);
+            } else {
+              await Promise.race([Promise.allSettled(pending), abortWake]);
+            }
+            continue;
+          }
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const grace = new Promise<"timeout">((resolve) => {
+            // Deliberately ref'd (no unref): this timer is load-bearing for
+            // the run's terminal transition — an unref'd one would let the
+            // process exit before the run settles when nothing else holds the
+            // loop open.
+            timer = setTimeout(() => resolve("timeout"), drainAbortGraceMs);
+          });
+          const winner = await Promise.race([Promise.allSettled(pending).then(() => "settled" as const), grace]);
+          if (timer) clearTimeout(timer);
+          if (winner === "timeout") {
+            // Leave the calls behind. No rejection-swallowing needed here:
+            // every inFlight promise already carries a noop catch from its
+            // creation site (:712), so a late rejection is handled. The store
+            // disposes below; no journal can follow (the completion path's
+            // abort check precedes journaling); manager persists are
+            // staleness-gated.
+            log(
+              `abandoning ${pending.length} outstanding agent() call(s) that did not settle within ${drainAbortGraceMs}ms of the drain's abort grace`,
+            );
+            break;
+          }
         }
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        const grace = new Promise<"timeout">((resolve) => {
-          timer = setTimeout(() => resolve("timeout"), drainAbortGraceMs);
-          (timer as unknown as { unref?: () => void }).unref?.();
-        });
-        const winner = await Promise.race([Promise.allSettled(pending).then(() => "settled" as const), grace]);
-        if (timer) clearTimeout(timer);
-        if (winner === "timeout") {
-          // Swallow late rejections from the abandoned calls (nothing awaits
-          // them after the break), then leave them behind: the store disposes
-          // below and late journals are dropped by the manager's staleness
-          // gating (isCurrent/lease), so abandoning cannot corrupt the record.
-          for (const call of pending) void Promise.resolve(call).catch(() => {});
-          log(
-            `abandoning ${shared.inFlight.size} outstanding agent() call(s) that did not settle within ${drainAbortGraceMs}ms of the abort`,
-          );
-          break;
-        }
+      } finally {
+        options.signal?.removeEventListener("abort", externalWake);
+        shared.runFatalController.signal.removeEventListener("abort", fatalWake);
       }
       store.dispose();
     }

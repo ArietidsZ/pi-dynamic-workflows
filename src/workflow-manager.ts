@@ -1111,6 +1111,23 @@ export class WorkflowManager extends EventEmitter {
         console.warn(`[workflow] ${warning.replace(/\n\s*/g, " ")}`);
       }
 
+      // A pause() requested while the terminal drain was settling (the run's
+      // script had already returned, so the drain was the only thing keeping
+      // it non-terminal) owns the lifecycle: keep the run paused/resumable
+      // instead of overwriting to completed — the result is already in
+      // managed.result below and the journal carries the work, so a later
+      // resume replays instantly and completes (audit2 #3 drain-grace makes
+      // this window reachable for hung-then-abandoned agents).
+      if (managed.status === "paused") {
+        managed.result = result;
+        this.persistRun(managed);
+        if (this.isCurrent(managed)) {
+          this.releaseRunLease(managed);
+          this.recordTerminalRun(managed.runId);
+        }
+        return result;
+      }
+
       managed.status = "completed";
       managed.result = result;
       // Gated the same way as disk/lease below (see emitLive()): a stale

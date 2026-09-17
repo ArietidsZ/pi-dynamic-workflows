@@ -4721,3 +4721,42 @@ test(
     assert.equal(statusRow?.cacheRead, 0);
   }),
 );
+
+test(
+  "pause() during the terminal drain keeps the run paused (not overwritten to completed) (audit2 r1 m7)",
+  withTempCwd(async (cwd) => {
+    let releaseSibling!: () => void;
+    const siblingGate = new Promise<void>((resolve) => (releaseSibling = resolve));
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          if (prompt === "slow") {
+            setTimeout(releaseSibling, 60);
+            await siblingGate;
+          }
+          return "done";
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'pause_drain', description: 'pause during drain' }
+const stray = agent('slow')
+return 'script-done'`;
+    const { runId, promise } = manager.startInBackground(script);
+
+    // Wait for the drain to start, then pause mid-drain.
+    for (let i = 0; i < 2000; i++) {
+      const logs = manager.getRun(runId)?.snapshot.logs ?? [];
+      if (logs.some((l) => l.includes("outstanding agent()"))) break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(manager.pause(runId), true);
+    releaseSibling();
+    await promise.catch(() => {});
+
+    const persisted = manager.getPersistence().load(runId);
+    assert.equal(persisted?.status, "paused", "pause owns the lifecycle — no paused→completed flip");
+    assert.equal(persisted?.result, "script-done", "the result is retained on the paused record");
+  }),
+);
