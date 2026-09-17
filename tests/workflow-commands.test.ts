@@ -607,3 +607,95 @@ function progressAndFinalListenerCount(manager: EventEmitter): number {
     .map((ev) => manager.listenerCount(ev))
     .reduce((a, b) => a + b, 0);
 }
+
+test("/workflows status watch survives a throwing sendMessage/setStatus (audit2 #37)", async () => {
+  const snapshot = {
+    name: "demo",
+    phases: [],
+    logs: [],
+    agents: [],
+    agentCount: 1,
+    runningCount: 0,
+    doneCount: 1,
+    errorCount: 0,
+  };
+  const manager: any = new EventEmitter();
+  manager.getRun = (id: string) => (id === "run-1" ? { runId: "run-1", status: "completed", snapshot } : undefined);
+  manager.getSnapshot = () => null;
+  manager.listRuns = () => [];
+  let handler: ((a: string, c: any) => Promise<void>) | undefined;
+  const pi: any = {
+    getCommands: () => [],
+    registerCommand: (_n: string, o: any) => {
+      handler = o.handler;
+    },
+    sendMessage: () => {
+      throw new Error("stale ctx");
+    },
+  };
+  registerWorkflowCommands(pi as unknown as ExtensionAPI, manager as unknown as WorkflowManager);
+  const ctx = {
+    ui: {
+      notify: () => {},
+      setStatus: () => {
+        throw new Error("stale ui");
+      },
+    },
+  };
+  await handler!("status run-1", ctx);
+  assert.doesNotThrow(() => manager.emit("complete", { runId: "run-1" }), "finish swallows stale-ctx failures");
+  assert.equal(progressAndFinalListenerCount(manager), 0, "listeners still torn down");
+});
+
+test("/workflows save <name> warns (not false-success) when the name is host-owned (audit2 #35)", async () => {
+  const saved: Array<{ name: string; description?: string; script: string }> = [];
+  const storage = {
+    save: (w: { name: string; description?: string; script: string }) => {
+      saved.push(w);
+      return { ...w, id: "saved-1", path: `/tmp/${w.name}.json`, savedAt: "now" };
+    },
+    load: () => null,
+    list: () => saved,
+  };
+  const runs = [
+    {
+      runId: "recent",
+      workflowName: "scan",
+      status: "completed",
+      script: "export const meta = { name: 'scan', description: 'scan' }",
+      agents: [],
+      logs: [],
+    },
+  ];
+  const manager = {
+    listRuns: () => runs,
+    getSnapshot: () => null,
+    getRun: () => undefined,
+    pause: () => false,
+    resume: async () => false,
+    stop: () => false,
+    deleteRun: () => false,
+  } as unknown as WorkflowManager;
+
+  const commands: Array<{ name: string }> = [{ name: "host-owned" }]; // third-party command
+  let workflowsHandler: Handler | undefined;
+  registerWorkflowCommands(
+    {
+      getCommands: () => commands.map((c) => ({ name: c.name })),
+      registerCommand: (name: string, opts: { handler: Handler }) => {
+        if (name === "workflows") workflowsHandler = opts.handler;
+      },
+      sendMessage: async () => {},
+    } as unknown as ExtensionAPI,
+    manager,
+    { storage, cwd: "/cwd" },
+  );
+  const notified: Array<{ message: string; type?: string }> = [];
+  await workflowsHandler!("save host-owned", {
+    ui: { notify: (m: string, t?: string) => notified.push({ message: m, type: t }) },
+  });
+  assert.equal(saved.length, 1, "the file persisted");
+  assert.equal(notified.length, 1);
+  assert.equal(notified[0].type, "warning", "a refused registration is a warning, not a success");
+  assert.match(notified[0].message, /cannot be registered/);
+});

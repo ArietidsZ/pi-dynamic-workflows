@@ -101,12 +101,27 @@ function writeJsonAtomic(fs: PersistenceFsLayer, path: string, data: unknown, st
  * destroying it with zero remaining bytes (audit2 #36). Recovery via
  * readJsonWithBackupRecovery() then yields the previous version when the new
  * primary is unreadable — strictly better than an unrecoverable loss.
+ *
+ * The previous content is only used when it READS and PARSES: a corrupt
+ * primary must not poison the backup (a later corruption would then lose
+ * everything), and an unreadable primary must not fail the save (tmp+rename
+ * needs no read permission) — in both cases the existing `.bak` is preserved.
  */
 export function writeJsonAtomicPreservingPreviousBackup(fs: PersistenceFsLayer, path: string, data: unknown): void {
-  const previous = fs.existsSync(path) ? fs.readFileSync(path, "utf8") : undefined;
+  let previous: string | undefined;
+  try {
+    if (fs.existsSync(path)) {
+      const raw = fs.readFileSync(path, "utf8");
+      JSON.parse(raw); // validate — corrupt bytes are not a recoverable version
+      previous = raw;
+    }
+  } catch {
+    previous = undefined; // preserve the existing .bak instead of copying garbage
+  }
   const json = JSON.stringify(data, null, 2);
   fs.writeFileSync(`${path}.tmp`, json);
   fs.renameSync(`${path}.tmp`, path);
+  if (previous === undefined && fs.existsSync(`${path}.bak`)) return; // keep the last good backup
   try {
     fs.writeFileSync(`${path}.bak`, previous ?? json);
   } catch {

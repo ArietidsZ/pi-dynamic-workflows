@@ -81,18 +81,18 @@ function watchRun(manager: WorkflowManager, pi: ExtensionAPI, ctx: ExtensionComm
     settled = true;
     for (const ev of progressEvents) manager.off(ev, onEvent);
     for (const ev of finalEvents) manager.off(ev, finish);
-    ctx.ui.setStatus(key, undefined);
-    const run = manager.getRun(id);
-    if (run) {
-      try {
+    try {
+      ctx.ui.setStatus(key, undefined);
+      const run = manager.getRun(id);
+      if (run) {
         pi.sendMessage({
           customType: "workflows",
           content: renderWorkflowText(recomputeWorkflowSnapshot(run.snapshot), true),
           display: true,
         });
-      } catch {
-        // Listeners are already removed; a stale-ctx failure is not actionable.
       }
+    } catch {
+      // Listeners are already removed; a stale-ctx/UI failure is not actionable.
     }
   };
   for (const ev of progressEvents) manager.on(ev, onEvent);

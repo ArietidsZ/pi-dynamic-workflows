@@ -1988,8 +1988,10 @@ export class WorkflowManager extends EventEmitter {
     const deleted = this.persistence.delete(runId);
     // Notify watchers (watchRun subscribes to "deleted"): without an event, a
     // /workflows watch on a deleted run leaks all of its listeners and strands
-    // the status-bar entry forever (audit2 #34).
-    if (deleted) this.emit("deleted", { runId });
+    // the status-bar entry forever (audit2 #34). Emit when the run existed in
+    // memory even if the file was already gone out-of-band — the lifecycle
+    // fact is what watchers need.
+    if (deleted || managed) this.emit("deleted", { runId });
     return deleted;
   }
 

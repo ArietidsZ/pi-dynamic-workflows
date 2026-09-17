@@ -605,3 +605,37 @@ test("a saved shadow does not override an explicitly named argument (audit2 #43)
   const args = started[0].args as Record<string, unknown>;
   assert.equal(args.question, "explicit-topic", "the named arg wins; positionals stay in _");
 });
+
+test("shadow positional mapping: equals-only topics, defaults, and structured secondaries (audit2 #43 r1)", async () => {
+  const { pi, commands } = makeCommandRegistryPi();
+  const { manager, started } = makeFakeManager();
+  registerBuiltinWorkflows(pi, {
+    cwd: "/tmp",
+    manager,
+    storage: makeFakeStorage({
+      "deep-research": {
+        script: "export const meta = { name: 'shadow', description: 's' }",
+        parameters: { question: { default: "DEFAULT" } },
+      },
+      "multi-perspective": { script: "export const meta = { name: 'mps', description: 's' }" },
+    }),
+  });
+  const { ctx } = makeNotifyCtx();
+  const deep = commands.find((c) => c.name === "deep-research")?.handler;
+  const mps = commands.find((c) => c.name === "multi-perspective")?.handler;
+  assert.ok(deep && mps);
+
+  // "="-containing topic survives (parseCommandArgs treats it as key=value).
+  await deep!("a=b=c", ctx);
+  assert.equal((started[0].args as Record<string, unknown>).question, "a=b=c");
+
+  // A bare positional beats the declared parameter default.
+  await deep!("explicit topic", ctx);
+  assert.equal((started[1].args as Record<string, unknown>).question, "explicit topic");
+
+  // Structured secondary: first token → topic, rest → perspectives.
+  await mps!("auth-flows security performance", ctx);
+  const mpArgs = started[2].args as Record<string, unknown>;
+  assert.equal(mpArgs.topic, "auth-flows");
+  assert.deepEqual(mpArgs.perspectives, ["security", "performance"]);
+});
