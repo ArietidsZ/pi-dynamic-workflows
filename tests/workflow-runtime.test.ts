@@ -2366,3 +2366,86 @@ return main`;
   assert.equal(calls.stray, 1, "the un-awaited agent's cached result must replay, not re-run, on resume");
   assert.equal(calls.main, 1, "the awaited agent's cached result must replay, not re-run, on resume");
 });
+
+test("runWorkflow's final onTokenUsage flush includes agents that settle during the drain (audit2 #5)", async () => {
+  // The script returns while an un-awaited sibling is still running; the drain
+  // waits it out, and the final flush must carry the sibling's spend.
+  const script = `export const meta = { name: 'drain_flush', description: 'drain flush' }
+const pending = agent('slow-sibling', { label: 'sibling' })
+return 'script-done'`;
+  const flushes: number[] = [];
+  let releaseSibling!: () => void;
+  const siblingGate = new Promise<void>((resolve) => (releaseSibling = resolve));
+  let calls = 0;
+  const result = await runWorkflow<string>(script, {
+    agent: {
+      async run(prompt: string) {
+        calls++;
+        if (prompt === "slow-sibling") {
+          setTimeout(releaseSibling, 30);
+          await siblingGate;
+        }
+        return "done";
+      },
+    },
+    onAgentUsage: () => {},
+    onTokenUsage: (usage) => flushes.push(usage.total),
+    persistLogs: false,
+  });
+  assert.equal(result.result, "script-done");
+  assert.equal(calls, 1, "the sibling ran exactly once");
+  assert.equal(flushes.length, 1, "exactly one final flush");
+  assert.ok(flushes[0] > 0, "the drain-settled sibling's usage is in the final flush");
+});
+
+test("runWorkflow initialPhaseBudgets adopts the persisted baseline instead of re-basing (audit2 #4)", async () => {
+  // Simulates resume(): the prior execution declared phase 'p' with budget 100
+  // at baseline 0 and already spent 60. The resumed script re-runs
+  // phase('p', {budget: 100}) — with re-basing the phase would get a FRESH 100
+  // allowance (120 total), with adoption the ceiling holds at 100 cumulatively.
+  const script = `export const meta = { name: 'phase_seed', description: 'phase seed' }
+phase('p', { budget: 100 })
+const a = await agent('a', { label: 'a' })
+let blocked = false
+try { await agent('b', { label: 'b' }) } catch (e) { blocked = (e && e.code) === 'TOKEN_BUDGET_EXHAUSTED' }
+return { a, blocked }`;
+  const phaseBudgetEvents: Array<Record<string, { budget: number; startSpent: number }>> = [];
+  const result = await runWorkflow<{ a: unknown; blocked: boolean }>(script, {
+    agent: fakeAgent({ input: 60, output: 0, total: 60, cost: 0 }),
+    initialTokenUsage: { input: 60, output: 0, total: 60, cost: 0, cacheRead: 0, cacheWrite: 0 },
+    initialPhaseBudgets: { p: { budget: 100, startSpent: 0 } },
+    onPhaseBudgets: (budgets) => phaseBudgetEvents.push(budgets),
+    persistLogs: false,
+  });
+  // 'a' runs (phase spent 60 < 100 → gate passes), spends 60 → phase spent 120.
+  assert.equal(result.result.a, "ok");
+  assert.equal(
+    result.result.blocked,
+    true,
+    "'b' must be blocked: the phase ceiling is cumulative across resume (60 + 60 ≥ 100 from the ORIGINAL baseline)",
+  );
+  assert.equal(
+    phaseBudgetEvents.length,
+    0,
+    "re-declaring an already-budgeted phase does not re-declare (first declaration wins)",
+  );
+});
+
+test("runWorkflow phase() first-declaration-wins and notifies once per new budget", async () => {
+  const script = `export const meta = { name: 'phase_decl', description: 'phase decl' }
+phase('p', { budget: 60 })
+const a = await agent('a', { label: 'a' })
+phase('p', { budget: 999999 })
+let blocked = false
+try { await agent('b', { label: 'b' }) } catch (e) { blocked = true }
+return { a, blocked }`;
+  const events: Array<Record<string, { budget: number }>> = [];
+  const result = await runWorkflow<{ a: unknown; blocked: boolean }>(script, {
+    agent: fakeAgent({ input: 60, output: 0, total: 60, cost: 0 }),
+    onPhaseBudgets: (budgets) => events.push(budgets),
+    persistLogs: false,
+  });
+  assert.equal(result.result.blocked, true, "the 999999 re-declaration must NOT re-base the budget away");
+  assert.equal(events.length, 1, "exactly one budget notification (the first declaration)");
+  assert.equal(events[0]?.p?.budget, 60);
+});

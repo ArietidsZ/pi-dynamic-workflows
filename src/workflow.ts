@@ -270,6 +270,15 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   confirm?: (promptText: string, options: CheckpointOptions) => Promise<unknown>;
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
+  /**
+   * Persisted per-phase sub-budgets from a previous execution (resume() only):
+   * adopted on first re-declaration instead of re-basing, so a phase ceiling
+   * holds CUMULATIVELY across a pause/resume cycle (audit2 #4) instead of
+   * silently granting the phase a fresh allowance per resume.
+   */
+  initialPhaseBudgets?: Record<string, { budget: number; startSpent: number; warned?: boolean }>;
+  /** Fired whenever the phase-budget table changes, so the manager can persist it. */
+  onPhaseBudgets?: (budgets: Record<string, { budget: number; startSpent: number; warned: boolean }>) => void;
   /** Runtime behavior trace used by diagnostics and comprehension evidence. */
   onRuntimeEvent?: (event: WorkflowRuntimeEvent) => void;
   onAgentStart?: (event: {
@@ -515,7 +524,12 @@ export async function runWorkflow<T = unknown>(
     // explicit phase() (or agent({ phase })) overrides this.
     phases: meta.phases?.[0]?.title ? [meta.phases[0].title] : [],
     currentPhase: meta.phases?.[0]?.title,
-    phaseBudgets: new Map(),
+    phaseBudgets: new Map(
+      Object.entries(options.initialPhaseBudgets ?? {}).map(([title, pb]) => [
+        title,
+        { budget: pb.budget, startSpent: pb.startSpent, warned: pb.warned ?? false },
+      ]),
+    ),
     callSeq: 0,
     firstMiss: Number.POSITIVE_INFINITY,
   };
@@ -581,10 +595,13 @@ export async function runWorkflow<T = unknown>(
     state.currentPhase = title;
     if (!state.phases.includes(title)) state.phases.push(title);
     // Carve a soft sub-budget from the run total for work done under this phase.
-    // Re-declaring re-bases from the current spent (idempotent across resume: the
-    // script re-runs phase() and the ceiling is recomputed from live spent).
-    if (typeof phaseOptions?.budget === "number" && phaseOptions.budget > 0) {
+    // First declaration wins for the run's whole lifetime (including across
+    // resume, via the persisted initialPhaseBudgets seed): re-declaring a phase
+    // keeps its original baseline so the ceiling is cumulative, not per-resume
+    // (audit2 #4 — re-basing on resume silently re-granted the full allowance).
+    if (typeof phaseOptions?.budget === "number" && phaseOptions.budget > 0 && !state.phaseBudgets.has(title)) {
       state.phaseBudgets.set(title, { budget: phaseOptions.budget, startSpent: shared.spent, warned: false });
+      options.onPhaseBudgets?.(Object.fromEntries(state.phaseBudgets));
     }
     options.onPhase?.(title);
     options.onRuntimeEvent?.({
@@ -732,35 +749,7 @@ export async function runWorkflow<T = unknown>(
     // agents short-circuit before their real API call (see the limiter body).
     ensureAgentCapacity();
 
-    if (budget.total !== null && budget.remaining() <= 0) {
-      throw new WorkflowError("workflow token budget exhausted", WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED, {
-        recoverable: false,
-      });
-    }
-
     const assignedPhase = agentOptions.phase ?? state.currentPhase;
-
-    // Per-phase soft sub-budget gate: a noisy phase can exhaust its own ceiling
-    // without touching the run's overall budget. Soft (spent accrues post-agent),
-    // warns once at ~80%, throws at 100%. Scripts can try/catch around a phase's
-    // work so later phases still proceed.
-    if (assignedPhase) {
-      const pb = state.phaseBudgets.get(assignedPhase);
-      if (pb) {
-        const phaseSpent = shared.spent - pb.startSpent;
-        if (phaseSpent >= pb.budget) {
-          throw new WorkflowError(
-            `phase "${assignedPhase}" token sub-budget exhausted (${pb.budget})`,
-            WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED,
-            { recoverable: false },
-          );
-        }
-        if (!pb.warned && phaseSpent >= pb.budget * 0.8) {
-          pb.warned = true;
-          log(`phase "${assignedPhase}" at ${Math.round((phaseSpent / pb.budget) * 100)}% of its token sub-budget`);
-        }
-      }
-    }
 
     const requestedLabel = agentOptions.label?.trim();
 
@@ -865,6 +854,39 @@ export async function runWorkflow<T = unknown>(
     // unchanged prefix ends; this call and every later one then run live.
     if (!hashMatches || cachedEmptyOutput) {
       state.firstMiss = Math.min(state.firstMiss, callIndex);
+    }
+
+    // Budget gates, deliberately AFTER the replay lookup: a journaled cache hit
+    // is free (replay commits no usage), so an exhausted budget must not strand
+    // a resumable run at a replayable call (audit2 #1 — with the gate before
+    // the lookup, a budgeted run paused past its cap was permanently
+    // unresumable, since resume() cannot raise the budget). Both gates still
+    // fire before every LIVE (paid) call.
+    if (budget.total !== null && budget.remaining() <= 0) {
+      throw new WorkflowError("workflow token budget exhausted", WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED, {
+        recoverable: false,
+      });
+    }
+    // Per-phase soft sub-budget gate: a noisy phase can exhaust its own ceiling
+    // without touching the run's overall budget. Soft (spent accrues post-agent),
+    // warns once at ~80%, throws at 100%. Scripts can try/catch around a phase's
+    // work so later phases still proceed.
+    if (assignedPhase) {
+      const pb = state.phaseBudgets.get(assignedPhase);
+      if (pb) {
+        const phaseSpent = shared.spent - pb.startSpent;
+        if (phaseSpent >= pb.budget) {
+          throw new WorkflowError(
+            `phase "${assignedPhase}" token sub-budget exhausted (${pb.budget})`,
+            WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED,
+            { recoverable: false },
+          );
+        }
+        if (!pb.warned && phaseSpent >= pb.budget * 0.8) {
+          pb.warned = true;
+          log(`phase "${assignedPhase}" at ${Math.round((phaseSpent / pb.budget) * 100)}% of its token sub-budget`);
+        }
+      }
     }
 
     return limiter(async () => {
@@ -1604,6 +1626,7 @@ export async function runWorkflow<T = unknown>(
   });
 
   const wrapped = `${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`;
+  let runSucceeded = false;
   try {
     const result = await new vm.Script(wrapped, { filename: `${meta.name || "workflow"}.js` }).runInContext(context);
     // Even a script-level catch must not convert an accepted durable pause to
@@ -1616,9 +1639,7 @@ export async function runWorkflow<T = unknown>(
       log(`Logs persisted to ${logFile}`);
     }
 
-    // Emit final token usage
-    options.onTokenUsage?.(shared.tokenUsage);
-
+    runSucceeded = true;
     return {
       meta,
       result: result as T,
@@ -1698,6 +1719,13 @@ export async function runWorkflow<T = unknown>(
       while (shared.inFlight.size > 0) {
         await Promise.allSettled(Array.from(shared.inFlight));
       }
+      // Final token-usage flush, deliberately AFTER the drain: agents that
+      // settle during the drain commit their usage last, and a pre-drain flush
+      // would silently drop them from the run's final accounting (audit2 #5).
+      // Success path only — error/abort accounting is owned by the catch
+      // paths (e.g. the provisional-usage rollback), and firing here would
+      // clobber their deliberately-empty records.
+      if (runSucceeded) options.onTokenUsage?.(shared.tokenUsage);
       store.dispose();
     }
   }

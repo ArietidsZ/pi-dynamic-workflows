@@ -4721,3 +4721,77 @@ test(
     assert.equal(statusRow?.cacheRead, 0);
   }),
 );
+
+test(
+  "phase sub-budgets persist and hold cumulatively across a checkpoint pause/resume (audit2 #4)",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent({ total: 60 }) });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'phase_resume', description: 'phase resume' }
+phase('p', { budget: 60 })
+const a = await agent('a')
+await checkpoint({ kind: 'hold', checkpointId: 'h-1', payload: {} })
+let blocked = false
+try { await agent('b') } catch (e) { blocked = (e && e.code) === 'TOKEN_BUDGET_EXHAUSTED' }
+return { a, blocked }`;
+
+    const started = manager.startInBackground(script);
+    await assert.rejects(started.promise, /checkpoint/i);
+
+    // The declared phase budget must be on the persisted record.
+    const pausedRecord = manager.getPersistence().load(started.runId);
+    assert.deepEqual(pausedRecord?.phaseBudgets?.p, { budget: 60, startSpent: 0, warned: false });
+
+    await manager.attachCheckpointResponse(started.runId, "h-1", {});
+    const completed = once(manager, "complete");
+    assert.equal(await manager.resume(started.runId, { checkpointId: "h-1" }), true);
+    await completed;
+
+    const final = manager.getPersistence().load(started.runId);
+    assert.equal(
+      final?.result && (final.result as { blocked?: boolean }).blocked,
+      true,
+      "after resume, 'b' must be blocked: the phase ceiling (60) holds against the CUMULATIVE spend (60 pre-pause) instead of re-basing",
+    );
+    assert.deepEqual(
+      final?.agents.map((a) => a.prompt),
+      ["a"],
+      "'a' replayed in place from the journal and 'b' never ran (no 'b' row)",
+    );
+  }),
+);
+
+test(
+  "a run paused with its token budget exhausted still RESUMES: journaled replays are free (audit2 #1)",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent({ total: 60 }) });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'budget_resume', description: 'budget resume' }
+const a = await agent('a')
+await checkpoint({ kind: 'hold', checkpointId: 'h-1', payload: {} })
+let blocked = false
+try { await agent('b') } catch (e) { blocked = (e && e.code) === 'TOKEN_BUDGET_EXHAUSTED' }
+return { a, blocked }`;
+
+    const started = manager.startInBackground(script, undefined, { tokenBudget: 60 });
+    await assert.rejects(started.promise, /checkpoint/i);
+
+    await manager.attachCheckpointResponse(started.runId, "h-1", {});
+    const completed = once(manager, "complete");
+    assert.equal(await manager.resume(started.runId, { checkpointId: "h-1" }), true);
+    await completed;
+
+    const final = manager.getPersistence().load(started.runId);
+    assert.equal(final?.status, "completed", "the run must resume past the exhausted budget via free replays");
+    assert.equal(
+      final?.result && (final.result as { blocked?: boolean }).blocked,
+      true,
+      "the gate still fires at the first LIVE (paid) call",
+    );
+    assert.deepEqual(
+      final?.agents.map((a) => a.prompt),
+      ["a"],
+      "'a' replayed in place (budget gate must not strand the replay)",
+    );
+  }),
+);

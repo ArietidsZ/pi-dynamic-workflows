@@ -91,6 +91,13 @@ export interface PersistedRunState {
   /** Durable workflow-controlled suspension and its at-most-once response. */
   checkpoint?: WorkflowCheckpoint;
   phases: string[];
+  /**
+   * Per-phase soft sub-budgets declared so far in this run's lifetime
+   * (phase title -> ceiling + the run-wide spent baseline at declaration).
+   * Persisted so a resumed execution ADOPTS the original baseline instead of
+   * re-basing (audit2 #4) — a phase ceiling holds cumulatively across resume.
+   */
+  phaseBudgets?: Record<string, { budget: number; startSpent: number; warned?: boolean }>;
   currentPhase?: string;
   agents: PersistedAgentState[];
   logs: string[];
