@@ -11,7 +11,7 @@
  * the store state additively in callSeq order, so parallel-agent writes are
  * replayed correctly without the last-complete-wins ordering bug that a
  * whole-Map restore() would cause. Known limitation: when two PARALLEL agents
- * write the SAME key, live resolution follows completion order while replay
+ * write the SAME key, live resolution follows last-WRITE order while replay
  * follows callSeq order, so the final value can differ between live and resume
  * (the deltas themselves are journaled and replayed faithfully; only the
  * same-key ordering is not reconstructible).
@@ -52,9 +52,9 @@ export class SharedStore {
   // with an Object.is-equal value is still a write that must survive, and a
   // discarded window's shadow must never resurface — the log makes both
   // exact. Retention is bounded per key by the number of DISTINCT live windows
-  // plus one permanent entry: trackPut overwrites its own window's top entry,
-  // and compaction (see compactHistory) drops everything below the topmost
-  // permanent write.
+  // plus one permanent entry: trackPut keeps only its window's latest entry
+  // (moved to the top, preserving last-write order), and compaction (see
+  // compactHistory) drops everything below the topmost permanent write.
   private readonly keyHistories = new Map<string, { writes: Array<{ window?: string; value: unknown }> }>();
 
   private historyFor(key: string) {
@@ -114,15 +114,19 @@ export class SharedStore {
     if (typeof deltaKey !== "string") {
       throw new TypeError(`trackPut requires a string deltaKey, got ${String(deltaKey)}`);
     }
+    // Clone both copies BEFORE any state mutation: a throwing second clone
+    // (hostile getter) must not leave a live write with an empty delta, which
+    // no discard could roll back.
     const stored = structuredClone(value);
+    const journaled = structuredClone(stored);
     const history = this.historyFor(key);
-    // In-window rewrite: overwrite this window's own top entry instead of
-    // pushing — a discard removes every entry of the window anyway, so only the
-    // latest in-window write is ever observable. This bounds the per-key log by
-    // the number of DISTINCT live windows, not by write count.
-    const top = history.writes.at(-1);
-    if (top && top.window === deltaKey) top.value = stored;
-    else history.writes.push({ window: deltaKey, value: stored });
+    // Keep only this window's LATEST entry, moved to the top: a discard removes
+    // every entry of the window anyway, so earlier same-window entries are never
+    // observable, and the entry's position must reflect last-write order. This
+    // bounds the per-key log by the number of DISTINCT live windows (plus one
+    // permanent entry), even under interleaved writes.
+    history.writes = history.writes.filter((write) => write.window !== deltaKey);
+    history.writes.push({ window: deltaKey, value: stored });
     this.map.set(key, stored);
     let delta = this.agentDeltas.get(deltaKey);
     if (!delta) {
@@ -135,7 +139,7 @@ export class SharedStore {
     // A second, separate clone for the journaled delta: commitDelta hands the
     // delta to the caller, so it must not share references with store state.
     Object.defineProperty(delta, key, {
-      value: structuredClone(value),
+      value: journaled,
       enumerable: true,
       writable: true,
       configurable: true,
@@ -233,8 +237,10 @@ export class SharedStore {
    * no window's discard may remove them.
    */
   applyDelta(delta: Record<string, unknown>): void {
-    for (const [k, v] of Object.entries(delta)) {
-      const stored = structuredClone(v);
+    // Clone everything first: a clone failure mid-loop must not leave the
+    // store half-applied.
+    const entries = Object.entries(delta).map(([k, v]) => [k, structuredClone(v)] as const);
+    for (const [k, stored] of entries) {
       const history = this.historyFor(k);
       history.writes.push({ value: stored });
       this.compactHistory(history);
@@ -247,13 +253,15 @@ export class SharedStore {
    * Prefer `applyDelta` for resume replay — see journal integration above.
    */
   restore(snap: Record<string, unknown>): void {
+    // Clone everything BEFORE clearing: a clone failure must leave the current
+    // state untouched rather than half-restored.
+    const entries = Object.entries(snap).map(([k, v]) => [k, structuredClone(v)] as const);
     this.map.clear();
     this.keyHistories.clear();
     this.agentDeltas.clear();
     // Seed each entry as an untagged (permanent) write — cloned, like every
     // other write path, so the caller's snapshot object cannot alias in.
-    for (const [k, v] of Object.entries(snap)) {
-      const stored = structuredClone(v);
+    for (const [k, stored] of entries) {
       this.historyFor(k).writes.push({ value: stored });
       this.map.set(k, stored);
     }

@@ -819,7 +819,9 @@ test("SharedStore matches an event-log undo model under randomized interleavings
   const WINDOWS = ["run-1:0", "run-1:1", "run-1:2"];
   // Small value pool so writes frequently repeat an Object.is-equal value
   // across windows — the exact sibling-overwrite shape issue #208 describes.
-  const POOL: unknown[] = ["shared-a", "shared-b", { pooled: true }];
+  // Frozen: the model holds pool references, so a store that aliased or
+  // mutated them would be caught (mutation would throw in strict mode).
+  const POOL: unknown[] = ["shared-a", "shared-b", Object.freeze({ pooled: true })];
 
   for (let trial = 0; trial < 400; trial++) {
     const store = new SharedStore();
@@ -832,7 +834,9 @@ test("SharedStore matches an event-log undo model under randomized interleavings
     const discarded = new Set<string>();
     const push = (key: string, entry: { window?: string; value: unknown }) => {
       const list = refWrites.get(key) ?? [];
-      list.push(entry);
+      // Clone into the model so a store that aliases caller/store references
+      // diverges observably instead of sharing fate with the model.
+      list.push({ ...entry, value: structuredClone(entry.value) });
       refWrites.set(key, list);
     };
     const refVisible = (key: string) => refWrites.get(key)?.at(-1)?.value;
@@ -945,4 +949,42 @@ test("SharedStore stays correct under long same-key commit chains (log compactio
   // A stale window's discard is still a no-op against compacted history.
   store.discardDelta("run-1:0");
   assert.equal(store.get("hot"), "v1999");
+});
+
+test("SharedStore bounds interleaved hot-key logs by distinct live windows", () => {
+  const store = new SharedStore();
+  store.put("k", "seed");
+  for (let i = 0; i < 1000; i++) {
+    store.trackPut("k", `v${i}`, i % 2 ? "win-a" : "win-b");
+  }
+  const internals = store as unknown as { keyHistories: Map<string, { writes: unknown[] }> };
+  assert.equal(
+    internals.keyHistories.get("k")?.writes.length,
+    3,
+    "one permanent seed + one latest entry per live window, even under interleaving",
+  );
+  // Order still reflects last-write semantics: the final write (i=999, win-a)
+  // is visible.
+  assert.equal(store.get("k"), "v999");
+  store.discardDelta("win-a");
+  assert.equal(store.get("k"), "v998", "discarding one window resurfaces the other's latest write");
+  store.commitDelta("win-b");
+  assert.equal(
+    internals.keyHistories.get("k")?.writes.length,
+    1,
+    "commit detaches and compacts below the permanent floor",
+  );
+  store.discardDelta("win-a");
+  assert.equal(store.get("k"), "v998", "committed writes survive any later discard");
+});
+
+test("SharedStore trackPut clones before mutating (uncloneable value safety)", () => {
+  const store = new SharedStore();
+  store.put("k", "pre");
+  // Functions are not structured-cloneable: the write must fail BEFORE any
+  // state mutation, leaving neither a live value nor a half-recorded delta.
+  const uncloneable = { fn: () => 1 };
+  assert.throws(() => store.trackPut("k", uncloneable, "run-1:0"));
+  assert.equal(store.get("k"), "pre", "a failed clone leaves store state untouched");
+  assert.deepEqual(store.commitDelta("run-1:0"), {}, "no half-recorded delta entry");
 });
