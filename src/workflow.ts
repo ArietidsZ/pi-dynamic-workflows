@@ -214,6 +214,19 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   maxAgents?: number;
   /** Timeout per agent in milliseconds. null/omitted means no hard timeout. */
   agentTimeoutMs?: number | null;
+  /**
+   * Grace period (ms) for the terminal drain ONCE this run's abort has fired
+   * (external abort or run-fatal seal). Agents are signaled at abort, but the
+   * signal is cooperative — a signal-ignoring runner would otherwise wedge the
+   * drain, and with it the run's terminal transition, forever (audit2 #3).
+   * After the grace expires the drain stops waiting: late results are dropped
+   * (the store is disposed and the manager's isCurrent() gating rejects stale
+   * writes). Does NOT apply to non-abort drains (success, durable checkpoint
+   * suspension) — those wait for in-flight agents without a bound, since their
+   * results are still wanted. Default 10_000; Infinity restores unbounded
+   * waiting.
+   */
+  drainAbortGraceMs?: number;
   /** Whether to persist logs to disk. Default: true */
   persistLogs?: boolean;
   /** Run ID for persistence. Auto-generated if not provided. */
@@ -1683,20 +1696,52 @@ export async function runWorkflow<T = unknown>(
       // (not a single Promise.allSettled) because draining can itself let a
       // still-running call schedule further work that adds to the set.
       //
-      // Caveat: this can block indefinitely. A run-fatal abort (see the catch
+      // Caveat: without an abort this can still block indefinitely (success /
+      // checkpoint-suspension drains deliberately wait — those results are
+      // wanted). Once the run's abort has fired the wait is bounded by
+      // drainAbortGraceMs (default 10s): a run-fatal abort (see the catch
       // above) aborts the AbortSignal passed to each in-flight agent, but that
       // is cooperative — an agent runner that ignores its signal (or one still
       // waiting out a real subagent process that won't die) never settles on
       // its own. Combined with agentTimeoutMs: null (no hard timeout, the
-      // default), a single hung, signal-ignoring, un-awaited agent() call can
-      // wedge this drain — and therefore the whole run's completion — forever.
-      // Configure a finite agentTimeoutMs (run- or per-agent-level) for any
-      // workflow where this is a real risk; there is no drain-side timeout.
+      // default), a single hung, signal-ignoring, un-awaited agent() call would
+      // otherwise wedge this drain — and therefore the whole run's completion —
+      // forever (audit2 #3).
       if (shared.inFlight.size > 0) {
         log(`waiting for ${shared.inFlight.size} outstanding agent() call(s) to settle before this run completes`);
       }
+      const drainAbortGraceMs = options.drainAbortGraceMs ?? 10_000;
+      // Wakes the drain loop the moment the run aborts (either source), so a
+      // drain that started un-aborted re-enters promptly and the grace clock
+      // starts instead of blocking on allSettled forever.
+      const abortWake = new Promise<void>((resolve) => {
+        options.signal?.addEventListener("abort", () => resolve(), { once: true });
+        shared.runFatalController.signal.addEventListener("abort", () => resolve(), { once: true });
+      });
       while (shared.inFlight.size > 0) {
-        await Promise.allSettled(Array.from(shared.inFlight));
+        const pending = Array.from(shared.inFlight);
+        if (!isAborted() || !Number.isFinite(drainAbortGraceMs)) {
+          await Promise.race([Promise.allSettled(pending), abortWake]);
+          continue;
+        }
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const grace = new Promise<"timeout">((resolve) => {
+          timer = setTimeout(() => resolve("timeout"), drainAbortGraceMs);
+          (timer as unknown as { unref?: () => void }).unref?.();
+        });
+        const winner = await Promise.race([Promise.allSettled(pending).then(() => "settled" as const), grace]);
+        if (timer) clearTimeout(timer);
+        if (winner === "timeout") {
+          // Swallow late rejections from the abandoned calls (nothing awaits
+          // them after the break), then leave them behind: the store disposes
+          // below and late journals are dropped by the manager's staleness
+          // gating (isCurrent/lease), so abandoning cannot corrupt the record.
+          for (const call of pending) void Promise.resolve(call).catch(() => {});
+          log(
+            `abandoning ${shared.inFlight.size} outstanding agent() call(s) that did not settle within ${drainAbortGraceMs}ms of the abort`,
+          );
+          break;
+        }
       }
       store.dispose();
     }

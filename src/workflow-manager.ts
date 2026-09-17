@@ -231,6 +231,12 @@ export interface ExecOptions {
   agentTimeoutMs?: number | null;
   /** Host signal (e.g. tool/Esc) that should abort this run when fired. */
   externalSignal?: AbortSignal;
+  /**
+   * Grace (ms) for the terminal drain once this run's abort has fired
+   * (default 10_000; Infinity = unbounded). Not frozen/persisted — a host
+   * reliability knob, not run semantics. See WorkflowRunOptions.drainAbortGraceMs.
+   */
+  drainAbortGraceMs?: number;
   /** Called with the live snapshot on every progress event. */
   onProgress?: (snapshot: WorkflowSnapshot) => void;
   /** Hard token budget for this run; once spent reaches it, agent() throws. */
@@ -812,6 +818,7 @@ export class WorkflowManager extends EventEmitter {
       confirm,
       tools,
       initialTokenUsage,
+      drainAbortGraceMs,
     } = exec;
     // maxAgents/agentTimeoutMs/concurrency/agentRetries were resolved (per-run
     // value, else the manager default at the time) and frozen on the managed
@@ -888,6 +895,7 @@ export class WorkflowManager extends EventEmitter {
         agentRetries: resolvedAgentRetries,
         maxAgents: resolvedMaxAgents,
         agentTimeoutMs: resolvedAgentTimeoutMs,
+        drainAbortGraceMs,
         tokenBudget: resolvedTokenBudget,
         tools: resolvedTools,
         excludeTools: this.excludeSubagentTools,

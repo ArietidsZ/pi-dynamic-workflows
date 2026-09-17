@@ -2366,3 +2366,55 @@ return main`;
   assert.equal(calls.stray, 1, "the un-awaited agent's cached result must replay, not re-run, on resume");
   assert.equal(calls.main, 1, "the awaited agent's cached result must replay, not re-run, on resume");
 });
+
+test("an aborted run's drain abandons signal-ignoring agents after drainAbortGraceMs (audit2 #3)", async () => {
+  // Un-awaited agent whose runner NEVER settles and ignores its abort signal:
+  // without the grace the drain (and the run) would wedge forever.
+  const script = `export const meta = { name: 'hung_drain', description: 'hung drain' }
+void agent('wedged', { label: 'wedged' })
+return 'script-done'`;
+  const controller = new AbortController();
+  const started = Date.now();
+  const pending = runWorkflow<string>(script, {
+    agent: {
+      async run() {
+        return new Promise<string>(() => {}); // never settles, ignores signal
+      },
+    },
+    signal: controller.signal,
+    drainAbortGraceMs: 50,
+    persistLogs: false,
+  });
+  // Let the agent start, then abort.
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  controller.abort();
+  await pending.catch(() => {});
+  assert.ok(
+    Date.now() - started < 5_000,
+    "the run settles promptly after the grace instead of wedging on the hung agent",
+  );
+});
+
+test("a NON-abort drain still waits without a bound for a slow un-awaited agent (audit2 #3)", async () => {
+  // Success-path drains must not be grace-limited: the slow sibling's result
+  // is still wanted (the checkpoint-suspension drain relies on this).
+  const script = `export const meta = { name: 'slow_drain', description: 'slow drain' }
+const pending = agent('slow', { label: 'slow' })
+return 'script-done'`;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const started = Date.now();
+  const result = await runWorkflow<string>(script, {
+    agent: {
+      async run() {
+        setTimeout(release, 150);
+        await gate;
+        return "slow-done";
+      },
+    },
+    drainAbortGraceMs: 10, // even with a tiny grace, the success drain waits
+    persistLogs: false,
+  });
+  assert.equal(result.result, "script-done");
+  assert.ok(Date.now() - started >= 140, "the success drain waited out the slow sibling");
+});
