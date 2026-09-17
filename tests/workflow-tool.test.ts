@@ -683,12 +683,10 @@ return 'never reaches agents'`;
 test(
   "workflow tool: the abort path renders the latest coalesced progress frame (audit2 r1 m2)",
   withToolTempCwd(async (cwd) => {
-    let calls = 0;
     const manager = new WorkflowManager({
       cwd,
       agent: {
         async run() {
-          calls++;
           throw new WorkflowError("boom", WorkflowErrorCode.AGENT_FAILED, { recoverable: false });
         },
       },
