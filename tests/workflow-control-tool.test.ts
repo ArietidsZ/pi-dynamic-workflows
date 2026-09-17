@@ -130,6 +130,7 @@ test("list and status return stable lifecycle and observability fields", async (
         counts: { total: 4, done: 0, running: 1, queued: 1, error: 1, skipped: 1 },
         activeLabels: ["active scan"],
         tokenTotal: 30,
+        tokenTotalEstimated: false,
       },
     ],
   });
@@ -326,4 +327,15 @@ test("unknown IDs and illegal transitions return explicit errors with allowed ac
   const stopAborted = text(await execute(fixture.manager, { action: "stop", runId: "live-123" }));
   assert.match(stopAborted, /cannot stop run with status aborted/);
   assert.match(stopAborted, /allowed=status/);
+});
+
+test("status marks heuristic-estimated token totals with ~ and a details flag (#209)", async () => {
+  const estimatedRun: PersistedRunState = {
+    ...run("completed"),
+    tokenUsage: { input: 0, output: 0, total: 200, estimated: true },
+  };
+  const { manager } = fakeManager([estimatedRun]);
+  const status = await execute(manager, { action: "status", runId: "audit-abc123" });
+  assert.match(text(status), /tokens=~200$/, "a char-heuristic total never renders as metered");
+  assert.equal((status.details.run as { tokenTotalEstimated: boolean }).tokenTotalEstimated, true);
 });
