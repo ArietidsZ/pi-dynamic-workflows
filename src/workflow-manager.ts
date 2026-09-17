@@ -213,10 +213,11 @@ export interface ManagedRun {
    */
   agentRetries?: number;
   /**
-   * Per-phase sub-budgets declared so far in this run's lifetime — persisted
-   * so resume() can adopt the original baselines instead of re-basing
-   * (audit2 #4). Written by the onPhaseBudgets callback; read into
-   * initialPhaseBudgets at resume.
+   * Per-phase sub-budgets declared so far in this run's lifetime, keyed by
+   * `${frameRunId}:${phaseTitle}` — persisted so resume() can adopt the
+   * original baselines instead of re-basing (audit2 #4). Written by the
+   * onPhaseBudgets callback (merged — nested frames share the table); read
+   * into initialPhaseBudgets at resume.
    */
   phaseBudgets?: Record<string, { budget: number; startSpent: number; warned?: boolean }>;
 }

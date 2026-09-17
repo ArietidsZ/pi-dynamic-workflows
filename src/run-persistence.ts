@@ -92,8 +92,9 @@ export interface PersistedRunState {
   checkpoint?: WorkflowCheckpoint;
   phases: string[];
   /**
-   * Per-phase soft sub-budgets declared so far in this run's lifetime
-   * (phase title -> ceiling + the run-wide spent baseline at declaration).
+   * Per-phase soft sub-budgets declared so far in this run's lifetime, keyed by
+   * `${frameRunId}:${phaseTitle}` (nested workflow() frames have stable runIds
+   * across resume) -> ceiling + the run-wide spent baseline at declaration.
    * Persisted so a resumed execution ADOPTS the original baseline instead of
    * re-basing (audit2 #4) — a phase ceiling holds cumulatively across resume.
    */

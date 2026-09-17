@@ -2508,7 +2508,7 @@ return { a, nested, blocked }`;
   const merged = Object.assign({}, ...events);
   assert.equal(merged["parent-run:shared-title"]?.budget, 60, "parent entry under the parent frame key");
   assert.equal(merged["parent-run-nested1:shared-title"]?.budget, 1000, "child entry under the child frame key");
-  assert.equal(result.result.blocked, false, "parent tail call proceeds under its own ceiling");
+  assert.equal(result.result.blocked, false, "parent tail call proceeds under its own ceiling (10 < 60)");
 });
 
 test("the phase runtime event advertises the EFFECTIVE (first-declared) budget", async () => {
