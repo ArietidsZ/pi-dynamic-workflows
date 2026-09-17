@@ -258,7 +258,11 @@ export type _PersistedAgentStatusExhaustiveCheck = AssertNever<
 >;
 
 /** Every status a persisted agent row may validly carry — exhaustively
- * checked against PersistedAgentState["status"] by the assertion above. */
+ * checked against PersistedAgentState["status"] by the assertion above.
+ * Forward-compat note: resume seeding DROPS rows with out-of-union statuses
+ * (e.g. written by a newer release) — deliberate garbage-vs-unknown tradeoff:
+ * an unknown status cannot be ghost-settled or displayed safely, so the row
+ * is treated as corrupt rather than re-persisted as a lie. */
 export const VALID_PERSISTED_AGENT_STATUSES: ReadonlySet<PersistedAgentState["status"]> = new Set(
   PERSISTED_AGENT_STATUSES,
 );

@@ -1715,6 +1715,14 @@ export class WorkflowManager extends EventEmitter {
     if (!persisted?.script || persisted.status === "completed" || persisted.status === "aborted") return false;
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) return false;
+    // The pre-lease read is stale the moment it returns: another process could
+    // have stopped/deleted the run in the window. Re-load under the lease and
+    // bail if the terminal status changed (attachCheckpointResponse pattern).
+    const fresh = this.persistence.load(runId);
+    if (!fresh || fresh.status !== persisted.status) {
+      this.persistence.releaseRunLease(lease);
+      return false;
+    }
     const script = opts?.script ?? persisted.script;
     const args = opts?.args !== undefined ? opts.args : persisted.args;
     const persistedAgents = Array.isArray(persisted.agents) ? persisted.agents : [];
@@ -1775,8 +1783,9 @@ export class WorkflowManager extends EventEmitter {
     const seededAgents: WorkflowAgentSnapshot[] = [];
     // callId -> timestamp index, built alongside the rows (M3): ghosts carry
     // their SETTLE time here too, so a replayed journaled call on a ghost row
-    // is recognized as a replay (tokens/endedAt preserved) instead of looking
-    // live and getting its endedAt/tokens erased.
+    // keeps those timestamps (recognition itself is the unconditional
+    // replayedAgentCalls.add in onAgentStart; this map picks WHICH timestamps
+    // survive the replay).
     const seededTimestampsByCallId = new Map<string, { startedAt: string; endedAt?: string }>();
     for (const agent of persistedAgents) {
       // Corrupt/legacy-entry guard (M1): only well-shaped rows seed — a plain
