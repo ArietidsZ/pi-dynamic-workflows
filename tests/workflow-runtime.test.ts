@@ -2368,24 +2368,50 @@ return main`;
 });
 
 test("nested workflow() frames use the run's registry snapshot (audit2 #6)", async () => {
-  // A sentinel agentType that exists ONLY in the in-memory registry: if the
-  // nested frame re-loaded the registry from disk it would not resolve.
-  const registry: AgentRegistry = new Map([
-    ["sentinel-type", { name: "sentinel-type", description: "in-memory only" }],
-  ]);
+  // REAL scenario: no injected registry — the registry is loaded from
+  // <cwd>/.pi/agents at run start. The fake runner DELETES the .md mid-run
+  // (during the parent's first call); the nested frame must still resolve the
+  // sentinel definition from the forwarded snapshot, not re-load from disk.
+  const { mkdirSync, mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const cwd = mkdtempSync(join(tmpdir(), "pdw-registry-"));
+  const agentsDir = join(cwd, ".pi", "agents");
+  mkdirSync(agentsDir, { recursive: true });
+  const defPath = join(agentsDir, "sentinel.md");
+  writeFileSync(defPath, "---\nname: sentinel\ndescription: temp\n---\nSENTINEL-INSTRUCTIONS\n");
   const child = `export const meta = { name: 'child', description: 'c' }
-const r = await agent('child task', { agentType: 'sentinel-type' })
+const r = await agent('child task', { agentType: 'sentinel' })
 return { child: r }`;
   const parent = `export const meta = { name: 'parent', description: 'p' }
+await agent('parent task')
 const nested = await workflow('child')
 return { nested }`;
-  const result = await runWorkflow<{ nested: { child: string } }>(parent, {
-    agent: fakeAgent({}),
-    agentRegistry: registry,
-    loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
-    persistLogs: false,
-  });
-  assert.equal(result.result.nested.child, "ok", "the nested frame resolved the in-memory registry's type");
+  const seenInstructions: (string | undefined)[] = [];
+  let calls = 0;
+  try {
+    const result = await runWorkflow<{ nested: { child: string } }>(parent, {
+      cwd,
+      agent: {
+        async run(_prompt: string, options: { instructions?: string }) {
+          calls++;
+          seenInstructions.push(options.instructions);
+          if (calls === 1) rmSync(defPath); // mid-run registry edit
+          return "ok";
+        },
+      },
+      loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
+      persistLogs: false,
+    });
+    assert.equal(result.result.nested.child, "ok");
+    const childInstructions = seenInstructions[1];
+    assert.ok(
+      childInstructions?.includes("SENTINEL-INSTRUCTIONS"),
+      `nested frame resolved the run-start registry snapshot, got: ${childInstructions?.slice(0, 120)}`,
+    );
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 test("agent() retries back off between attempts (audit2 #7)", async () => {
@@ -2415,6 +2441,31 @@ return r`;
   assert.equal(result.result, "recovered");
   assert.deepEqual(backoffs, [1, 2], "backoff consulted per failed attempt");
   assert.ok(Date.now() - started >= 75, "the waits actually elapsed (2 × 40ms)");
+});
+
+test("agent() uses the default 250ms backoff for the first retry when no callback is injected", async () => {
+  const script = `export const meta = { name: 'retry_default', description: 'default backoff' }
+return await agent('flaky')`;
+  let attempts = 0;
+  const started = Date.now();
+  const result = await runWorkflow<string>(script, {
+    agent: {
+      async run() {
+        attempts++;
+        if (attempts === 1) {
+          throw new WorkflowError("empty", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, { recoverable: true });
+        }
+        return "recovered";
+      },
+    },
+    agentRetries: 1,
+    persistLogs: false,
+  });
+  assert.equal(result.result, "recovered");
+  assert.ok(
+    Date.now() - started >= 240,
+    `default first-retry backoff (~250ms) elapsed (took ${Date.now() - started}ms)`,
+  );
 });
 
 test("agent() rejects timeoutMs <= 0 instead of spawn-aborting sessions (audit2 #8)", async () => {
@@ -2454,5 +2505,6 @@ return await agent('x')`;
     },
     persistLogs: false,
   });
+  assert.equal(result.result, poisoned, "the agent call itself succeeded — an eager stringify would have failed it");
   assert.equal(result.tokenUsage?.total, 10, "real usage committed without ever stringifying the result");
 });

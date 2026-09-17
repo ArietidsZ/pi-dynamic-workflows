@@ -244,8 +244,11 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   /**
    * Backoff (ms) before retry attempt N (1-based — the attempt that just
    * failed). Default: min(250 * 2^(N-1), 2000) — immediate retries let a whole
-   * parallel() batch hammer the provider synchronously (audit2 #7). The retry
-   * keeps its concurrency slot during the backoff. Return 0 to disable.
+   * parallel() batch hammer the provider synchronously. The retry keeps its
+   * concurrency slot during the backoff. Return 0 to disable; non-positive or
+   * NaN returns fall back to the default, a throwing callback is ignored
+   * (default used), and large values are clamped to 2^31-1. Abort latency
+   * during the wait is bounded by the returned value.
    */
   agentRetryBackoffMs?: (failedAttempt: number) => number;
   /** Internal: shared runtime inherited by a nested workflow() call. */
@@ -411,7 +414,12 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    * and falls back to default tools/model (with the name as a prose hint).
    */
   agentType?: string;
-  /** Override timeout for this specific agent. null means no hard timeout. */
+  /**
+   * Override timeout for this specific agent. null means no hard timeout.
+   * Must be a finite number in [1, 2^31-1] — anything else (0, negatives,
+   * NaN, Infinity) throws SCRIPT_VALIDATION_ERROR instead of
+   * spawn-then-instantly-aborting a real session.
+   */
   timeoutMs?: number | null;
   /** Retry attempts after a recoverable failure for this specific agent. */
   retries?: number;
@@ -1103,7 +1111,17 @@ export async function runWorkflow<T = unknown>(
               // immediate retry storms the provider when a parallel() batch
               // fails together. The abort check after the wait keeps pause/stop
               // responsive (bounded by the 2s cap).
-              const backoffMs = options.agentRetryBackoffMs?.(attempt) ?? Math.min(250 * 2 ** (attempt - 1), 2_000);
+              const defaultBackoffMs = Math.min(250 * 2 ** (attempt - 1), 2_000);
+              let backoffMs = defaultBackoffMs;
+              if (options.agentRetryBackoffMs) {
+                try {
+                  const injected = options.agentRetryBackoffMs(attempt);
+                  backoffMs =
+                    typeof injected === "number" && injected > 0 ? Math.min(injected, 2_147_483_647) : defaultBackoffMs;
+                } catch {
+                  backoffMs = defaultBackoffMs; // a throwing callback must not abandon the retry
+                }
+              }
               if (backoffMs > 0) await new Promise((resolve) => setTimeout(resolve, backoffMs));
               throwIfAborted();
               continue;
