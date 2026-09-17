@@ -105,7 +105,8 @@ function writeJsonAtomic(fs: PersistenceFsLayer, path: string, data: unknown, st
  * The previous content is only used when it READS and PARSES: a corrupt
  * primary must not poison the backup (a later corruption would then lose
  * everything), and an unreadable primary must not fail the save (tmp+rename
- * needs no read permission) — in both cases the existing `.bak` is preserved.
+ * needs no read permission) — in both cases the existing `.bak` is preserved
+ * if it still parses, else replaced with the new content.
  */
 export function writeJsonAtomicPreservingPreviousBackup(fs: PersistenceFsLayer, path: string, data: unknown): void {
   let previous: string | undefined;

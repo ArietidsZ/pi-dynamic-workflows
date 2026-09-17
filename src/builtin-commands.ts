@@ -400,8 +400,8 @@ export function registerBuiltinWorkflows(
       // tokenizer (r2 MINOR): /multi-perspective "auth flows" security →
       // topic "auth flows", perspectives ["security"].
       const tokens = tokenizeArgs(raw);
-      // A leading key=value token means a pure named-arg invocation (no
-      // positional to map) — mirrors how any saved workflow parses it.
+      // A leading key=value token means a named-arg-style invocation —
+      // mirror how any saved workflow parses it (no positional mapping).
       if (tokens.length && !tokens[0].includes("=")) {
         parsed[tokenized.primary] = tokens[0];
         if (tokens.length > 1 && parsed[tokenized.rest] === undefined) parsed[tokenized.rest] = tokens.slice(1);
