@@ -988,3 +988,32 @@ test("SharedStore trackPut clones before mutating (uncloneable value safety)", (
   assert.equal(store.get("k"), "pre", "a failed clone leaves store state untouched");
   assert.deepEqual(store.commitDelta("run-1:0"), {}, "no half-recorded delta entry");
 });
+
+test("sibling COMMITS, then the failed window discards: the committed write survives (#208 r1 m1)", () => {
+  // The deterministic shape the fuzz only covers probabilistically: window A
+  // and sibling B write the SAME key; B's write COMMITS (journaled); then A's
+  // attempt fails and discards. A's rollback must not touch B's committed
+  // value — including when A's in-window value equals B's (writeStamp guard).
+  for (const equalValues of [false, true]) {
+    const store = new SharedStore();
+    store.put("k", "pre");
+    store.trackPut("k", "from-A", "run-1:0");
+    store.trackPut("k", equalValues ? "from-A" : "from-B", "run-1:1");
+    assert.deepEqual(store.commitDelta("run-1:1"), { k: equalValues ? "from-A" : "from-B" });
+    store.discardDelta("run-1:0"); // A's attempt failed after B committed
+    assert.equal(
+      store.get("k"),
+      equalValues ? "from-A" : "from-B",
+      `equal=${equalValues}: the failed window's discard must preserve the sibling's committed write`,
+    );
+  }
+});
+
+test("an untracked put with an Object.is-equal value still supersedes a discarded window's write (#208 r1 n4)", () => {
+  const store = new SharedStore();
+  store.put("k", "pre");
+  store.trackPut("k", "same", "run-1:0");
+  store.put("k", "same"); // script-level write, untracked, equal to the window's value
+  store.discardDelta("run-1:0"); // the window's attempt failed
+  assert.equal(store.get("k"), "same", "the script's write survives the failed window's rollback");
+});
