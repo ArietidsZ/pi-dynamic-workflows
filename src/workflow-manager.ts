@@ -1757,7 +1757,7 @@ export class WorkflowManager extends EventEmitter {
       autoResume: persisted.autoResume,
       // Same for the usage-limit backoff counter — it must survive manager
       // persists and process restarts or the give-up cap resets (#207).
-      autoResumeAttempts: persisted.autoResumeAttempts,
+      autoResumeAttempts: sanitizeAutoResumeAttempts(persisted.autoResumeAttempts),
       // Restore start-time execution context: the budget the run started with
       // (legacy runs without one resume unbudgeted — never re-apply the current
       // default to a run that predates it) and the toolset tag executeRun
