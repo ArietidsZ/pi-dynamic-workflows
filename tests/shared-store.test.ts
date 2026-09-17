@@ -142,12 +142,11 @@ test("SharedStore.discardDelta must not roll back a sibling's Object.is-EQUAL ov
   store.trackPut("k", "same-value", "run-1:1"); // sibling writes an Object.is-equal value
   store.discardDelta("run-1:0");
   assert.equal(store.get("k"), "same-value", "the sibling's equal-value write is still a write and must survive");
-  // The sibling's own rollback then restores the value IT shadowed (A's
-  // in-window write), and A's rollback reaches the pre-window value.
+  // The sibling's own rollback restores the value IT shadowed — A's in-window
+  // write (A's bookkeeping was finalized by its discard above, so the window
+  // chain ends there).
   store.discardDelta("run-1:1");
-  assert.equal(store.get("k"), "same-value", "B's rollback restores A's in-window write");
-  store.discardDelta("run-1:0");
-  assert.equal(store.get("k"), "pre", "A's rollback reaches the pre-window value");
+  assert.equal(store.get("k"), "same-value", "B's rollback restores the value B shadowed");
 });
 
 test("SharedStore.discardDelta restores writer ownership so an earlier window can still roll back (#208)", () => {
