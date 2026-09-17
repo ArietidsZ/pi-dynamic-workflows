@@ -1516,14 +1516,14 @@ export class WorkflowManager extends EventEmitter {
         agentRetries: managed.agentRetries,
         pauseReason:
           managed.status === "paused"
-            ? managed.checkpoint?.status === "waiting" || managed.checkpoint?.status === "resuming"
-              ? // A LIVE checkpoint (waiting, or resuming after a live attach
-                // mid-drain) is what the pause is for. A CONSUMED checkpoint is
-                // history, not a pause cause — it must not mask a later
-                // usage-limit pause (coldStartRearm filters on this value).
-                "workflow_checkpoint"
-              : managed.usageLimitPause
-                ? "usage_limit"
+            ? managed.usageLimitPause
+              ? // usageLimitPause is only ever set when the escaping error is
+                // genuinely PROVIDER_USAGE_LIMIT, so it is unambiguous and wins:
+                // a checkpoint in ANY status (waiting/resuming/consumed) must
+                // never mask it — coldStartRearm filters on this value.
+                "usage_limit"
+              : managed.checkpoint
+                ? "workflow_checkpoint"
                 : undefined
             : undefined,
         resetHint:

@@ -4857,3 +4857,58 @@ return { a, b }`;
     assert.equal(persisted?.checkpoint?.status, "consumed");
   }),
 );
+
+test(
+  "a usage-limit pause while a checkpoint is still RESUMING persists pauseReason usage_limit (r4 MAJOR)",
+  withTempCwd(async (cwd) => {
+    let limitActive = false;
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          if (limitActive) {
+            throw new WorkflowError(
+              "Codex usage limit reached. Resets in ~3h.",
+              WorkflowErrorCode.PROVIDER_USAGE_LIMIT,
+              {
+                recoverable: false,
+                resetHint: "Resets in ~3h",
+              },
+            );
+          }
+          return "ok";
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'cp_resuming_quota', description: 'resuming checkpoint then quota' }
+const a = await agent('first')
+await checkpoint({ kind: 'hold', checkpointId: 'g-1', payload: {} })
+return { a }`;
+
+    const started = manager.startInBackground(script);
+    await assert.rejects(started.promise, /checkpoint/i);
+    await manager.attachCheckpointResponse(started.runId, "g-1", {});
+
+    // Resume with an EDITED script whose first call hash-misses: the resumed
+    // execution runs live BEFORE reaching checkpoint(), so the checkpoint is
+    // still "resuming" when the provider limit hits.
+    limitActive = true;
+    const edited = `export const meta = { name: 'cp_resuming_quota', description: 'resuming checkpoint then quota' }
+const a = await agent('first-edited')
+await checkpoint({ kind: 'hold', checkpointId: 'g-1', payload: {} })
+return { a }`;
+    const paused = once(manager, "paused");
+    assert.equal(await manager.resume(started.runId, { checkpointId: "g-1", script: edited }), true);
+    await paused;
+
+    const persisted = manager.listRuns().find((r) => r.runId === started.runId);
+    assert.equal(persisted?.status, "paused");
+    assert.equal(persisted?.checkpoint?.status, "resuming", "the checkpoint was never consumed by the resumed run");
+    assert.equal(
+      persisted?.pauseReason,
+      "usage_limit",
+      "usageLimitPause is unambiguous and must win over a still-resuming checkpoint",
+    );
+  }),
+);
