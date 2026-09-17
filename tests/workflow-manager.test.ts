@@ -699,6 +699,26 @@ test(
 );
 
 test(
+  "fabricated fallback usage persists with the estimate flag, exact usage without it (#209)",
+  withTempCwd(async (cwd) => {
+    // fakeAgent() reports all-zero usage, so the commit falls back to the
+    // character-heuristic total — that figure is an estimate and must be
+    // flagged everywhere it persists.
+    const estimated = new WorkflowManager({ cwd, agent: fakeAgent() });
+    const estimatedResult = await estimated.runSync(oneAgentScript);
+    const estimatedRun = estimated.getPersistence().load(estimatedResult.runId);
+    assert.ok((estimatedRun?.tokenUsage?.total ?? 0) > 0, "fallback fabricated a positive total");
+    assert.equal(estimatedRun?.tokenUsage?.estimated, true, "fabricated total persisted as an estimate");
+
+    const exact = new WorkflowManager({ cwd, agent: fakeAgent({ input: 40, output: 2, total: 42, cost: 0.01 }) });
+    const exactResult = await exact.runSync(oneAgentScript);
+    const exactRun = exact.getPersistence().load(exactResult.runId);
+    assert.equal(exactRun?.tokenUsage?.total, 42);
+    assert.equal(exactRun?.tokenUsage?.estimated, undefined, "metered usage carries no estimate flag");
+  }),
+);
+
+test(
   "resume re-resolves the run's toolset tag and keeps its start-time tokenBudget",
   withTempCwd(async (cwd) => {
     // Agent where 'first' completes (journaling it) and 'second' hangs on its

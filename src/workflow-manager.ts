@@ -1326,6 +1326,7 @@ export class WorkflowManager extends EventEmitter {
           cost: prior.cost ?? 0,
           cacheRead: prior.cacheRead ?? 0,
           cacheWrite: prior.cacheWrite ?? 0,
+          estimated: prior.estimated,
         }
       : createEmptyAgentUsage();
     managed.snapshot.tokenUsage = sumAgentUsage(priorUsage, usage);
@@ -1552,6 +1553,7 @@ export class WorkflowManager extends EventEmitter {
               cost: managed.snapshot.tokenUsage.cost,
               cacheRead: managed.snapshot.tokenUsage.cacheRead,
               cacheWrite: managed.snapshot.tokenUsage.cacheWrite,
+              estimated: managed.snapshot.tokenUsage.estimated,
             }
           : undefined,
         startedAt: managed.startedAt.toISOString(),
@@ -1680,6 +1682,9 @@ export class WorkflowManager extends EventEmitter {
           cost: persisted.tokenUsage.cost ?? 0,
           cacheRead: persisted.tokenUsage.cacheRead ?? 0,
           cacheWrite: persisted.tokenUsage.cacheWrite ?? 0,
+          // The estimate flag is part of the value — an estimated prior total
+          // must stay flagged through resume (#209).
+          estimated: persisted.tokenUsage.estimated,
         }
       : undefined;
 
