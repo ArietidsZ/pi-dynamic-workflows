@@ -199,11 +199,17 @@ export function computeAutoResumeDelayMs(params: AutoResumeDelayParams): number 
   const backoff = remaining * 2 ** exponent;
   // Jitter BEFORE the clamp so the documented minDelayMs floor and maxDelayMs
   // ceiling both still hold on the armed delay.
-  const jittered =
-    params.jitterRatio && params.jitterRatio > 0
-      ? backoff * (1 - params.jitterRatio + (params.random ?? Math.random)() * 2 * params.jitterRatio)
-      : backoff;
-  return Math.min(params.maxDelayMs, Math.max(params.minDelayMs, jittered));
+  const jr = params.jitterRatio ?? 0;
+  const rand = params.random ?? Math.random;
+  const jittered = jr > 0 ? backoff * (1 - jr + rand() * 2 * jr) : backoff;
+  const clamped = Math.min(params.maxDelayMs, Math.max(params.minDelayMs, jittered));
+  // A clamped-to-ceiling delay is identical for every run paused by the same
+  // quota event (the herd audit2 #13 targets): spread it downward-only, which
+  // keeps the ceiling intact while decorrelating the arms.
+  if (jr > 0 && clamped === params.maxDelayMs && backoff > params.maxDelayMs) {
+    return Math.max(params.minDelayMs, Math.round(params.maxDelayMs * (1 - jr * rand())));
+  }
+  return Math.round(clamped);
 }
 
 /**
