@@ -433,6 +433,10 @@ test(
     assert.ok(aStartedAt, "A's launch timestamp persisted before pause");
 
     assert.equal(await manager.resume(runId), true);
+    // The regression window itself: immediately after resume (before replay
+    // progresses), the persisted record still carries the pre-pause fleet.
+    const justResumed = manager.getPersistence().load(runId);
+    assert.equal(justResumed?.agents.length, 2, "resume must not transiently wipe the fleet from the record");
     while (manager.getRun(runId)?.status === "running") {
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
@@ -505,7 +509,11 @@ test(
     const ghost = persisted?.agents.find((a) => a.status === "skipped");
     assert.equal(ghost?.error, "interrupted");
     assert.equal(ghost?.recoverable, false);
-    assert.equal(ghost?.endedAt, savedUpdatedAt, "the ghost ends at the record's last write");
+    assert.ok(ghost?.endedAt, "the ghost gets a settle timestamp");
+    assert.ok(
+      Date.parse(ghost?.endedAt ?? "") >= Date.parse(savedUpdatedAt),
+      "the ghost settles at resume wall-clock, never before the record's last write",
+    );
     assert.equal(persisted?.agents.length, 4, "preserved history + both live re-executions");
   }),
 );
@@ -2070,9 +2078,11 @@ return { a, b }`;
       // resume() seeds the snapshot from the persisted agents (#206): the
       // pre-pause pair (done + skipped) is present immediately, so wait for
       // the LIVE re-execution of agent 2 to push the third entry.
-      while ((manager.getRun(runId)?.snapshot.agents.length ?? 0) < 3) {
+      let waitSpin = 0;
+      while ((manager.getRun(runId)?.snapshot.agents.length ?? 0) < 3 && waitSpin++ < 2000) {
         await new Promise((resolve) => setTimeout(resolve, 0));
       }
+      assert.equal(manager.getRun(runId)?.snapshot.agents.length, 3, "the live retry pushed its own entry");
       // The snapshot entry is pushed at onAgentStart, before the runner has
       // registered its deferred attempt — keep resolving until the live call
       // actually picks it up and the run completes.

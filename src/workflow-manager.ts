@@ -946,26 +946,43 @@ export class WorkflowManager extends EventEmitter {
           // A replayed journaled call whose entry was seeded from the persisted
           // snapshot (see resume(), #206) updates THAT entry in place — pushing
           // a fresh one would duplicate every pre-pause agent in the record.
+          // Match the LAST seeded row with this callId: callIds are positional
+          // (`${runId}:${callIndex}`) and reused (ghost + live retry, edited
+          // scripts shifting indices), and the latest row is the most recent
+          // execution of that call.
           const seeded = event.replayed
-            ? managed.snapshot.agents.find((agent) => agent.callId === event.id)
+            ? managed.snapshot.agents.findLast((agent) => agent.callId === event.id)
             : undefined;
-          const id = seeded?.id ?? managed.snapshot.agents.length + 1;
-          const prior = event.replayed ? managed.replayedAgentStatesByCallId.get(event.id) : undefined;
-          const priorSession = event.replayed ? managed.agentSessionsByCallId.get(event.id) : undefined;
-          const agentSnapshot: WorkflowAgentSnapshot = seeded ?? {
-            id,
-            callId: event.id,
-            label: event.label,
-            phase: event.phase,
-            prompt: event.prompt,
-            status: "running",
-            model: event.model ?? prior?.model,
-            sessionId: priorSession?.sessionId,
-            sessionFile: priorSession?.sessionFile,
-            tokens: prior?.tokens,
-            tokenUsage: prior?.tokenUsage,
-          };
-          if (!seeded) managed.snapshot.agents.push(agentSnapshot);
+          let agentSnapshot: WorkflowAgentSnapshot;
+          if (seeded) {
+            // Keep the row's identity/history, refresh presentation fields from
+            // the replayed call — label is not part of the call hash, so a
+            // label-only script edit still replays and must not leave a stale
+            // label (or model) behind.
+            seeded.label = event.label;
+            seeded.phase = event.phase;
+            seeded.prompt = event.prompt;
+            if (event.model) seeded.model = event.model;
+            agentSnapshot = seeded;
+          } else {
+            const prior = event.replayed ? managed.replayedAgentStatesByCallId.get(event.id) : undefined;
+            const priorSession = event.replayed ? managed.agentSessionsByCallId.get(event.id) : undefined;
+            agentSnapshot = {
+              id: managed.snapshot.agents.length + 1,
+              callId: event.id,
+              label: event.label,
+              phase: event.phase,
+              prompt: event.prompt,
+              status: "running",
+              model: event.model ?? prior?.model,
+              sessionId: priorSession?.sessionId,
+              sessionFile: priorSession?.sessionFile,
+              tokens: prior?.tokens,
+              tokenUsage: prior?.tokenUsage,
+            };
+            managed.snapshot.agents.push(agentSnapshot);
+          }
+          const id = agentSnapshot.id;
           // Index by the call's unique id (never label — see agentsById's doc
           // comment) so onAgentEnd/onAgentHistory/onAgentUsage can resolve back
           // to exactly THIS entry even when a concurrent sibling shares its
@@ -1714,36 +1731,43 @@ export class WorkflowManager extends EventEmitter {
     // the task panel would lose every prior agent (permanently, for calls an
     // edited script never replays). Ghost entries (still queued/running when
     // the owning execution died) settle to "skipped" with the interrupt cause
-    // and endedAt = the last persisted write, mirroring
-    // settleManagedInterruptedAgents. Replayed journaled calls update their
-    // seeded entry in place (see onAgentStart) instead of pushing duplicates.
+    // and a wall-clock endedAt, mirroring settleManagedInterruptedAgents.
+    // Replayed journaled calls update their seeded entry in place (see
+    // onAgentStart) instead of pushing duplicates. Non-object entries (corrupt
+    // or legacy records, #110-hardened everywhere else) are skipped.
     const seededAgentTimestamps = new Map<number, { startedAt: string; endedAt?: string }>();
-    const seededAgents: WorkflowAgentSnapshot[] = persistedAgents.map((agent, index) => {
-      const id = index + 1;
+    const settledAt = new Date().toISOString();
+    const seededAgents: WorkflowAgentSnapshot[] = [];
+    for (const agent of persistedAgents) {
+      if (!agent || typeof agent !== "object") continue;
+      const id = seededAgents.length + 1;
       const { startedAt, endedAt, ...snapshotFields } = agent;
       const ghost = agentHasNonTerminalStatus(agent.status);
       if (startedAt) {
-        seededAgentTimestamps.set(id, { startedAt, endedAt: endedAt ?? (ghost ? persisted.updatedAt : undefined) });
+        seededAgentTimestamps.set(id, { startedAt, endedAt: endedAt ?? (ghost ? settledAt : undefined) });
       } else if (ghost) {
-        seededAgentTimestamps.set(id, { startedAt: persisted.updatedAt, endedAt: persisted.updatedAt });
+        seededAgentTimestamps.set(id, { startedAt: settledAt, endedAt: settledAt });
       }
-      return ghost
-        ? {
-            ...snapshotFields,
-            id,
-            status: "skipped",
-            error: agent.error ?? INTERRUPTED_AGENT_CAUSE.error,
-            errorCode: agent.errorCode ?? INTERRUPTED_AGENT_CAUSE.errorCode,
-            recoverable: false,
-          }
-        : { ...snapshotFields, id };
-    });
+      seededAgents.push(
+        ghost
+          ? {
+              ...snapshotFields,
+              id,
+              status: "skipped",
+              error: agent.error ?? INTERRUPTED_AGENT_CAUSE.error,
+              errorCode: agent.errorCode ?? INTERRUPTED_AGENT_CAUSE.errorCode,
+              recoverable: false,
+            }
+          : { ...snapshotFields, id },
+      );
+    }
     const managed: ManagedRun = {
       runId,
       status: "running",
       snapshot: recomputeWorkflowSnapshot({
         name: persisted.workflowName,
         phases: persisted.phases ?? [],
+        currentPhase: persisted.currentPhase,
         logs: persisted.logs ?? [],
         agents: seededAgents,
         agentCount: 0,

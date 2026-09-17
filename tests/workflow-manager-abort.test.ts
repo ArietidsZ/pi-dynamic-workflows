@@ -635,9 +635,11 @@ return { a, b }`;
       // resume() seeds the snapshot from the persisted agents (#206): the
       // pre-pause pair (done + skipped) is present immediately, so wait for
       // the LIVE re-execution of agent 2 to push the third entry.
-      while ((manager.getRun(runId)?.snapshot.agents.length ?? 0) < 3) {
+      let waitSpin = 0;
+      while ((manager.getRun(runId)?.snapshot.agents.length ?? 0) < 3 && waitSpin++ < 2000) {
         await new Promise((resolve) => setTimeout(resolve, 0));
       }
+      assert.equal(manager.getRun(runId)?.snapshot.agents.length, 3, "the live retry pushed its own entry");
       // The snapshot entry is pushed at onAgentStart, before the runner has
       // registered its deferred attempt — keep resolving until the live call
       // actually picks it up and the run completes.
