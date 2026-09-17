@@ -390,6 +390,127 @@ test(
 );
 
 test(
+  "resume seeds the snapshot from persisted agents — no wiped fleet, no replay duplicates (#206)",
+  withTempCwd(async (cwd) => {
+    let bAttempts = 0;
+    let markBStarted: () => void = () => {};
+    const bStarted = new Promise<void>((resolve) => {
+      markBStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt, options) {
+          options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+          if (prompt === "first") {
+            await new Promise((resolve) => setTimeout(resolve, 5));
+            return "a-done";
+          }
+          bAttempts++;
+          if (bAttempts === 1) {
+            markBStarted();
+            await new Promise<void>((_resolve, reject) => {
+              options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+            });
+          }
+          return "b-done";
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    const { runId, promise } = manager.startInBackground(twoAgentScript);
+    promise.catch(() => {});
+    await bStarted;
+    assert.equal(manager.pause(runId), true);
+
+    // At pause the record holds A (done) + B (settled to skipped by pause()).
+    const atPause = manager.getPersistence().load(runId);
+    assert.equal(atPause?.agents.length, 2);
+    const aAtPause = atPause?.agents.find((a) => a.prompt === "first");
+    assert.equal(aAtPause?.status, "done");
+    const aStartedAt = aAtPause?.startedAt;
+    assert.ok(aStartedAt, "A's launch timestamp persisted before pause");
+
+    assert.equal(await manager.resume(runId), true);
+    while (manager.getRun(runId)?.status === "running") {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    const persisted = manager.getPersistence().load(runId);
+    assert.equal(persisted?.status, "completed");
+    const firsts = persisted?.agents.filter((a) => a.prompt === "first") ?? [];
+    assert.equal(firsts.length, 1, "journaled replay updates the seeded entry in place — no duplicate");
+    assert.equal(firsts[0]?.status, "done");
+    assert.equal(firsts[0]?.startedAt, aStartedAt, "seeded timestamps survive every later persist");
+    const seconds = persisted?.agents.filter((a) => a.prompt === "second") ?? [];
+    assert.equal(seconds.length, 2, "the killed attempt stays as history next to its live retry");
+    assert.equal(seconds[0]?.status, "skipped");
+    assert.equal(seconds[1]?.status, "done");
+    const snapshot = manager.getRun(runId)?.snapshot;
+    assert.equal(snapshot?.agentCount, 3);
+    assert.equal(snapshot?.doneCount, 2);
+  }),
+);
+
+test(
+  "resume maps persisted ghost (queued/running) agents to interrupted-skipped (#206)",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    // A legacy/dead-process record recovery never settled: one done agent and
+    // one still-"running" ghost. No journal, so both calls re-execute live.
+    manager.getPersistence().save({
+      runId: "legacy-run",
+      workflowName: "two_agent_demo",
+      script: twoAgentScript,
+      status: "paused",
+      phases: ["Work"],
+      agents: [
+        {
+          id: 1,
+          callId: "legacy-run:0",
+          label: "a",
+          prompt: "first",
+          status: "done",
+          resultPreview: "a-done",
+          startedAt: "2026-01-01T00:00:00.000Z",
+          endedAt: "2026-01-01T00:00:05.000Z",
+        },
+        {
+          id: 2,
+          callId: "legacy-run:1",
+          label: "b",
+          prompt: "second",
+          status: "running",
+          startedAt: "2026-01-01T00:00:06.000Z",
+        },
+      ],
+      logs: [],
+      startedAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:10.000Z",
+    });
+    manager.on("error", () => {});
+    // persistence.save stamps its own updatedAt on every write — read back the
+    // authoritative value instead of assuming the fixture's.
+    const savedUpdatedAt = manager.getPersistence().load("legacy-run")?.updatedAt;
+    assert.ok(savedUpdatedAt);
+
+    assert.equal(await manager.resume("legacy-run"), true);
+    while (manager.getRun("legacy-run")?.status === "running") {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    const persisted = manager.getPersistence().load("legacy-run");
+    assert.equal(persisted?.status, "completed");
+    const ghost = persisted?.agents.find((a) => a.status === "skipped");
+    assert.equal(ghost?.error, "interrupted");
+    assert.equal(ghost?.recoverable, false);
+    assert.equal(ghost?.endedAt, savedUpdatedAt, "the ghost ends at the record's last write");
+    assert.equal(persisted?.agents.length, 4, "preserved history + both live re-executions");
+  }),
+);
+
+test(
   "resume refuses to overlap pause teardown that exceeds the settlement grace period",
   withTempCwd(async (cwd) => {
     let markFirstAttemptStarted: () => void = () => {};
@@ -1946,7 +2067,10 @@ return { a, b }`;
       // Resume
       const resumed = await manager.resume(runId);
       assert.equal(resumed, true);
-      while ((manager.getRun(runId)?.snapshot.agents.length ?? 0) < 2) {
+      // resume() seeds the snapshot from the persisted agents (#206): the
+      // pre-pause pair (done + skipped) is present immediately, so wait for
+      // the LIVE re-execution of agent 2 to push the third entry.
+      while ((manager.getRun(runId)?.snapshot.agents.length ?? 0) < 3) {
         await new Promise((resolve) => setTimeout(resolve, 0));
       }
       da.resolve("second-result");
