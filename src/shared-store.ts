@@ -40,11 +40,19 @@ export class SharedStore {
   // shadowed — later writes to the same key within the same attempt are
   // already covered by that first shadow) and cleared whenever the delta is
   // finalized, either way, via `commitDelta`/`discardDelta`.
-  private readonly priorValues = new Map<string, Map<string, { existed: boolean; value: unknown }>>();
+  private readonly priorValues = new Map<string, Map<string, { existed: boolean; value: unknown; stamp?: string }>>();
+  // Last tracked writer per key (`deltaKey`), stamped on every trackPut —
+  // including writes of an Object.is-EQUAL value, which are still writes.
+  // discardDelta's ownership guard keys off this stamp: value comparison
+  // cannot distinguish "the store still holds my write" from "a sibling
+  // overwrote my key with an equal value", and the latter must NOT be rolled
+  // back (#208). Untracked put()/restore() clear the stamp (writer unknown).
+  private readonly writeStamps = new Map<string, string>();
 
   /** Store a value under `key`. Overwrites any existing value. */
   put(key: string, value: unknown): void {
     this.map.set(key, value);
+    this.writeStamps.delete(key);
   }
 
   /**
@@ -63,12 +71,14 @@ export class SharedStore {
     // this key — a second write to the same key within the same attempt must
     // not overwrite the shadow with its own (already-in-window) value.
     if (!priors.has(key)) {
-      priors.set(
-        key,
-        this.map.has(key) ? { existed: true, value: this.map.get(key) } : { existed: false, value: undefined },
-      );
+      priors.set(key, {
+        existed: this.map.has(key),
+        value: this.map.get(key),
+        stamp: this.writeStamps.get(key),
+      });
     }
     this.map.set(key, value);
+    this.writeStamps.set(key, deltaKey);
     let delta = this.agentDeltas.get(deltaKey);
     if (!delta) {
       delta = {};
@@ -117,14 +127,15 @@ export class SharedStore {
    * whatever it held immediately before the window started (or deleted, if
    * it did not exist yet) — never to some other attempt's or caller's value.
    *
-   * Per-key guard: a key is only rolled back if the store STILL holds this
-   * attempt's own last write to it (checked with `Object.is` against the
-   * value recorded in `delta`). If a concurrently-running sibling (a
-   * different `deltaKey`, e.g. another agent in the same parallel() batch)
-   * legitimately overwrote the same key AFTER this attempt wrote it but
-   * BEFORE it failed, that sibling's write is left untouched — rolling back
-   * unconditionally would silently erase a live, unrelated write that this
-   * attempt never made and has no business undoing.
+   * Per-key guard: a key is only rolled back if this attempt is still its
+   * LAST tracked writer (checked against the per-key write stamp, not the
+   * value — a sibling that overwrote the key with an Object.is-equal value is
+   * still a later writer whose write must survive, #208). If a
+   * concurrently-running sibling (a different `deltaKey`, e.g. another agent
+   * in the same parallel() batch) overwrote the same key AFTER this attempt
+   * wrote it but BEFORE it failed, that sibling's write is left untouched —
+   * rolling back unconditionally would silently erase a live, unrelated write
+   * that this attempt never made and has no business undoing.
    *
    * A no-op if `deltaKey` never wrote anything (nothing to roll back).
    */
@@ -133,12 +144,16 @@ export class SharedStore {
     if (!delta) return;
     const priors = this.priorValues.get(deltaKey);
     for (const key of Object.keys(delta)) {
-      // Someone else already overwrote this key since our last write to it —
+      // Someone else already rewrote this key since our last write to it —
       // leave their write in place instead of clobbering it with our rollback.
-      if (!Object.is(this.map.get(key), delta[key])) continue;
+      if (this.writeStamps.get(key) !== deltaKey) continue;
       const prior = priors?.get(key);
       if (prior?.existed) this.map.set(key, prior.value);
       else this.map.delete(key);
+      // Restore the pre-window writer stamp too, so an EARLIER window whose
+      // write we shadowed can still roll back its own value later.
+      if (prior?.stamp === undefined) this.writeStamps.delete(key);
+      else this.writeStamps.set(key, prior.stamp);
     }
     this.agentDeltas.delete(deltaKey);
     this.priorValues.delete(deltaKey);
@@ -161,6 +176,7 @@ export class SharedStore {
    */
   restore(snap: Record<string, unknown>): void {
     this.map.clear();
+    this.writeStamps.clear();
     for (const [k, v] of Object.entries(snap)) {
       this.map.set(k, v);
     }

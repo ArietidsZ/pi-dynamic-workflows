@@ -131,6 +131,49 @@ test("SharedStore.discardDelta must not clobber a concurrent sibling's legitimat
   );
 });
 
+test("SharedStore.discardDelta must not roll back a sibling's Object.is-EQUAL overwrite (#208)", () => {
+  // Value comparison cannot distinguish "the store still holds my write" from
+  // "a sibling rewrote my key with an equal value". The sibling's write is a
+  // real, journaled write: rolling it back would erase it from the live store
+  // while resume replay re-applies it — permanent live/replay divergence.
+  const store = new SharedStore();
+  store.put("k", "pre");
+  store.trackPut("k", "same-value", "run-1:0");
+  store.trackPut("k", "same-value", "run-1:1"); // sibling writes an Object.is-equal value
+  store.discardDelta("run-1:0");
+  assert.equal(store.get("k"), "same-value", "the sibling's equal-value write is still a write and must survive");
+  // The sibling's own rollback then restores the value IT shadowed (A's
+  // in-window write), and A's rollback reaches the pre-window value.
+  store.discardDelta("run-1:1");
+  assert.equal(store.get("k"), "same-value", "B's rollback restores A's in-window write");
+  store.discardDelta("run-1:0");
+  assert.equal(store.get("k"), "pre", "A's rollback reaches the pre-window value");
+});
+
+test("SharedStore.discardDelta restores writer ownership so an earlier window can still roll back (#208)", () => {
+  // Window A writes, window B overwrites, B fails and rolls back — the value
+  // returns to A's write AND A remains the recognized owner, so A's own
+  // later discard still rolls back to the pre-window state.
+  const store = new SharedStore();
+  store.trackPut("k", "a-value", "run-1:0");
+  store.trackPut("k", "b-value", "run-1:1");
+  store.discardDelta("run-1:1");
+  assert.equal(store.get("k"), "a-value", "B's rollback restores A's write");
+  store.discardDelta("run-1:0");
+  assert.equal(store.has("k"), false, "A's rollback then removes the key it introduced");
+});
+
+test("SharedStore.discardDelta skips rollback after an untracked put overwrites the key", () => {
+  // An untracked put() (script-level write outside any delta window) is an
+  // unknown writer: the attempt's rollback must not clobber it.
+  const store = new SharedStore();
+  store.put("k", "pre");
+  store.trackPut("k", "window-value", "run-1:0");
+  store.put("k", "script-value");
+  store.discardDelta("run-1:0");
+  assert.equal(store.get("k"), "script-value", "the untracked script write survives the window's rollback");
+});
+
 test("SharedStore.discardDelta still rolls back a key untouched by any concurrent sibling", () => {
   const store = new SharedStore();
   store.put("k", "pre");
