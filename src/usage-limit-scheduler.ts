@@ -106,22 +106,43 @@ export function parseResetHintMs(hint?: string, nowMs: number = Date.now()): num
   // Absolute forms providers actually emit, e.g. "It will reset at 2026-09-17
   // 13:20:54 +0800 CST" (Ark/Codex quota messages) or "Try again at 3:20 PM".
   const absoluteIso =
-    /(?:resets?|resetting|try again)\s+(?:at|on)\s+(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?(?:\s*[+-]\d{2}:?\d{2})?)/i.exec(
+    /(?:resets?|resetting|try again)\s+(?:at|on)\s+(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:\s*(?:[+-]\d{2}:?\d{2}|Z))?)/i.exec(
       hint,
     );
   if (absoluteIso) {
-    const ts = Date.parse(absoluteIso[1].replace(" ", "T").replace(/ ([+-]\d{2}:?\d{2})$/, "$1"));
-    if (Number.isFinite(ts)) return Math.max(0, ts - nowMs);
+    // Canonicalize for Date.parse: single T separator, no whitespace before the
+    // offset, bare Z kept (dropping it would silently re-interpret UTC as local).
+    const canonical = absoluteIso[1]
+      .replace(/^(\d{4}-\d{2}-\d{2})[ T](\d{2})/, "$1T$2")
+      .replace(/\s+([+-]\d{2}:?\d{2}|Z)$/i, "$1");
+    const ts = Date.parse(canonical);
+    // An absolute match that fails to parse must NOT fall through to the
+    // relative scan — an unrelated quantity elsewhere in the message
+    // ("Retry-After: 600 seconds") would be returned instead of the fallback.
+    return Number.isFinite(ts) ? Math.max(0, ts - nowMs) : undefined;
   }
-  const absoluteClock = /(?:resets?|try again)\s+at\s+(\d{1,2}):(\d{2})\s*([AP]M)\b/i.exec(hint);
+  const absoluteClock = /(?:resets?|resetting|try again)\s+at\s+(\d{1,2}):(\d{2})\s*([AP]M)\b/i.exec(hint);
   if (absoluteClock) {
     let hour = Number.parseInt(absoluteClock[1], 10) % 12;
     if (absoluteClock[3].toUpperCase() === "PM") hour += 12;
     const minute = Number.parseInt(absoluteClock[2], 10);
     const target = new Date(nowMs);
     target.setHours(hour, minute, 0, 0);
-    if (target.getTime() <= nowMs) target.setDate(target.getDate() + 1); // rollover to tomorrow
-    return target.getTime() - nowMs;
+    // An explicit date elsewhere in the hint ("… at 3:20 PM on 2026-09-20")
+    // pins the day; otherwise roll over to tomorrow only when the time is
+    // unambiguously past (minute-truncated hints delivered within the same
+    // minute must not roll a full day).
+    const explicitDate = /\b(\d{4})-(\d{2})-(\d{2})\b/.exec(hint);
+    if (explicitDate) {
+      target.setFullYear(
+        Number.parseInt(explicitDate[1], 10),
+        Number.parseInt(explicitDate[2], 10) - 1,
+        Number.parseInt(explicitDate[3], 10),
+      );
+    } else if (target.getTime() + 60_000 <= nowMs) {
+      target.setDate(target.getDate() + 1);
+    }
+    return Math.max(0, target.getTime() - nowMs);
   }
   // No trailing \b: combined forms like "1h30m" have a digit right after the
   // unit letter, which is itself a word character, so \b would never match
@@ -150,6 +171,12 @@ export function parseResetHintMs(hint?: string, nowMs: number = Date.now()): num
 export interface AutoResumeDelayParams {
   /** The provider's verbatim reset hint for this pause, if any. */
   resetHint?: string;
+  /** Clock reading for anchoring absolute reset hints (default Date.now()). */
+  nowMs?: number;
+  /** Jitter ratio applied BEFORE the min/max clamp (default 0 = no jitter). */
+  jitterRatio?: number;
+  /** Randomness source for jitter (default Math.random). */
+  random?: () => number;
   /** 1-indexed attempt number for the pause currently being armed. */
   attempts: number;
   /** Milliseconds already elapsed since the pause began (0 for a live pause). */
@@ -165,12 +192,18 @@ export interface AutoResumeDelayParams {
  * The exponent is capped defensively so a pathological attempt count can't
  * overflow the multiplication to Infinity/NaN before the maxDelayMs clamp runs.
  */
-export function computeAutoResumeDelayMs(params: AutoResumeDelayParams & { nowMs?: number }): number {
+export function computeAutoResumeDelayMs(params: AutoResumeDelayParams): number {
   const base = parseResetHintMs(params.resetHint, params.nowMs) ?? params.fallbackDelayMs;
   const remaining = base - params.elapsedMs;
   const exponent = Math.min(Math.max(params.attempts - 1, 0), 30);
   const backoff = remaining * 2 ** exponent;
-  return Math.min(params.maxDelayMs, Math.max(params.minDelayMs, backoff));
+  // Jitter BEFORE the clamp so the documented minDelayMs floor and maxDelayMs
+  // ceiling both still hold on the armed delay.
+  const jittered =
+    params.jitterRatio && params.jitterRatio > 0
+      ? backoff * (1 - params.jitterRatio + (params.random ?? Math.random)() * 2 * params.jitterRatio)
+      : backoff;
+  return Math.min(params.maxDelayMs, Math.max(params.minDelayMs, jittered));
 }
 
 /**
@@ -297,9 +330,8 @@ export class UsageLimitScheduler {
     // value would defeat the give-up cap and produce NaN timer delays.
     const priorAttempts =
       this.state.get(runId)?.attempts ?? sanitizeAutoResumeAttempts(persisted?.autoResumeAttempts) ?? 0;
-    // Fresh pause cycle: clear any accumulated refusal count from the last one
-    // (spread keeps the pending timer handle so arm() can clear it).
-    this.state.set(runId, { ...this.state.get(runId), attempts: priorAttempts, refusals: 0 });
+    // arm() overwrites RunState wholesale on both its paths, so any refusal
+    // count from a previous pause cycle is reset by construction.
     this.arm(runId, {
       attempts: priorAttempts + 1,
       resetHint: event.resetHint ?? persisted?.resetHint,
@@ -389,24 +421,22 @@ export class UsageLimitScheduler {
       return;
     }
 
-    const computed = computeAutoResumeDelayMs({
+    // nowMs is anchored at PAUSE time (now - elapsed), not arm time: an
+    // absolute hint parses to (resetTime - anchor) and the elapsed subtraction
+    // then yields the true remaining (resetTime - now). Anchoring at arm time
+    // would double-subtract elapsedMs on the cold-start path.
+    const anchorMs = this.now() - params.elapsedMs;
+    const delay = computeAutoResumeDelayMs({
       resetHint: params.resetHint,
       attempts: params.attempts,
       elapsedMs: params.elapsedMs,
       minDelayMs: this.minDelayMs,
       fallbackDelayMs: this.fallbackDelayMs,
       maxDelayMs: this.maxDelayMs,
-      nowMs: this.now(),
+      nowMs: anchorMs,
+      jitterRatio: this.jitterRatio,
+      random: this.random,
     });
-    // ±jitterRatio spread: runs paused by the same quota event must not all
-    // resume in one timer batch (thundering herd on the recovering provider).
-    const delay =
-      this.jitterRatio > 0
-        ? Math.max(
-            this.minDelayMs,
-            Math.round(computed * (1 - this.jitterRatio + this.random() * 2 * this.jitterRatio)),
-          )
-        : computed;
 
     const timer = this.setTimer(() => this.safe(() => this.onTimerFire(runId)), delay);
     this.state.set(runId, { attempts: params.attempts, timer });
@@ -461,7 +491,7 @@ export class UsageLimitScheduler {
     const refusals = (current.refusals ?? 0) + 1;
     if (refusals > this.maxRefusals) {
       this.diagnostic(
-        `[usage-limit-scheduler] ${runId}: giving up after ${this.maxRefusals} refused auto-resume poll(s); leaving paused for manual resume`,
+        `[usage-limit-scheduler] ${runId}: giving up after ${refusals} refused auto-resume poll(s); leaving paused for manual resume`,
       );
       this.cleanup(runId);
       return;

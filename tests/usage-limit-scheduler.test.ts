@@ -169,6 +169,101 @@ test("parseResetHintMs: absolute clock time rolls over to tomorrow (audit2 #10)"
   assert.equal(parseResetHintMs("Try again at 9:00 AM", now), rolled.getTime() - now);
 });
 
+test("parseResetHintMs: Z-suffixed ISO timestamps parse as UTC, not local", () => {
+  const now = Date.parse("2026-09-17T13:00:00Z");
+  assert.equal(parseResetHintMs("It will reset at 2026-09-17T13:20:54Z", now), 1_254_000);
+  assert.equal(parseResetHintMs("It will reset at 2026-09-17 13:20:54.123Z", now), 1_254_123);
+});
+
+test("parseResetHintMs: an unparseable absolute match does not fall through to unrelated units", () => {
+  // The absolute regex matched but the timestamp is garbage: the "600 seconds"
+  // elsewhere in the message must NOT be returned (callers fall back instead).
+  assert.equal(parseResetHintMs("It will reset at 2026-13-45 99:99 +0800. Retry-After: 600 seconds", 0), undefined);
+});
+
+test("parseResetHintMs: an explicit date pins the clock branch's day", () => {
+  const now = Date.parse("2026-09-17T15:00:00"); // 3:00 PM local
+  const expected = new Date(now);
+  expected.setFullYear(2026, 8, 20);
+  expected.setHours(15, 20, 0, 0);
+  assert.equal(parseResetHintMs("Try again at 3:20 PM on 2026-09-20", now), expected.getTime() - now);
+  // A minute-truncated hint delivered within the same minute must not roll a day.
+  const within = new Date(now);
+  within.setHours(15, 20, 30, 500);
+  assert.equal(parseResetHintMs("Try again at 3:20 PM", within.getTime()), 0);
+});
+
+test("jitter never breaches the maxDelayMs ceiling", () => {
+  assert.equal(
+    computeAutoResumeDelayMs({
+      resetHint: "resets in 99h",
+      attempts: 1,
+      elapsedMs: 0,
+      minDelayMs: 60_000,
+      fallbackDelayMs: 300_000,
+      maxDelayMs: 3_600_000,
+      jitterRatio: 0.1,
+      random: () => 0.999999,
+    }),
+    3_600_000,
+    "the documented ceiling holds on the armed delay",
+  );
+});
+
+test("cold start with an ABSOLUTE reset hint arms the true remaining, not the floor", async () => {
+  // Paused at t=0 with a reset at t+20m54s; the process restarts 10m in.
+  // The re-arm must be ~10.9m (reset - now), not the 60s floor from
+  // double-subtracting elapsed (audit2 r1 B1).
+  const manager = new FakeManager();
+  const clock = createFakeClock(0);
+  manager.persistence.seed(
+    makeRun({
+      status: "paused",
+      pauseReason: "usage_limit",
+      resetHint: "It will reset at 2026-09-17T13:20:54Z",
+      autoResumeAttempts: 1,
+      updatedAt: new Date(Date.parse("2026-09-17T13:00:00Z")).toISOString(),
+    }),
+  );
+  clock.advance(10 * 60_000);
+  const pausedNow = Date.parse("2026-09-17T13:00:00Z") + 10 * 60_000;
+  const scheduler = new UsageLimitScheduler(manager, {
+    now: () => pausedNow,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    ...TUNABLES,
+  });
+  await flush();
+  assert.deepEqual(clock.pendingDelays(), [1_254_000 - 10 * 60_000], "true remaining (reset - now), not the floor");
+  scheduler.dispose();
+});
+
+test("cold start with an absent counter WRITES the armed attempt through the non-live path (audit2 r1 m5)", async () => {
+  const manager = new FakeManager();
+  const clock = createFakeClock();
+  manager.persistence.seed(
+    makeRun({
+      status: "paused",
+      pauseReason: "usage_limit",
+      resetHint: "resets in 10m",
+      // autoResumeAttempts deliberately absent (pre-#207 record)
+    }),
+  );
+  const scheduler = new UsageLimitScheduler(manager, {
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    ...TUNABLES,
+  });
+  await flush();
+  assert.equal(
+    manager.persistence.get("run-1")?.autoResumeAttempts,
+    1,
+    "arming attempt 1 over an absent counter is a changed value and must persist",
+  );
+  scheduler.dispose();
+});
+
 test("jitter spreads identical arms deterministically with an injected random (audit2 #13)", () => {
   const manager = new FakeManager();
   manager.persistence.seed(makeRun({ resetHint: "resets in 10m" }));
