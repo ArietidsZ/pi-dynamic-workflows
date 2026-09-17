@@ -4738,9 +4738,9 @@ return { a, blocked }`;
     const started = manager.startInBackground(script);
     await assert.rejects(started.promise, /checkpoint/i);
 
-    // The declared phase budget must be on the persisted record.
+    // The declared phase budget must be on the persisted record (frame-namespaced).
     const pausedRecord = manager.getPersistence().load(started.runId);
-    assert.deepEqual(pausedRecord?.phaseBudgets?.p, { budget: 60, startSpent: 0, warned: false });
+    assert.deepEqual(pausedRecord?.phaseBudgets?.[`${started.runId}:p`], { budget: 60, startSpent: 0, warned: false });
 
     await manager.attachCheckpointResponse(started.runId, "h-1", {});
     const completed = once(manager, "complete");
@@ -4817,9 +4817,9 @@ return { a, nested }`;
     const { runId, promise } = manager.startInBackground(parent);
     await promise;
     const persisted = manager.getPersistence().load(runId);
-    assert.ok(persisted?.phaseBudgets?.parentphase, "parent entry survives the child's declaration");
-    assert.ok(persisted?.phaseBudgets?.childphase, "child entry recorded");
-    assert.equal(persisted?.phaseBudgets?.parentphase?.budget, 100);
-    assert.equal(persisted?.phaseBudgets?.childphase?.budget, 50);
+    assert.ok(persisted?.phaseBudgets?.[`${runId}:parentphase`], "parent entry survives the child's declaration");
+    assert.ok(persisted?.phaseBudgets?.[`${runId}-nested1:childphase`], "child entry recorded under its own frame key");
+    assert.equal(persisted?.phaseBudgets?.[`${runId}:parentphase`]?.budget, 100);
+    assert.equal(persisted?.phaseBudgets?.[`${runId}-nested1:childphase`]?.budget, 50);
   }),
 );

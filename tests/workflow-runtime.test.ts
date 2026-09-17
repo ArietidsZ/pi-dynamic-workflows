@@ -2414,7 +2414,8 @@ return { a, blocked }`;
   const result = await runWorkflow<{ a: unknown; blocked: boolean }>(script, {
     agent: fakeAgent({ input: 60, output: 0, total: 60, cost: 0 }),
     initialTokenUsage: { input: 60, output: 0, total: 60, cost: 0, cacheRead: 0, cacheWrite: 0 },
-    initialPhaseBudgets: { p: { budget: 100, startSpent: 0 } },
+    runId: "seeded-run",
+    initialPhaseBudgets: { "seeded-run:p": { budget: 100, startSpent: 0 } },
     onPhaseBudgets: (budgets) => phaseBudgetEvents.push(budgets),
     persistLogs: false,
   });
@@ -2443,49 +2444,71 @@ return { a, blocked }`;
   const events: Array<Record<string, { budget: number }>> = [];
   const result = await runWorkflow<{ a: unknown; blocked: boolean }>(script, {
     agent: fakeAgent({ input: 60, output: 0, total: 60, cost: 0 }),
+    runId: "decl-run",
     onPhaseBudgets: (budgets) => events.push(budgets),
     persistLogs: false,
   });
   assert.equal(result.result.blocked, true, "the 999999 re-declaration must NOT re-base the budget away");
   assert.equal(events.length, 1, "exactly one budget notification (the first declaration)");
-  assert.equal(events[0]?.p?.budget, 60);
+  assert.equal(events[0]?.["decl-run:p"]?.budget, 60, "emitted keys are frame-namespaced");
 });
 
-test("a nested workflow() frame is NOT seeded from the parent's persisted phase table (audit2 r1 MAJOR)", async () => {
-  // The top level adopts the persisted seed (parentphase); the nested child
-  // frame must declare from an empty table — otherwise a title collision would
-  // silently adopt the other frame's baseline and the child's notification
-  // would carry parent entries.
+test("a nested frame ADOPTS its own persisted phase-budget slice across resume (audit2 r2 MAJOR)", async () => {
+  // The child's phase budget was persisted from the prior execution with
+  // baseline 0 and budget 60; the child already spent 60 (seeded via
+  // initialTokenUsage). On resume the child re-declares its phase — it must
+  // adopt the persisted baseline, so the ceiling is already exhausted.
   const child = `export const meta = { name: 'child', description: 'c' }
-phase('childphase', { budget: 50 })
+phase('childphase', { budget: 60 })
+let blocked = false
+try { await agent('child task', { label: 'c' }) } catch (e) { blocked = (e && e.code) === 'TOKEN_BUDGET_EXHAUSTED' }
+return { blocked }`;
+  const parent = `export const meta = { name: 'parent', description: 'p' }
+const nested = await workflow('child')
+return { nested }`;
+  const result = await runWorkflow<{ nested: { blocked: boolean } }>(parent, {
+    agent: fakeAgent({ input: 60, output: 0, total: 60, cost: 0 }),
+    persistLogs: false,
+    runId: "parent-run",
+    loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
+    initialTokenUsage: { input: 60, output: 0, total: 60, cost: 0, cacheRead: 0, cacheWrite: 0 },
+    initialPhaseBudgets: { "parent-run-nested1:childphase": { budget: 60, startSpent: 0 } },
+  });
+  assert.equal(
+    result.result.nested.blocked,
+    true,
+    "the nested frame adopted its persisted baseline: 60 already spent against a 60 ceiling blocks the call",
+  );
+});
+
+test("same-title phases in parent and child frames keep independent baselines (frame-namespaced)", async () => {
+  const child = `export const meta = { name: 'child', description: 'c' }
+phase('shared-title', { budget: 1000 })
 const r = await agent('child task', { label: 'c' })
 return { child: r }`;
   const parent = `export const meta = { name: 'parent', description: 'p' }
-phase('parentphase', { budget: 100 })
+phase('shared-title', { budget: 60 })
 const a = await agent('parent task', { label: 'p' })
 const nested = await workflow('child')
-return { a, nested }`;
-
+let blocked = false
+try { await agent('parent tail', { label: 't' }) } catch (e) { blocked = true }
+return { a, nested, blocked }`;
   const events: Array<Record<string, { budget: number; startSpent: number }>> = [];
-  await runWorkflow(parent, {
+  const result = await runWorkflow<{ blocked: boolean }>(parent, {
     agent: fakeAgent({ input: 10, output: 0, total: 10, cost: 0 }),
     persistLogs: false,
+    runId: "parent-run",
     loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
-    initialPhaseBudgets: { parentphase: { budget: 100, startSpent: 0 } },
     onPhaseBudgets: (budgets) => events.push(budgets),
   });
-
-  assert.equal(
-    events.length,
-    1,
-    "only the child's NEW declaration fires (the parent's seeded phase is adopted, not re-declared)",
-  );
-  assert.deepEqual(
-    Object.keys(events[0] ?? {}),
-    ["childphase"],
-    "the child frame's table contains only its own declaration — no parent seed leakage",
-  );
-  assert.equal(events[0]?.childphase?.budget, 50);
+  // Parent spent 10 in 'shared-title' (budget 60); the child's 1000-budget
+  // same-title phase must not lift the parent's ceiling for the tail call...
+  // parent tail: phaseSpent 10 (parent frame) < 60 → runs. The REAL assertion
+  // is the event table: two independent entries, never merged.
+  const merged = Object.assign({}, ...events);
+  assert.equal(merged["parent-run:shared-title"]?.budget, 60, "parent entry under the parent frame key");
+  assert.equal(merged["parent-run-nested1:shared-title"]?.budget, 1000, "child entry under the child frame key");
+  assert.equal(result.result.blocked, false, "parent tail call proceeds under its own ceiling");
 });
 
 test("the phase runtime event advertises the EFFECTIVE (first-declared) budget", async () => {

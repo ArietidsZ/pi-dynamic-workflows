@@ -271,13 +271,19 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
   /**
-   * Persisted per-phase sub-budgets from a previous execution (resume() only):
-   * adopted on first re-declaration instead of re-basing, so a phase ceiling
-   * holds CUMULATIVELY across a pause/resume cycle (audit2 #4) instead of
-   * silently granting the phase a fresh allowance per resume.
+   * Persisted per-phase sub-budgets from a previous execution (resume() only),
+   * keyed by `${frameRunId}:${phaseTitle}` (a nested workflow()'s frame runId
+   * is stable across resume — `${parentRunId}-nested${seq}`). Each frame adopts
+   * only ITS slice on first re-declaration, so a phase ceiling holds
+   * CUMULATIVELY across a pause/resume cycle (audit2 #4) instead of silently
+   * re-granting the full allowance per resume — and frames can never
+   * cross-contaminate each other's baselines.
    */
   initialPhaseBudgets?: Record<string, { budget: number; startSpent: number; warned?: boolean }>;
-  /** Fired whenever the phase-budget table changes, so the manager can persist it. */
+  /**
+   * Fired whenever this frame's phase-budget table changes, so the manager can
+   * persist it. Keys are already frame-namespaced (`${frameRunId}:${title}`).
+   */
   onPhaseBudgets?: (budgets: Record<string, { budget: number; startSpent: number; warned: boolean }>) => void;
   /** Runtime behavior trace used by diagnostics and comprehension evidence. */
   onRuntimeEvent?: (event: WorkflowRuntimeEvent) => void;
@@ -524,18 +530,18 @@ export async function runWorkflow<T = unknown>(
     // explicit phase() (or agent({ phase })) overrides this.
     phases: meta.phases?.[0]?.title ? [meta.phases[0].title] : [],
     currentPhase: meta.phases?.[0]?.title,
-    // Seeded ONLY on the fresh-SharedRuntime branch (same rule as spent/:545):
-    // a nested workflow() frame declares its own phases; seeding it from the
-    // parent's persisted table would cross-contaminate frames and let a child
-    // overwrite parent entries (the persisted table is flat by title).
-    phaseBudgets: options.sharedRuntime
-      ? new Map()
-      : new Map(
-          Object.entries(options.initialPhaseBudgets ?? {}).map(([title, pb]) => [
-            title,
-            { budget: pb.budget, startSpent: pb.startSpent, warned: pb.warned ?? false },
-          ]),
-        ),
+    // Adopt this frame's slice of the persisted table (keys are
+    // `${frameRunId}:${title}` — a nested frame's own runId prefix selects its
+    // entries, so frames never cross-contaminate). The slice keys are stripped
+    // back to bare titles for the frame-local map.
+    phaseBudgets: new Map(
+      Object.entries(options.initialPhaseBudgets ?? {})
+        .filter(([key]) => key.startsWith(`${runId}:`))
+        .map(([key, pb]) => [
+          key.slice(runId.length + 1),
+          { budget: pb.budget, startSpent: pb.startSpent, warned: pb.warned ?? false },
+        ]),
+    ),
     callSeq: 0,
     firstMiss: Number.POSITIVE_INFINITY,
   };
@@ -597,6 +603,12 @@ export async function runWorkflow<T = unknown>(
     logger.log(text);
   };
 
+  const emitPhaseBudgets = () => {
+    options.onPhaseBudgets?.(
+      Object.fromEntries([...state.phaseBudgets].map(([title, pb]) => [`${runId}:${title}`, pb])),
+    );
+  };
+
   const phase = (title: string, phaseOptions?: { budget?: number }) => {
     state.currentPhase = title;
     if (!state.phases.includes(title)) state.phases.push(title);
@@ -607,7 +619,7 @@ export async function runWorkflow<T = unknown>(
     // (audit2 #4 — re-basing on resume silently re-granted the full allowance).
     if (typeof phaseOptions?.budget === "number" && phaseOptions.budget > 0 && !state.phaseBudgets.has(title)) {
       state.phaseBudgets.set(title, { budget: phaseOptions.budget, startSpent: shared.spent, warned: false });
-      options.onPhaseBudgets?.(Object.fromEntries(state.phaseBudgets));
+      emitPhaseBudgets();
     }
     options.onPhase?.(title);
     options.onRuntimeEvent?.({
@@ -811,11 +823,15 @@ export async function runWorkflow<T = unknown>(
     // below) with callIndex makes the key unique across the whole store.
     const deltaKey = `${runId}:${callIndex}`;
 
-    // Reserve the agent slot synchronously — atomic with the limit/budget gate
-    // above (no await in between) — so a parallel() fan-out can't all observe the
-    // same agentCount and overshoot maxAgents. (Token budget stays a soft gate:
-    // spent accrues after each agent, matching Claude Code; in-flight agents may
-    // push slightly past total, then further agent() calls throw.)
+    // Reserve the agent slot synchronously (no await between this and the
+    // capacity check) so a parallel() fan-out can't all observe the same
+    // agentCount and overshoot maxAgents. The increment precedes the budget
+    // gates deliberately: callIndex/agentCount must stay lexical for
+    // replay-key stability, and a budget-blocked call consumes its slot
+    // uniformly (resume replays count identically). (Token budget stays a
+    // soft gate: spent accrues after each agent, matching Claude Code;
+    // in-flight agents may push slightly past total, then further agent()
+    // calls throw.)
     shared.agentCount++;
     const label = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount);
     // Longest-unchanged-prefix resume: replay a cached result only while the
@@ -890,7 +906,7 @@ export async function runWorkflow<T = unknown>(
         }
         if (!pb.warned && phaseSpent >= pb.budget * 0.8) {
           pb.warned = true;
-          options.onPhaseBudgets?.(Object.fromEntries(state.phaseBudgets));
+          emitPhaseBudgets();
           log(`phase "${assignedPhase}" at ${Math.round((phaseSpent / pb.budget) * 100)}% of its token sub-budget`);
         }
       }
