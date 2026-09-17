@@ -4758,5 +4758,10 @@ return 'script-done'`;
     const persisted = manager.getPersistence().load(runId);
     assert.equal(persisted?.status, "paused", "pause owns the lifecycle — no paused→completed flip");
     assert.equal(persisted?.result, "script-done", "the result is retained on the paused record");
+    assert.equal(
+      persisted?.agents[0]?.status,
+      "skipped",
+      "the never-settled sibling is settled fail-closed, not left at running forever",
+    );
   }),
 );

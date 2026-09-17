@@ -1120,11 +1120,12 @@ export class WorkflowManager extends EventEmitter {
       // this window reachable for hung-then-abandoned agents).
       if (managed.status === "paused") {
         managed.result = result;
+        // Fail-closed display: the drain's abandoned/slow siblings never get an
+        // onAgentEnd post-abort — without this they would sit at "running"
+        // forever on a settled, paused run (mirrors the catch-branch pause tail).
+        this.settleManagedInterruptedAgents(managed, INTERRUPTED_AGENT_CAUSE, new Date());
         this.persistRun(managed);
-        if (this.isCurrent(managed)) {
-          this.releaseRunLease(managed);
-          this.recordTerminalRun(managed.runId);
-        }
+        if (this.isCurrent(managed)) this.releaseRunLease(managed);
         return result;
       }
 

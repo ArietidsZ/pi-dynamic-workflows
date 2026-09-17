@@ -1701,9 +1701,9 @@ export async function runWorkflow<T = unknown>(
       // (not a single Promise.allSettled) because draining can itself let a
       // still-running call schedule further work that adds to the set.
       //
-      // Caveat: without an abort this can still block indefinitely (success /
-      // checkpoint-suspension drains deliberately wait — those results are
-      // wanted). Once the run's abort has fired the wait is bounded by
+      // Caveat: without an abort the SUCCESS drain still blocks indefinitely —
+      // those results are wanted. (Suspension drains are currently abort-sealed
+      // too, hence bounded; see drainAbortGraceMs.) Once the run's abort has fired the wait is bounded by
       // drainAbortGraceMs (default 10s): a run-fatal abort (see the catch
       // above) aborts the AbortSignal passed to each in-flight agent, but that
       // is cooperative — an agent runner that ignores its signal (or one still
