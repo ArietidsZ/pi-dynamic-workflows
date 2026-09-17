@@ -2018,6 +2018,9 @@ export class WorkflowManager extends EventEmitter {
     if (sanitizeAutoResumeAttempts(attempts) === undefined) return;
     const managed = this.runs.get(runId);
     if (managed) {
+      // Skip equal-value writes (undefined ≡ 0 for this counter): a usage-limit
+      // pause storm must not each trigger a full-record rewrite (audit2 #15).
+      if ((managed.autoResumeAttempts ?? 0) === attempts) return;
       managed.autoResumeAttempts = attempts;
       this.persistRun(managed);
       return;
@@ -2027,6 +2030,7 @@ export class WorkflowManager extends EventEmitter {
     try {
       const current = this.persistence.load(runId);
       if (!current) return;
+      if ((current.autoResumeAttempts ?? 0) === attempts) return;
       this.persistence.save({ ...current, autoResumeAttempts: attempts });
     } finally {
       this.persistence.releaseRunLease(lease);

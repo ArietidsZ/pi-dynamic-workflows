@@ -57,6 +57,21 @@ export interface UsageLimitSchedulerOptions {
   fallbackDelayMs?: number;
   /** Delay ceiling — backoff is clamped here. Default 6h. */
   maxDelayMs?: number;
+  /**
+   * Jitter ratio applied to every armed delay (default 0.1 = ±10%): runs paused
+   * by the same quota event would otherwise all auto-resume in the same timer
+   * batch (audit2 #13). Set 0 for deterministic tests.
+   */
+  jitterRatio?: number;
+  /** Injectable randomness for jitter (default Math.random). */
+  random?: () => number;
+  /**
+   * Consecutive refused-resume re-arms before giving up (default 10): a refused
+   * resume() isn't a real attempt (lease held elsewhere, structural refusal),
+   * but polling it forever re-arms an un-backed-off 60s loop for the run's
+   * lifetime (audit2 #12).
+   */
+  maxRefusals?: number;
   /** Diagnostics sink; defaults to console.warn. Never throws back into the caller. */
   onDiagnostic?: (message: string, detail?: unknown) => void;
 }
@@ -64,11 +79,15 @@ export interface UsageLimitSchedulerOptions {
 interface RunState {
   /** How many auto-resume attempts have been made (or armed) for this pause-cycle. */
   attempts: number;
+  /** Consecutive resume() refusals (structural, not real attempts) — capped separately. */
+  refusals?: number;
   /** The currently armed timer, if any. */
   timer?: TimerHandle;
   /** Set once the attempt cap is hit, so the give-up diagnostic logs once. */
   gaveUp?: boolean;
 }
+
+const DEFAULT_MAX_REFUSALS = 10;
 
 const DEFAULT_MAX_ATTEMPTS = 5;
 const DEFAULT_MIN_DELAY_MS = 60_000;
@@ -82,14 +101,34 @@ const DEFAULT_MAX_DELAY_MS = 6 * 60 * 60 * 1000;
  * Returns undefined when nothing recognizable is found — callers should fall
  * back to a fixed delay rather than guess.
  */
-export function parseResetHintMs(hint?: string): number | undefined {
+export function parseResetHintMs(hint?: string, nowMs: number = Date.now()): number | undefined {
   if (!hint) return undefined;
+  // Absolute forms providers actually emit, e.g. "It will reset at 2026-09-17
+  // 13:20:54 +0800 CST" (Ark/Codex quota messages) or "Try again at 3:20 PM".
+  const absoluteIso =
+    /(?:resets?|resetting|try again)\s+(?:at|on)\s+(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?(?:\s*[+-]\d{2}:?\d{2})?)/i.exec(
+      hint,
+    );
+  if (absoluteIso) {
+    const ts = Date.parse(absoluteIso[1].replace(" ", "T").replace(/ ([+-]\d{2}:?\d{2})$/, "$1"));
+    if (Number.isFinite(ts)) return Math.max(0, ts - nowMs);
+  }
+  const absoluteClock = /(?:resets?|try again)\s+at\s+(\d{1,2}):(\d{2})\s*([AP]M)\b/i.exec(hint);
+  if (absoluteClock) {
+    let hour = Number.parseInt(absoluteClock[1], 10) % 12;
+    if (absoluteClock[3].toUpperCase() === "PM") hour += 12;
+    const minute = Number.parseInt(absoluteClock[2], 10);
+    const target = new Date(nowMs);
+    target.setHours(hour, minute, 0, 0);
+    if (target.getTime() <= nowMs) target.setDate(target.getDate() + 1); // rollover to tomorrow
+    return target.getTime() - nowMs;
+  }
   // No trailing \b: combined forms like "1h30m" have a digit right after the
   // unit letter, which is itself a word character, so \b would never match
   // there. A negative lookahead for another letter is the correct boundary —
   // it still stops "hours" from partially matching as bare "h" mid-word while
   // allowing a unit to be followed immediately by the next (digit, unit) pair.
-  const re = /(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)(?![a-z])/gi;
+  const re = /(\d+(?:\.\d+)?)\s*(weeks?|w|days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)(?![a-z])/gi;
   let match: RegExpExecArray | null;
   let totalMs = 0;
   let found = false;
@@ -99,7 +138,9 @@ export function parseResetHintMs(hint?: string): number | undefined {
     if (!Number.isFinite(value)) continue;
     const unit = match[2].toLowerCase();
     found = true;
-    if (unit.startsWith("h")) totalMs += value * 3_600_000;
+    if (unit.startsWith("w")) totalMs += value * 7 * 86_400_000;
+    else if (unit.startsWith("d")) totalMs += value * 86_400_000;
+    else if (unit.startsWith("h")) totalMs += value * 3_600_000;
     else if (unit.startsWith("m")) totalMs += value * 60_000;
     else if (unit.startsWith("s")) totalMs += value * 1_000;
   }
@@ -124,8 +165,8 @@ export interface AutoResumeDelayParams {
  * The exponent is capped defensively so a pathological attempt count can't
  * overflow the multiplication to Infinity/NaN before the maxDelayMs clamp runs.
  */
-export function computeAutoResumeDelayMs(params: AutoResumeDelayParams): number {
-  const base = parseResetHintMs(params.resetHint) ?? params.fallbackDelayMs;
+export function computeAutoResumeDelayMs(params: AutoResumeDelayParams & { nowMs?: number }): number {
+  const base = parseResetHintMs(params.resetHint, params.nowMs) ?? params.fallbackDelayMs;
   const remaining = base - params.elapsedMs;
   const exponent = Math.min(Math.max(params.attempts - 1, 0), 30);
   const backoff = remaining * 2 ** exponent;
@@ -155,6 +196,9 @@ export class UsageLimitScheduler {
   private readonly minDelayMs: number;
   private readonly fallbackDelayMs: number;
   private readonly maxDelayMs: number;
+  private readonly jitterRatio: number;
+  private readonly random: () => number;
+  private readonly maxRefusals: number;
   private readonly diagnostic: (message: string, detail?: unknown) => void;
 
   private readonly state = new Map<string, RunState>();
@@ -185,6 +229,9 @@ export class UsageLimitScheduler {
     this.minDelayMs = options.minDelayMs ?? DEFAULT_MIN_DELAY_MS;
     this.fallbackDelayMs = options.fallbackDelayMs ?? DEFAULT_FALLBACK_DELAY_MS;
     this.maxDelayMs = options.maxDelayMs ?? DEFAULT_MAX_DELAY_MS;
+    this.jitterRatio = options.jitterRatio ?? 0.1;
+    this.random = options.random ?? Math.random;
+    this.maxRefusals = options.maxRefusals ?? DEFAULT_MAX_REFUSALS;
     this.diagnostic =
       options.onDiagnostic ??
       ((message, detail) => {
@@ -250,6 +297,9 @@ export class UsageLimitScheduler {
     // value would defeat the give-up cap and produce NaN timer delays.
     const priorAttempts =
       this.state.get(runId)?.attempts ?? sanitizeAutoResumeAttempts(persisted?.autoResumeAttempts) ?? 0;
+    // Fresh pause cycle: clear any accumulated refusal count from the last one
+    // (spread keeps the pending timer handle so arm() can clear it).
+    this.state.set(runId, { ...this.state.get(runId), attempts: priorAttempts, refusals: 0 });
     this.arm(runId, {
       attempts: priorAttempts + 1,
       resetHint: event.resetHint ?? persisted?.resetHint,
@@ -289,10 +339,20 @@ export class UsageLimitScheduler {
       // Validate the persisted counter: a corrupt/foreign value (NaN, string,
       // negative) would defeat the give-up cap and produce NaN timer delays.
       const priorAttempts = sanitizeAutoResumeAttempts(run.autoResumeAttempts) ?? 0;
+      // A persisted value past the cap is the frozen give-up sentinel
+      // (maxAttempts + 1, see arm()): that run already gave up BEFORE the
+      // restart — skip it silently instead of re-logging the give-up diagnostic
+      // on every cold start (#106, kept under the no-drift rearm of audit2 #11).
+      if (priorAttempts > this.maxAttempts) continue;
       const updatedAtMs = Date.parse(run.updatedAt);
       const elapsedMs = Number.isFinite(updatedAtMs) ? Math.max(0, this.now() - updatedAtMs) : 0;
+      // Re-arm the ALREADY-COUNTED attempt, not the next one: the counter is
+      // persisted at arm time, so the armed attempt never fired if the process
+      // died. Bumping it on every construction would burn the give-up budget
+      // on mere restarts (/new, /resume, a second window) without any real
+      // retry having happened (audit2 #11).
       this.arm(run.runId, {
-        attempts: priorAttempts + 1,
+        attempts: Math.max(priorAttempts, 1),
         resetHint: run.resetHint,
         elapsedMs,
       });
@@ -329,14 +389,24 @@ export class UsageLimitScheduler {
       return;
     }
 
-    const delay = computeAutoResumeDelayMs({
+    const computed = computeAutoResumeDelayMs({
       resetHint: params.resetHint,
       attempts: params.attempts,
       elapsedMs: params.elapsedMs,
       minDelayMs: this.minDelayMs,
       fallbackDelayMs: this.fallbackDelayMs,
       maxDelayMs: this.maxDelayMs,
+      nowMs: this.now(),
     });
+    // ±jitterRatio spread: runs paused by the same quota event must not all
+    // resume in one timer batch (thundering herd on the recovering provider).
+    const delay =
+      this.jitterRatio > 0
+        ? Math.max(
+            this.minDelayMs,
+            Math.round(computed * (1 - this.jitterRatio + this.random() * 2 * this.jitterRatio)),
+          )
+        : computed;
 
     const timer = this.setTimer(() => this.safe(() => this.onTimerFire(runId)), delay);
     this.state.set(runId, { attempts: params.attempts, timer });
@@ -384,8 +454,20 @@ export class UsageLimitScheduler {
     }
 
     const current = this.state.get(runId) ?? entry;
+    // A refusal is not an attempt (bug (a) — it doesn't consume the backoff
+    // budget), but it must not poll forever either: cap consecutive refusals
+    // (audit2 #12 — otherwise a lease held by another window means an
+    // un-backed-off 60s poll for the rest of the run's lifetime).
+    const refusals = (current.refusals ?? 0) + 1;
+    if (refusals > this.maxRefusals) {
+      this.diagnostic(
+        `[usage-limit-scheduler] ${runId}: giving up after ${this.maxRefusals} refused auto-resume poll(s); leaving paused for manual resume`,
+      );
+      this.cleanup(runId);
+      return;
+    }
     const timer = this.setTimer(() => this.safe(() => this.onTimerFire(runId)), this.minDelayMs);
-    this.state.set(runId, { attempts: current.attempts, timer });
+    this.state.set(runId, { ...current, refusals, timer });
   }
 
   // ---- helpers --------------------------------------------------------------
