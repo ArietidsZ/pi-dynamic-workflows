@@ -385,20 +385,24 @@ export function registerBuiltinWorkflows(
     const saved = getStorage().load(name);
     if (!saved) return false;
     const parsed = parseCommandArgs(rawArgs, saved.parameters);
-    const positional = typeof parsed._ === "string" ? parsed._.trim() : "";
     const raw = typeof parsed._raw === "string" ? parsed._raw.trim() : "";
     // An explicit `key=value` for the primary beats the positional mapping;
     // the user's bare positional beats a declared parameter default.
     const wholeKey = SHADOW_WHOLE_STRING_PRIMARY[name];
-    if (wholeKey && !new RegExp(`(?:^|\\s)${wholeKey}=`).test(rawArgs) && (positional || raw)) {
-      // The positional is the primary (mirrors the builtin's args.trim());
-      // fall back to _raw so inputs whose ONLY token contains "=" survive.
-      parsed[wholeKey] = positional || raw;
+    if (wholeKey && !new RegExp(`(?:^|\\s)${wholeKey}=`).test(rawArgs) && raw) {
+      // The WHOLE raw string is the primary — exactly the builtin's
+      // args.trim(), including "="-containing topics (r2 NIT).
+      parsed[wholeKey] = raw;
     }
     const tokenized = SHADOW_TOKENIZED_PRIMARY[name];
-    if (tokenized && !new RegExp(`(?:^|\\s)${tokenized.primary}=`).test(rawArgs) && positional) {
-      const tokens = positional.split(/\s+/).filter(Boolean);
-      if (tokens.length) {
+    if (tokenized && !new RegExp(`(?:^|\\s)${tokenized.primary}=`).test(rawArgs) && raw) {
+      // Quote-aware tokenization, mirroring the builtin handler's own
+      // tokenizer (r2 MINOR): /multi-perspective "auth flows" security →
+      // topic "auth flows", perspectives ["security"].
+      const tokens = tokenizeArgs(raw);
+      // A leading key=value token means a pure named-arg invocation (no
+      // positional to map) — mirrors how any saved workflow parses it.
+      if (tokens.length && !tokens[0].includes("=")) {
         parsed[tokenized.primary] = tokens[0];
         if (tokens.length > 1 && parsed[tokenized.rest] === undefined) parsed[tokenized.rest] = tokens.slice(1);
       }

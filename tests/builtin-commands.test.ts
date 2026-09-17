@@ -641,3 +641,43 @@ test("shadow positional mapping: equals-only topics, defaults, and structured se
   assert.equal(mpArgs.topic, "auth-flows");
   assert.deepEqual(mpArgs.perspectives, ["security", "performance"]);
 });
+
+test("shadow tokenized mapping is quote-aware like the builtin (audit2 #43 r2)", async () => {
+  const { pi, commands } = makeCommandRegistryPi();
+  const { manager, started } = makeFakeManager();
+  registerBuiltinWorkflows(pi, {
+    cwd: "/tmp",
+    manager,
+    storage: makeFakeStorage({
+      "multi-perspective": { script: "export const meta = { name: 'mps', description: 's' }" },
+    }),
+  });
+  const mps = commands.find((c) => c.name === "multi-perspective")?.handler;
+  assert.ok(mps);
+  const { ctx } = makeNotifyCtx();
+  await mps('"auth flows" security performance', ctx);
+  const args = started[0].args as Record<string, unknown>;
+  assert.equal(args.topic, "auth flows", "quoted multi-word topic, exactly like the builtin");
+  assert.deepEqual(args.perspectives, ["security", "performance"]);
+});
+
+test("shadow whole-string mapping keeps equals-containing topics whole (audit2 #43 r2)", async () => {
+  const { pi, commands } = makeCommandRegistryPi();
+  const { manager, started } = makeFakeManager();
+  registerBuiltinWorkflows(pi, {
+    cwd: "/tmp",
+    manager,
+    storage: makeFakeStorage({
+      "deep-research": { script: "export const meta = { name: 'shadow', description: 's' }" },
+    }),
+  });
+  const deep = commands.find((c) => c.name === "deep-research")?.handler;
+  assert.ok(deep);
+  const { ctx } = makeNotifyCtx();
+  await deep("what does a=b mean", ctx);
+  assert.equal(
+    (started[0].args as Record<string, unknown>).question,
+    "what does a=b mean",
+    "the full trimmed string, exactly like the builtin",
+  );
+});

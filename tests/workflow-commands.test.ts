@@ -621,7 +621,9 @@ test("/workflows status watch survives a throwing sendMessage/setStatus (audit2 
     errorCount: 0,
   };
   const manager: any = new EventEmitter();
-  manager.getRun = (id: string) => (id === "run-1" ? { runId: "run-1", status: "completed", snapshot } : undefined);
+  // "running" — with a terminal status watchRun returns early and zero
+  // listeners exist, making this test vacuous (r2).
+  manager.getRun = (id: string) => (id === "run-1" ? { runId: "run-1", status: "running", snapshot } : undefined);
   manager.getSnapshot = () => null;
   manager.listRuns = () => [];
   let handler: ((a: string, c: any) => Promise<void>) | undefined;
@@ -638,13 +640,16 @@ test("/workflows status watch survives a throwing sendMessage/setStatus (audit2 
   const ctx = {
     ui: {
       notify: () => {},
-      setStatus: () => {
-        throw new Error("stale ui");
+      setStatus: (_k: string, text?: string) => {
+        // Throw only on the TEARDOWN call — the subscribe-time update() also
+        // sets a status line and must succeed for listeners to register.
+        if (text === undefined) throw new Error("stale ui");
       },
     },
   };
   assert.ok(handler);
   await handler("status run-1", ctx);
+  assert.ok(progressAndFinalListenerCount(manager) > 0, "watch actually subscribed (non-vacuous)");
   assert.doesNotThrow(() => manager.emit("complete", { runId: "run-1" }), "finish swallows stale-ctx failures");
   assert.equal(progressAndFinalListenerCount(manager), 0, "listeners still torn down");
 });

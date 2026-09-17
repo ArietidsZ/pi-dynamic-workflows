@@ -121,7 +121,16 @@ export function writeJsonAtomicPreservingPreviousBackup(fs: PersistenceFsLayer, 
   const json = JSON.stringify(data, null, 2);
   fs.writeFileSync(`${path}.tmp`, json);
   fs.renameSync(`${path}.tmp`, path);
-  if (previous === undefined && fs.existsSync(`${path}.bak`)) return; // keep the last good backup
+  if (previous === undefined && fs.existsSync(`${path}.bak`)) {
+    // Keep the existing backup only when it still parses — a corrupt .bak is
+    // not a recovery source, and the new content is strictly better (r2 NIT).
+    try {
+      JSON.parse(fs.readFileSync(`${path}.bak`, "utf8"));
+      return; // keep the last good backup
+    } catch {
+      // fall through and mirror the new content
+    }
+  }
   try {
     fs.writeFileSync(`${path}.bak`, previous ?? json);
   } catch {
