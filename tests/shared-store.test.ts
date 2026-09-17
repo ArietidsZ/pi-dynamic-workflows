@@ -819,7 +819,7 @@ test("SharedStore matches an event-log undo model under randomized interleavings
   const WINDOWS = ["run-1:0", "run-1:1", "run-1:2"];
   // Small value pool so writes frequently repeat an Object.is-equal value
   // across windows — the exact sibling-overwrite shape issue #208 describes.
-  const POOL = ["shared-a", "shared-b"];
+  const POOL: unknown[] = ["shared-a", "shared-b", { pooled: true }];
 
   for (let trial = 0; trial < 400; trial++) {
     const store = new SharedStore();
@@ -874,7 +874,7 @@ test("SharedStore matches an event-log undo model under randomized interleavings
       }
       // Check EVERY key after EVERY op — presence as well as value.
       for (const k of KEYS) {
-        assert.equal(
+        assert.deepEqual(
           store.get(k),
           refVisible(k),
           `trial ${trial} step ${step}: key ${k} diverged (committed=${[...committed]}, discarded=${[...discarded]})`,
@@ -930,6 +930,18 @@ test("SharedStore stays correct under long same-key commit chains (log compactio
     store.commitDelta(`run-1:${i}`);
   }
   assert.equal(store.get("hot"), "v1999");
+  // The compaction itself, not just values: the log must collapse to the
+  // single observable (topmost permanent) entry.
+  const internals = store as unknown as { keyHistories: Map<string, { writes: unknown[] }> };
+  assert.equal(internals.keyHistories.get("hot")?.writes.length, 1, "compacted log keeps only the live entry");
+  // In-window rewrites collapse too: one live window, many writes, one entry.
+  for (let i = 0; i < 2000; i++) {
+    store.trackPut("hot", `w${i}`, "run-x:0");
+  }
+  assert.equal(internals.keyHistories.get("hot")?.writes.length, 2, "live window contributes one entry");
+  assert.equal(store.get("hot"), "w1999");
+  store.discardDelta("run-x:0");
+  assert.equal(store.get("hot"), "v1999", "the collapsed in-window rewrite is fully rolled back");
   // A stale window's discard is still a no-op against compacted history.
   store.discardDelta("run-1:0");
   assert.equal(store.get("hot"), "v1999");
