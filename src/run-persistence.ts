@@ -242,6 +242,9 @@ export const TERMINAL_RUN_STATUSES: ReadonlySet<RunStatus> = new Set(["completed
 
 const NON_TERMINAL_AGENT_STATUSES = new Set(["queued", "running"]);
 
+/** Every status a persisted agent row may validly carry (see PersistedAgentState). */
+export const VALID_PERSISTED_AGENT_STATUSES = new Set(["queued", "running", "done", "error", "skipped"]);
+
 /** Cause stamped onto leftover agents when a live execution is gone but the run is still paused. */
 export const INTERRUPTED_AGENT_CAUSE: { error: string; errorCode: WorkflowErrorCode } = {
   error: "interrupted",
