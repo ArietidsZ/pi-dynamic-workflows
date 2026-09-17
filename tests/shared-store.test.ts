@@ -142,11 +142,36 @@ test("SharedStore.discardDelta must not roll back a sibling's Object.is-EQUAL ov
   store.trackPut("k", "same-value", "run-1:1"); // sibling writes an Object.is-equal value
   store.discardDelta("run-1:0");
   assert.equal(store.get("k"), "same-value", "the sibling's equal-value write is still a write and must survive");
-  // The sibling's own rollback restores the value IT shadowed — A's in-window
-  // write (A's bookkeeping was finalized by its discard above, so the window
-  // chain ends there).
+  // The sibling's own rollback then cascades past the discarded window's
+  // never-committed write to the true pre-window value — the failed attempt's
+  // write must not resurface in the live store when replay omits it.
   store.discardDelta("run-1:1");
-  assert.equal(store.get("k"), "same-value", "B's rollback restores the value B shadowed");
+  assert.equal(store.get("k"), "pre", "B's rollback cascades past the discarded window to the pre-window value");
+});
+
+test("SharedStore.discardDelta cascades past a discarded window (both-fail, distinct values) (#208)", () => {
+  // Both parallel writers fail: A's write was never journaled, so B's rollback
+  // must reach the pre-window value, not A's dead write — replay applies
+  // neither delta and would otherwise diverge from the live store.
+  const store = new SharedStore();
+  store.put("k", "pre");
+  store.trackPut("k", "a-value", "run-1:0");
+  store.trackPut("k", "b-value", "run-1:1");
+  store.discardDelta("run-1:0"); // skipped: B owns the key now
+  assert.equal(store.get("k"), "b-value", "B's live write survives A's discard");
+  store.discardDelta("run-1:1");
+  assert.equal(store.get("k"), "pre", "B's rollback cascades past A's discarded write");
+});
+
+test("SharedStore.applyDelta clears writer stamps — a failed window must not roll back a replay write (#208)", () => {
+  // Resume replay applies journaled deltas additively while a live window can
+  // hold an in-progress write to the same key. The replay write belongs to no
+  // live window: the live window's later rollback must leave it untouched.
+  const store = new SharedStore();
+  store.trackPut("k", "live-write", "run-1:0");
+  store.applyDelta({ k: "replayed" });
+  store.discardDelta("run-1:0");
+  assert.equal(store.get("k"), "replayed", "the journaled replay write survives the failed window's rollback");
 });
 
 test("SharedStore.discardDelta restores writer ownership so an earlier window can still roll back (#208)", () => {
