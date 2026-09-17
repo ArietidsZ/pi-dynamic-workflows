@@ -3482,4 +3482,8 @@ it("sessionFileContainsEntry finds entries before AND after the incremental scan
   // Content written BEFORE the cached offset (interleaved delivery): head fallback.
   assert.equal(sessionFileContainsEntry(file, entry1), true, "pre-offset entry found via the head fallback");
   assert.equal(sessionFileContainsEntry(file, { id: "never" }), false);
+  // REPEAT the same needle with nothing appended (the delivery-ACK poll loop):
+  // the tail window must be wide enough to contain it — an off-by-one here
+  // degenerated every repeat check into a full head scan (r1 M1).
+  assert.equal(sessionFileContainsEntry(file, entry2), true, "repeat check of the last entry hits the tail window");
 });

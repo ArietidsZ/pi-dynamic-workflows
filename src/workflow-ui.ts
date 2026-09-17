@@ -639,14 +639,13 @@ export class NavigatorState {
   }
 
   /** Reconcile selection after any list/filter/manager change without drifting. */
-  reconcile(snapshot: NavigatorSnapshot, managerEvent = false): void {
+  reconcile(snapshot: NavigatorSnapshot): void {
     if (this.kind !== "runs") return;
-    // Do NOT cancel a pending confirmation on manager events (audit2 #22):
-    // tokenUsage alone fires ~4/s per streaming agent, so the double-tap
-    // window never survived. confirm() re-validates cursor/filter/context and
-    // the TARGET identity against the current item, so a stale confirmation
-    // cannot act on the wrong row.
-    void managerEvent;
+    // NOTE: a pending confirmation is deliberately NOT cancelled by manager
+    // events (audit2 #22) — tokenUsage alone fires ~4/s per streaming agent,
+    // so the double-tap window never survived. confirm() re-validates
+    // cursor/filter/context and the TARGET identity against the current item,
+    // so a stale confirmation cannot act on the wrong row.
     const top = this.top();
     const index = snapshot.items.findIndex((item) => sameIdentity(top.selected, item.identity));
     if (index >= 0) {
@@ -658,9 +657,6 @@ export class NavigatorState {
     top.selected = undefined;
     top.cursor = snapshot.items.length ? Math.max(0, Math.min(top.cursor, snapshot.items.length - 1)) : 0;
     if (snapshot.items.length) top.selected = snapshot.items[top.cursor]?.identity;
-  }
-  noteManagerEvent(snapshot: NavigatorSnapshot): void {
-    this.reconcile(snapshot, true);
   }
   currentItem(snapshot: NavigatorSnapshot): VisibleNavigatorItem | undefined {
     this.reconcile(snapshot);

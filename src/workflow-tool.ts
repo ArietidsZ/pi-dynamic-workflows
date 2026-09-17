@@ -292,7 +292,10 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         if (progressRenderTimer) {
           clearTimeout(progressRenderTimer);
           progressRenderTimer = undefined;
-          if (latestProgress) snapshot = recomputeWorkflowSnapshot(latestProgress);
+          if (latestProgress) {
+            snapshot = recomputeWorkflowSnapshot(latestProgress);
+            display.update(snapshot); // the last frame must not be 100ms stale
+          }
         }
       };
 
@@ -340,6 +343,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         throw error;
       }
 
+      flushProgress(); // no stray timer may survive ANY exit, incl. this throw
       if (result.agentCount === 0) {
         throw new Error(
           "workflow scripts must call agent() at least once; this workflow declared phases but did not run any subagents",

@@ -380,10 +380,16 @@ export function sessionFileContainsEntry(path: string, entry: object): boolean {
     // offset (with a needle-length overlap) instead of offset 0. On a tail
     // miss, fall back to one head scan: an entry can precede the cached offset
     // when two deliveries interleave.
-    const resumeFrom = Math.max(0, (sessionScanOffsets.get(path) ?? 0) - needle.length + 1);
+    // - needle.length (NOT +1): the cached offset is one past the last scanned
+    // byte, and a needle straddling it can start at offset-1 — the tail window
+    // must be at least needle.length+1 bytes or a repeat check for an
+    // already-present entry always misses the tail and degenerates to a full
+    // head scan (r1 M1). An entry followed by later writes still falls back to
+    // one head scan — acceptable.
+    const resumeFrom = Math.max(0, (sessionScanOffsets.get(path) ?? 0) - needle.length);
     const foundInTail = scanRegion(fd, needle, resumeFrom);
     const end = lseekEnd(fd);
-    sessionScanOffsets.set(path, end);
+    rememberScanOffset(path, end);
     if (foundInTail) return true;
     if (resumeFrom > 0) return scanRegion(fd, needle, 0, resumeFrom + needle.length - 1);
     return false;
@@ -394,8 +400,19 @@ export function sessionFileContainsEntry(path: string, entry: object): boolean {
   }
 }
 
-/** Last fully-scanned byte offset per session file (append-only). */
+/** Last fully-scanned byte offset per session file (append-only). Bounded:
+ * one entry per touched session file; FIFO-evicted past 128. */
 const sessionScanOffsets = new Map<string, number>();
+const SESSION_SCAN_OFFSETS_CAP = 128;
+
+function rememberScanOffset(path: string, end: number): void {
+  sessionScanOffsets.delete(path);
+  sessionScanOffsets.set(path, end);
+  if (sessionScanOffsets.size > SESSION_SCAN_OFFSETS_CAP) {
+    const oldest = sessionScanOffsets.keys().next().value;
+    if (oldest !== undefined) sessionScanOffsets.delete(oldest);
+  }
+}
 
 function lseekEnd(fd: number): number {
   try {

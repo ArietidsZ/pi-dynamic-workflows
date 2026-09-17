@@ -299,9 +299,10 @@ export function renderWorkflowLines(
   options: WorkflowDisplayOptions = {},
   theme: ThemeLike = NO_THEME,
 ): string[] {
-  // A non-positive cap means "show none" — slice(-0) === slice(0) would
-  // otherwise render ALL agents (audit2 #31).
-  const maxAgents = Math.max(0, options.maxAgents ?? 8);
+  // A non-positive cap falls back to the default (mirrors clampMaxAgents in
+  // the task panel): slice(-0) === slice(0) would otherwise render ALL agents
+  // (audit2 #31).
+  const maxAgents = options.maxAgents !== undefined && options.maxAgents > 0 ? options.maxAgents : 8;
   const showResultPreviews = options.showResultPreviews ?? false;
   const state =
     snapshot.errorCount > 0
@@ -327,6 +328,9 @@ export function renderWorkflowLines(
   // every render O(phases × agents), which dominates at large fleets.
   const agentsByPhase = new Map<string, WorkflowAgentSnapshot[]>();
   for (const agent of snapshot.agents) {
+    // Degenerate case: an agent whose phase is "" renders under "Unphased"
+    // even when meta.phases declares a ""-titled phase (the phase row then
+    // reads 0/0) — same as the pre-bucketing behavior for untitled agents.
     if (!agent.phase) continue;
     let bucket = agentsByPhase.get(agent.phase);
     if (!bucket) {
@@ -353,7 +357,7 @@ export function renderWorkflowLines(
         ),
     );
 
-    const visibleAgents = maxAgents > 0 ? agents.slice(-maxAgents) : [];
+    const visibleAgents = agents.slice(-maxAgents);
     for (const agent of visibleAgents) {
       const order = `[${agent.id}]`;
       const result = showResultPreviews && agent.resultPreview ? ` — ${agent.resultPreview}` : "";
@@ -368,7 +372,7 @@ export function renderWorkflowLines(
   const unphased = snapshot.agents.filter((agent) => !rendered.has(agent));
   if (unphased.length) {
     lines.push(theme.fg("accent", "  Unphased"));
-    for (const agent of maxAgents > 0 ? unphased.slice(-maxAgents) : []) {
+    for (const agent of unphased.slice(-maxAgents)) {
       const result = showResultPreviews && agent.resultPreview ? ` — ${agent.resultPreview}` : "";
       lines.push(
         `    [${agent.id}] ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${agentTokenCell(agent, theme)}${result}`,
@@ -416,73 +420,7 @@ export function shorten(value: string, max: number): string {
 }
 
 export function preview(value: unknown, max = 80): string {
-  if (typeof value === "string") {
-    const text = value;
-    return text.length > max ? `${text.slice(0, max - 1)}…` : text;
-  }
-  // Bounded serialization (audit2 #26): JSON.stringify walks the ENTIRE value
-  // (a multi-MB agent result stalls the event loop) just to take an 80-char
-  // slice. Serialize only until the budget is spent.
-  // JSON.stringify(undefined/function/symbol) yields undefined → "".
-  if (value === undefined || typeof value === "function" || typeof value === "symbol") return "";
-  const text = boundedJsonPreview(value, max + 1);
+  const text = typeof value === "string" ? value : JSON.stringify(value);
   if (!text) return "";
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
-}
-
-/** Serialize a JSON-ish value, stopping once `budget` chars have been produced. */
-function boundedJsonPreview(value: unknown, budget: number): string {
-  let out = "";
-  const walk = (v: unknown, depth: number): void => {
-    if (out.length >= budget || depth > 8) return;
-    if (v === undefined || typeof v === "function" || typeof v === "symbol") {
-      out += "null"; // JSON.stringify renders these as null inside arrays
-      return;
-    }
-    if (v === null || typeof v === "number" || typeof v === "boolean") {
-      out += String(v);
-      return;
-    }
-    if (typeof v === "string") {
-      const remaining = budget - out.length;
-      out += JSON.stringify(v.length > remaining ? v.slice(0, remaining) : v);
-      return;
-    }
-    if (Array.isArray(v)) {
-      out += "[";
-      for (let i = 0; i < v.length && out.length < budget; i++) {
-        if (i > 0) out += ",";
-        walk(v[i], depth + 1);
-      }
-      out += out.length >= budget ? "" : "]";
-      return;
-    }
-    if (typeof v === "object") {
-      out += "{";
-      let first = true;
-      for (const [k, entry] of Object.entries(v as Record<string, unknown>)) {
-        if (out.length >= budget) break;
-        if (typeof entry === "function" || typeof entry === "undefined") continue;
-        if (!first) out += ",";
-        first = false;
-        out += `${JSON.stringify(k)}:`;
-        walk(entry, depth + 1);
-      }
-      out += out.length >= budget ? "" : "}";
-      return;
-    }
-    // functions/symbols/bigints: String() fallback, bounded
-    try {
-      out += String(v).slice(0, budget - out.length);
-    } catch {
-      // ignore exotic values
-    }
-  };
-  try {
-    walk(value, 0);
-  } catch {
-    // circular structures: Object.entries can't cycle infinitely at depth ≤ 8,
-    // but a throwing getter could — degrade gracefully
-  }
-  return out;
 }
