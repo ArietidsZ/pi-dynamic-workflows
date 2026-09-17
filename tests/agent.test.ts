@@ -2431,3 +2431,31 @@ test("fallback registry resolves to a real ModelRegistry on stock pi and is cach
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("WorkflowAgent.run bounds the loader memo: one-off cwds are LRU-evicted (audit2 #41)", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-loader-lru-home-"));
+  const root = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-loader-lru-root-"));
+  const core = createFauxCore({
+    provider: "fauxtest-loader-lru",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const registry = await fauxRegistry(home, "fauxtest-loader-lru", core);
+      core.setResponses(
+        Array.from({ length: 12 }, (_, i) => fauxAssistantMessage(`answer ${i}`, { stopReason: "stop" })),
+      );
+      const agent = new WorkflowAgent({ cwd: root, modelRegistry: registry });
+      // Worktree-style fan-out: every call has a unique explicit cwd.
+      for (let i = 0; i < 12; i++) {
+        const dir = mkdtempSync(join(root, `wt-${i}-`));
+        await agent.run(`call ${i}`, { cwd: dir, model: "fauxtest-loader-lru/faux-model" });
+      }
+      const loaders = (agent as unknown as { resourceLoaders: Map<string, unknown> }).resourceLoaders;
+      assert.ok(loaders.size <= 8, `one-off worktree loaders are LRU-evicted (got ${loaders.size}, cap is 8)`);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});

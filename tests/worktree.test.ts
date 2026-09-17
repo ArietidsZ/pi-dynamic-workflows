@@ -151,3 +151,26 @@ test("removeWorktree preserves the branch when a locked worktree cannot be remov
     rmSync(repo, { recursive: true, force: true });
   }
 });
+
+test("a hung git is bounded by the exec timeout (audit2 #21)", async () => {
+  // A fake `git` that sleeps forever: createWorktree must fail fast instead of
+  // blocking agent spawn indefinitely.
+  const shimDir = mkdtempSync(join(tmpdir(), "pi-wt-shim-"));
+  const shimPath = join(shimDir, process.platform === "win32" ? "git.cmd" : "git");
+  writeFileSync(shimPath, "#!/bin/sh\nsleep 600\n");
+  execFileSync("chmod", ["+x", shimPath]);
+  const repo = mkdtempSync(join(tmpdir(), "pi-wt-hang-"));
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${shimDir}:${originalPath}`;
+  try {
+    const started = Date.now();
+    const wt = await createWorktreeLive(repo, "run-hang-0-task", { timeoutMs: 150 });
+    const elapsed = Date.now() - started;
+    assert.equal(wt.isolated, false, "the timed-out git fails the worktree (falls back to base cwd)");
+    assert.ok(elapsed < 10_000, `bounded (took ${elapsed}ms, not the default 30s or forever)`);
+  } finally {
+    process.env.PATH = originalPath;
+    rmSync(shimDir, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
