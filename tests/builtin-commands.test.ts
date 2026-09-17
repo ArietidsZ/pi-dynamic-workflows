@@ -626,15 +626,17 @@ test("shadow positional mapping: equals-only topics, defaults, and structured se
   assert.ok(deep && mps);
 
   // "="-containing topic survives (parseCommandArgs treats it as key=value).
-  await deep!("a=b=c", ctx);
+  assert.ok(deep);
+  await deep("a=b=c", ctx);
   assert.equal((started[0].args as Record<string, unknown>).question, "a=b=c");
 
   // A bare positional beats the declared parameter default.
-  await deep!("explicit topic", ctx);
+  await deep("explicit topic", ctx);
   assert.equal((started[1].args as Record<string, unknown>).question, "explicit topic");
 
   // Structured secondary: first token → topic, rest → perspectives.
-  await mps!("auth-flows security performance", ctx);
+  assert.ok(mps);
+  await mps("auth-flows security performance", ctx);
   const mpArgs = started[2].args as Record<string, unknown>;
   assert.equal(mpArgs.topic, "auth-flows");
   assert.deepEqual(mpArgs.perspectives, ["security", "performance"]);

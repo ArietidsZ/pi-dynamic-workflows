@@ -591,7 +591,8 @@ test("/workflows status watch ends when the run is deleted (audit2 #34)", async 
   };
   registerWorkflowCommands(pi as unknown as ExtensionAPI, manager as unknown as WorkflowManager);
   const ctx = { ui: { notify: () => {}, setStatus: (_k: string, t?: string) => statusLine.push(t) } };
-  await handler!("status run-1", ctx);
+  assert.ok(handler);
+  await handler("status run-1", ctx);
   const listenersBefore = progressAndFinalListenerCount(manager);
   assert.ok(listenersBefore > 0, "watch subscribed");
 
@@ -642,7 +643,8 @@ test("/workflows status watch survives a throwing sendMessage/setStatus (audit2 
       },
     },
   };
-  await handler!("status run-1", ctx);
+  assert.ok(handler);
+  await handler("status run-1", ctx);
   assert.doesNotThrow(() => manager.emit("complete", { runId: "run-1" }), "finish swallows stale-ctx failures");
   assert.equal(progressAndFinalListenerCount(manager), 0, "listeners still torn down");
 });
@@ -691,7 +693,8 @@ test("/workflows save <name> warns (not false-success) when the name is host-own
     { storage, cwd: "/cwd" },
   );
   const notified: Array<{ message: string; type?: string }> = [];
-  await workflowsHandler!("save host-owned", {
+  assert.ok(workflowsHandler);
+  await workflowsHandler("save host-owned", {
     ui: { notify: (m: string, t?: string) => notified.push({ message: m, type: t }) },
   });
   assert.equal(saved.length, 1, "the file persisted");

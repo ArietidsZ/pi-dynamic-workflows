@@ -625,7 +625,8 @@ test("save() preserves the PREVIOUS version as .bak on overwrite (audit2 #36)", 
   const loaded = storage.load("demo");
   assert.equal(loaded?.script, "SCRIPT_V2", "the new version is primary");
   // Corrupt the primary → recovery must yield the PREVIOUS version, not nothing.
-  const path = loaded!.path;
+  assert.ok(loaded);
+  const path = loaded.path;
   writeFileSync(path, "{ truncated");
   const recovered = storage.load("demo");
   assert.equal(recovered?.script, "SCRIPT_V1", "an accidental overwrite leaves the old script recoverable");
