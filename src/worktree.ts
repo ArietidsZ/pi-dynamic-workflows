@@ -20,7 +20,7 @@ const GIT_EXEC_OPTIONS = { timeout: 30_000, maxBuffer: 4 * 1024 * 1024 } as cons
 
 /** Options for the git invocations behind worktree creation/removal. */
 export interface WorktreeExecOptions {
-  /** Per-invocation timeout; defaults to 30s (see GIT_EXEC_OPTIONS). */
+  /** Per-invocation timeout; defaults to 30s (see GIT_EXEC_OPTIONS). 0 disables. */
   timeoutMs?: number;
 }
 
@@ -65,8 +65,8 @@ export async function createWorktree(
   try {
     const { stdout } = await exec("git", ["-C", baseCwd, "rev-parse", "--show-toplevel"], gitOptions(execOptions));
     repoRoot = stdout.trim();
-  } catch {
-    return { isolated: false, cwd: baseCwd, reason: "not a git repository" };
+  } catch (error) {
+    return { isolated: false, cwd: baseCwd, reason: describeGitFailure(error, "not a git repository") };
   }
 
   const path = join(repoRoot, ".pi", "worktrees", id);
@@ -75,7 +75,42 @@ export async function createWorktree(
     await exec("git", ["-C", repoRoot, "worktree", "add", "-b", branch, path, "HEAD"], gitOptions(execOptions));
     return { isolated: true, cwd: path, branch, repoRoot };
   } catch (error) {
-    return { isolated: false, cwd: baseCwd, reason: error instanceof Error ? error.message : String(error) };
+    // A timed-out/failed `worktree add` can leave a created branch and a
+    // partially checked-out tree behind (r1 MAJOR): git rolls back its
+    // registration but never deletes the `-b` branch or the directory.
+    await cleanupFailedWorktreeAdd(repoRoot, path, branch);
+    return { isolated: false, cwd: baseCwd, reason: describeGitFailure(error, String(error)) };
+  }
+}
+
+/** Honest failure text: a killed (timed-out) git is not "not a git repository". */
+function describeGitFailure(error: unknown, fallback: string): string {
+  if (typeof error === "object" && error !== null && (error as { killed?: boolean }).killed) {
+    return "git timed out (slow or hung filesystem?)";
+  }
+  return error instanceof Error ? error.message : fallback;
+}
+
+/** Best-effort cleanup after a failed `worktree add`: drop the half-created
+ * branch and any partial checkout left by a killed git. All steps short-timeout
+ * and failure-tolerant — the spawn path must not hang on cleanup. */
+async function cleanupFailedWorktreeAdd(repoRoot: string, path: string, branch: string): Promise<void> {
+  const quick = { timeout: 5_000, maxBuffer: 1024 * 1024 } as const;
+  try {
+    await exec("git", ["-C", repoRoot, "worktree", "prune"], quick);
+  } catch {
+    // best-effort
+  }
+  try {
+    await exec("git", ["-C", repoRoot, "branch", "-D", branch], quick);
+  } catch {
+    // best-effort
+  }
+  try {
+    const { rm } = await import("node:fs/promises");
+    await rm(path, { recursive: true, force: true });
+  } catch {
+    // best-effort
   }
 }
 

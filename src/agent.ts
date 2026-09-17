@@ -788,7 +788,9 @@ export class WorkflowAgent {
       // Don't let a transient build failure (e.g. EMFILE during reload's disk
       // I/O) poison every subagent AND every retry of this run — clear the memo
       // so the next caller rebuilds instead of replaying the same rejection.
-      this.resourceLoaders.delete(key);
+      // Identity-checked: an older failed build must not delete a NEWER
+      // healthy pending entry for the same key (the map is LRU-evictable).
+      if (this.resourceLoaders.get(key) === pending) this.resourceLoaders.delete(key);
       throw err;
     });
     this.resourceLoaders.set(key, pending);

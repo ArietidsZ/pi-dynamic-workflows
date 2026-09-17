@@ -174,3 +174,46 @@ test("a hung git is bounded by the exec timeout (audit2 #21)", async () => {
     rmSync(repo, { recursive: true, force: true });
   }
 });
+
+test("a timed-out worktree add cleans up the half-created branch and tree (audit2 #21 r1)", async () => {
+  // Real git repo, but a PATH shim that sleeps ONLY on `worktree add`:
+  // rev-parse/branch -D/prune delegate to the real git.
+  const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  const shimDir = mkdtempSync(join(tmpdir(), "pi-wt-shim2-"));
+  const shimPath = join(shimDir, "git");
+  writeFileSync(
+    shimPath,
+    `#!/bin/sh\ncase "$*" in\n  *"worktree add"*) sleep 600 ;;\n  *) exec "${realGit}" "$@" ;;\nesac\n`,
+  );
+  execFileSync("chmod", ["+x", shimPath]);
+
+  const repo = mkdtempSync(join(tmpdir(), "pi-wt-add-hang-"));
+  const git = (...args: string[]) =>
+    execFileSync(realGit, ["-C", repo, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  const originalPath = process.env.PATH;
+  try {
+    git("init", "-q");
+    git("config", "user.email", "t@t.t");
+    git("config", "user.name", "t");
+    writeFileSync(join(repo, "f.txt"), "base\n");
+    git("add", ".");
+    git("commit", "-qm", "init");
+
+    process.env.PATH = `${shimDir}:${originalPath}`;
+    const started = Date.now();
+    const wt = await createWorktreeLive(repo, "run-addhang-0-task", { timeoutMs: 200 });
+    const elapsed = Date.now() - started;
+    process.env.PATH = originalPath;
+
+    assert.equal(wt.isolated, false);
+    assert.match(wt.reason ?? "", /timed out/, "an honest timeout reason, not 'not a git repository'");
+    assert.ok(elapsed < 15_000, `bounded (took ${elapsed}ms)`);
+    const branches = git("branch", "--list", "pi/wf/*");
+    assert.equal(branches.trim(), "", "the half-created branch was cleaned up");
+    assert.equal(existsSync(join(repo, ".pi", "worktrees")), false, "no partial checkout left behind");
+  } finally {
+    process.env.PATH = originalPath;
+    rmSync(shimDir, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
