@@ -318,6 +318,10 @@ test("jitter: a backoff exactly AT the cap still spreads (no point mass at maxDe
     "ceiling holds in every sample",
   );
   assert.ok(delays.size > 1, "same-cap cohorts decorrelate instead of piling onto maxDelayMs");
+  assert.ok(
+    [...delays].every((d) => d < 3_600_000),
+    "no sample piles exactly at the cap",
+  );
 });
 
 test("jitter spreads identical arms deterministically with an injected random (audit2 #13)", () => {

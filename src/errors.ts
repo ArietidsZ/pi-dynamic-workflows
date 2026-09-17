@@ -163,7 +163,7 @@ export function classifyProviderLimit(text: string | undefined): { matched: bool
   // "Resets in ~3h", "reset at 2026-09-17 13:20:54 +0800", and the pi-ai
   // Codex form "Try again in ~299 min" (audit2 #10 — the extraction must reach
   // the scheduler verbatim; parseResetHintMs understands all three shapes).
-  const reset = text.match(/(?:resets?\s+(?:in|at)|try again\s+in|available again\s+in)\s+[^.\n]+/i);
+  const reset = text.match(/(?:resets?\s+(?:in|at)|try again\s+in)\s+[^.\n]+/i);
   return { matched: true, resetHint: reset?.[0]?.trim() };
 }
 
