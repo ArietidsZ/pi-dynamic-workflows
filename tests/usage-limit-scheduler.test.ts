@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import type { PersistedRunState, RunPersistence } from "../src/run-persistence.js";
 import {
   computeAutoResumeDelayMs,
@@ -8,6 +12,8 @@ import {
   type SchedulableWorkflowManager,
   UsageLimitScheduler,
 } from "../src/usage-limit-scheduler.js";
+import { WorkflowManager } from "../src/workflow-manager.js";
+import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 // ---- test doubles -----------------------------------------------------------
 
@@ -660,4 +666,123 @@ test("attempts and opt-out are persisted (best-effort) for a future cold start",
   const persisted = manager.persistence.get("run-1");
   assert.equal(persisted?.autoResumeAttempts, 1, "attempt count persisted after the microtask flush");
   scheduler.dispose();
+});
+
+// ---- real WorkflowManager wiring (#207 regression) -----------------------------
+//
+// The fake manager above can't catch a scheduler that bypasses
+// recordAutoResumeAttempts (the fake reimplements the same merge), and never
+// exercises the real manager's non-live branch. These two tests wire a REAL
+// WorkflowManager + UsageLimitScheduler over an isolated cwd/HOME.
+
+const QUOTA_SCRIPT = `export const meta = { name: 'quota_demo', description: 'quota' }
+const a = await agent('hit the wall', { label: 'a' })
+return { a }`;
+
+function quotaAgent() {
+  return {
+    async run(): Promise<never> {
+      throw new WorkflowError(
+        "Codex usage limit reached (plus plan). Resets in ~3h.",
+        WorkflowErrorCode.PROVIDER_USAGE_LIMIT,
+        {
+          recoverable: false,
+          resetHint: "Resets in ~3h",
+        },
+      );
+    },
+  };
+}
+
+async function withRealManagerCwd(fn: (cwd: string) => Promise<void>): Promise<void> {
+  const cwd = mkdtempSync(join(tmpdir(), "pdw-sched-real-"));
+  const home = mkdtempSync(join(tmpdir(), "pdw-sched-home-"));
+  try {
+    await withFakeHomeAsync(home, () => fn(cwd));
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+test("real manager: scheduler-recorded attempts survive later manager persists (#207)", async () => {
+  await withRealManagerCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: quotaAgent() });
+    manager.on("error", () => {});
+    const clock = createFakeClock();
+    const scheduler = new UsageLimitScheduler(manager, {
+      now: clock.now,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+      ...TUNABLES,
+    });
+
+    const { runId, promise } = manager.startInBackground(QUOTA_SCRIPT);
+    await promise.catch(() => {}); // rejects with PROVIDER_USAGE_LIMIT; run pauses
+    assert.equal(manager.getRun(runId)?.status, "paused");
+    assert.equal(
+      manager.getPersistence().load(runId)?.autoResumeAttempts,
+      1,
+      "scheduler records attempt 1 through the manager",
+    );
+    assert.equal(clock.pendingCount(), 1, "auto-resume timer armed");
+
+    // The #207 erasure: any later manager persist rebuilt the record from a
+    // literal without the field. adoptLiveRunsToSession forces exactly such a
+    // persist on the live run.
+    manager.adoptLiveRunsToSession("some-other-session");
+    assert.equal(
+      manager.getPersistence().load(runId)?.autoResumeAttempts,
+      1,
+      "later manager persist keeps the counter",
+    );
+    scheduler.dispose();
+  });
+});
+
+test("real manager restart: cold-start rearm continues the backoff via the non-live path (#207)", async () => {
+  await withRealManagerCwd(async (cwd) => {
+    const managerA = new WorkflowManager({ cwd, agent: quotaAgent() });
+    managerA.on("error", () => {});
+    const clockA = createFakeClock();
+    const schedulerA = new UsageLimitScheduler(managerA, {
+      now: clockA.now,
+      setTimer: clockA.setTimer,
+      clearTimer: clockA.clearTimer,
+      ...TUNABLES,
+    });
+    const { runId, promise } = managerA.startInBackground(QUOTA_SCRIPT);
+    await promise.catch(() => {});
+    assert.equal(managerA.getPersistence().load(runId)?.autoResumeAttempts, 1);
+    schedulerA.dispose();
+
+    // Simulate a process restart: a fresh manager + scheduler over the same
+    // cwd. The paused run is disk-only for manager B, so coldStartRearm's
+    // persist goes through recordAutoResumeAttempts's non-live branch.
+    const managerB = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          return "ok";
+        },
+      },
+    });
+    managerB.on("error", () => {});
+    const clockB = createFakeClock();
+    const schedulerB = new UsageLimitScheduler(managerB, {
+      now: clockB.now,
+      setTimer: clockB.setTimer,
+      clearTimer: clockB.clearTimer,
+      ...TUNABLES,
+    });
+    await flush();
+
+    assert.equal(
+      managerB.getPersistence().load(runId)?.autoResumeAttempts,
+      2,
+      "a restart continues the backoff counter instead of resetting it",
+    );
+    assert.equal(clockB.pendingCount(), 1, "auto-resume re-armed after restart");
+    schedulerB.dispose();
+  });
 });

@@ -10,10 +10,10 @@
  * it keeps hitting the wall, and a hard attempt cap so it never retries forever.
  *
  * Deliberately standalone: it consumes ONLY WorkflowManager's public surface
- * (on/off, listAllRuns, resume, getPersistence) so it stays decoupled from
- * manager/persistence internals. It owns its own timers and its own bookkeeping
- * (in-memory, best-effort persisted) — it does not rely on manager.stop(), which
- * only operates on in-memory runs.
+ * (on/off, listAllRuns, resume, getPersistence, recordAutoResumeAttempts) so it
+ * stays decoupled from manager/persistence internals. It owns its own timers
+ * and its own bookkeeping (in-memory, best-effort persisted) — it does not
+ * rely on manager.stop(), which only operates on in-memory runs.
  */
 
 import type { PersistedRunState, RunPersistence, RunStatus } from "./run-persistence.js";
@@ -400,26 +400,19 @@ export class UsageLimitScheduler {
   /**
    * Best-effort persist of the in-memory attempt counter, so a cold start after
    * a crash can approximately resume the backoff sequence instead of restarting
-   * it. Deferred to a microtask so it lands AFTER the manager's own persistRun()
-   * write for this same pause (which happens synchronously, right after the
-   * "paused" event we're reacting to returns control to executeRun()) — writing
-   * synchronously here would just get clobbered, since persistRun() writes a
-   * fresh PersistedRunState object literal that doesn't know about this field.
-   * This is still inherently racy across process crashes (see class docs); it
-   * is a best-effort durability aid, not a correctness requirement for the live
-   * (in-memory) path.
+   * it. Goes through the manager, which owns the field: for a live run it sets
+   * ManagedRun.autoResumeAttempts so every later writeRunToDisk carries it
+   * (#207); for a disk-only run it merges the persisted record under a lease.
+   * Synchronous is safe: the manager write is atomic in-process, and the
+   * pause-settle persist that follows this event reads the live field.
    */
   private persistAttempts(runId: string, attempts: number): void {
-    queueMicrotask(() => {
-      if (this.disposed) return;
-      try {
-        // Through the manager (never a raw persistence.save) so the next
-        // manager persist cannot erase the field (#207).
-        this.manager.recordAutoResumeAttempts(runId, attempts);
-      } catch (err) {
-        this.diagnostic(`[usage-limit-scheduler] ${runId}: failed to persist autoResumeAttempts`, err);
-      }
-    });
+    if (this.disposed) return;
+    try {
+      this.manager.recordAutoResumeAttempts(runId, attempts);
+    } catch (err) {
+      this.diagnostic(`[usage-limit-scheduler] ${runId}: failed to persist autoResumeAttempts`, err);
+    }
   }
 
   private safe(fn: () => void | Promise<void>): void {

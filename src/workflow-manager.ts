@@ -702,6 +702,8 @@ export class WorkflowManager extends EventEmitter {
         startedAt: managed.startedAt.toISOString(),
         updatedAt: managed.startedAt.toISOString(),
         autoResume: managed.autoResume,
+        // autoResumeAttempts deliberately omitted: the scheduler's counter
+        // cannot exist before the run starts (ids are minted here).
         tokenBudget: managed.tokenBudget,
         toolset: managed.toolset,
         maxAgents: managed.maxAgents,
@@ -2008,8 +2010,9 @@ export class WorkflowManager extends EventEmitter {
    * Record the usage-limit scheduler's auto-resume backoff counter for a run.
    * Live runs go through the managed state (so the next persistRun carries it);
    * non-live runs (paused on disk from a prior process) merge into the
-   * persisted record directly. Never write this field via a raw
-   * persistence.save side-channel — writeRunToDisk would erase it (#207).
+   * persisted record under a run lease — skipped on contention, since the
+   * owning process then persists authoritatively. Never write this field via
+   * a raw persistence.save side-channel — writeRunToDisk would erase it (#207).
    */
   recordAutoResumeAttempts(runId: string, attempts: number): void {
     const managed = this.runs.get(runId);
@@ -2018,11 +2021,18 @@ export class WorkflowManager extends EventEmitter {
       this.persistRun(managed);
       return;
     }
-    const current = this.persistence.load(runId);
-    if (!current) return;
-    this.persistence.save({ ...current, autoResumeAttempts: attempts });
+    const lease = this.persistence.acquireRunLease(runId);
+    if (!lease) return;
+    try {
+      const current = this.persistence.load(runId);
+      if (!current) return;
+      this.persistence.save({ ...current, autoResumeAttempts: attempts });
+    } finally {
+      this.persistence.releaseRunLease(lease);
+    }
   }
 
+  /** Get the persistence layer (for saving workflows). */
   getPersistence(): RunPersistence {
     return this.persistence;
   }
