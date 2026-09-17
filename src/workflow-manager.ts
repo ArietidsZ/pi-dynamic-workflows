@@ -1600,10 +1600,68 @@ export class WorkflowManager extends EventEmitter {
    */
   async attachCheckpointResponse(runId: string, checkpointId: string, responseValue: unknown): Promise<void> {
     const response = cloneDurableJsonValue(responseValue, "checkpoint response");
+    const buildResuming = (checkpoint: NonNullable<ManagedRun["checkpoint"]>) => {
+      if (checkpoint.checkpointId !== checkpointId) {
+        throw new Error(
+          `stale checkpoint response: expected ${JSON.stringify(checkpoint.checkpointId)}, received ${JSON.stringify(checkpointId)}`,
+        );
+      }
+      if (checkpoint.status !== "waiting") {
+        if (isDeepStrictEqual(checkpoint.response, response)) return undefined;
+        throw new Error(`conflicting response for checkpoint ${JSON.stringify(checkpointId)}`);
+      }
+      return { ...checkpoint, status: "resuming" as const, response };
+    };
+
     const active = this.runs.get(runId);
     const settlingExecution = active ? this.executions.get(active) : undefined;
-    if (settlingExecution && !(await waitForPausedExecutionSettlement(settlingExecution))) {
-      throw new Error(`workflow run ${JSON.stringify(runId)} is still settling`);
+    // Settled-execution probe: a .then handler attached to an already-settled
+    // promise runs on the very next microtask, while one attached to a pending
+    // promise does not. (Promise.race can't express this — a wrapped settled
+    // entry still needs two hops.) Post-drain attaches keep the lease+disk path
+    // so resume() sees the response on disk immediately; only a genuinely
+    // draining execution takes the live-write path below.
+    let executionPending = false;
+    if (settlingExecution) {
+      let settled = false;
+      void settlingExecution.then(
+        () => (settled = true),
+        () => (settled = true),
+      );
+      await Promise.resolve();
+      executionPending = !settled;
+    }
+    if (settlingExecution && executionPending) {
+      // The suspension's sibling drain (the run is deliberately not sealed, so
+      // in-flight siblings finish and journal) can take as long as the slowest
+      // agent — far past the 1s settle guard. The draining execution's final
+      // persist happens strictly after the drain, so writing the response onto
+      // the LIVE managed record is durable: that persist carries it to disk.
+      // Attaching here keeps the documented host flow (attach, then resume on
+      // the "paused" event) usable while siblings still settle.
+      if (active && this.isCurrent(active)) {
+        if (!active.checkpoint) throw new Error("run has no durable checkpoint");
+        const next = buildResuming(active.checkpoint);
+        if (next === undefined) return;
+        active.checkpoint = next;
+        // Belt-and-suspenders: if the final persist already ran in the narrow
+        // window between drain end and execution settlement, persist again once
+        // settled so the response lands on disk either way.
+        // Runs on settle EITHER WAY — a suspended execution rejects with
+        // WorkflowCheckpointSuspensionError, and the narrow window this covers
+        // (final persist already ran, execution not yet settled) is exactly the
+        // rejection case. The caller's own promise still carries the error.
+        const persistIfStillOurs = () => {
+          if (this.runs.get(runId) === active && this.isCurrent(active) && active.checkpoint?.status === "resuming") {
+            this.persistRun(active);
+          }
+        };
+        void settlingExecution.then(persistIfStillOurs, persistIfStillOurs);
+        return;
+      }
+      if (!(await waitForPausedExecutionSettlement(settlingExecution))) {
+        throw new Error(`workflow run ${JSON.stringify(runId)} is still settling`);
+      }
     }
 
     const lease = this.persistence.acquireRunLease(runId);
@@ -1611,21 +1669,11 @@ export class WorkflowManager extends EventEmitter {
     try {
       const persisted = this.persistence.load(runId);
       if (!persisted?.checkpoint) throw new Error("run has no durable checkpoint");
-      if (persisted.checkpoint.checkpointId !== checkpointId) {
-        throw new Error(
-          `stale checkpoint response: expected ${JSON.stringify(persisted.checkpoint.checkpointId)}, received ${JSON.stringify(checkpointId)}`,
-        );
-      }
-      if (persisted.checkpoint.status !== "waiting") {
-        if (isDeepStrictEqual(persisted.checkpoint.response, response)) return;
-        throw new Error(`conflicting response for checkpoint ${JSON.stringify(checkpointId)}`);
-      }
-      this.persistence.save({
-        ...persisted,
-        checkpoint: { ...persisted.checkpoint, status: "resuming", response },
-      });
+      const next = buildResuming(persisted.checkpoint);
+      if (next === undefined) return;
+      this.persistence.save({ ...persisted, checkpoint: next });
       if (active && this.isCurrent(active)) {
-        active.checkpoint = { ...persisted.checkpoint, status: "resuming", response };
+        active.checkpoint = next;
       }
     } finally {
       this.persistence.releaseRunLease(lease);

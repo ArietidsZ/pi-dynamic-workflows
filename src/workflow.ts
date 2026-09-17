@@ -338,7 +338,9 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    * Top-level workflow error observed before runWorkflow drains in-flight agents.
    * This preserves error provenance for hosts whose own lifecycle control can race
    * with that cooperative drain. Observational only: callback failures (sync or
-   * async) are ignored.
+   * async) are ignored. A durable checkpoint suspension does NOT invoke this —
+   * an intentional human-in-the-loop pause is not a fatal error (in-flight
+   * siblings are waited out, not aborted).
    */
   onRunFatal?: (error: unknown) => void | PromiseLike<void>;
 }

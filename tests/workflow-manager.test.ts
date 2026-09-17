@@ -4768,6 +4768,13 @@ return await sibling`;
       if (logs.some((l) => l.includes("outstanding agent()"))) break;
       await new Promise((resolve) => setTimeout(resolve, 1));
     }
+    // The documented host flow (attach response, then resume on the "paused"
+    // event) must work while the drain is still running — the 1s settle guard
+    // would otherwise block attach for the slowest sibling's entire runtime.
+    // Resolves without throwing — previously this threw "still settling" after
+    // a 1s wait whenever the drain outlasted the settle guard.
+    await manager.attachCheckpointResponse(runId, "hold-1", { approved: true });
+
     slowReleased();
     await promise.catch(() => {});
     let persisted = manager.getPersistence().load(runId);
@@ -4775,6 +4782,12 @@ return await sibling`;
       await new Promise((resolve) => setTimeout(resolve, 1));
       persisted = manager.getPersistence().load(runId);
     }
+    assert.equal(
+      persisted?.checkpoint?.status,
+      "resuming",
+      "the response attached during the drain lands on disk (carried by the final persist)",
+    );
+    assert.deepEqual(persisted?.checkpoint?.response, { approved: true });
     assert.equal(persisted?.status, "paused", "run pauses at the durable checkpoint");
     assert.equal(persisted?.checkpoint?.checkpointId, "hold-1");
     assert.ok(
