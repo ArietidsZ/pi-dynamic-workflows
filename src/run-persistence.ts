@@ -250,9 +250,15 @@ const PERSISTED_AGENT_STATUSES = [
   "skipped",
 ] as const satisfies readonly PersistedAgentState["status"][];
 
-/** Every status a persisted agent row may validly carry — compile-time linked
- * to PersistedAgentState["status"] via the satisfies array above, so a new
- * union member fails type-check here instead of being silently dropped. */
+// Exhaustiveness: adding a member to PersistedAgentState["status"] without
+// listing it above fails to compile HERE (Exclude yields a non-never).
+type AssertNever<T extends never> = T;
+export type _PersistedAgentStatusExhaustiveCheck = AssertNever<
+  Exclude<PersistedAgentState["status"], (typeof PERSISTED_AGENT_STATUSES)[number]>
+>;
+
+/** Every status a persisted agent row may validly carry — exhaustively
+ * checked against PersistedAgentState["status"] by the assertion above. */
 export const VALID_PERSISTED_AGENT_STATUSES: ReadonlySet<PersistedAgentState["status"]> = new Set(
   PERSISTED_AGENT_STATUSES,
 );

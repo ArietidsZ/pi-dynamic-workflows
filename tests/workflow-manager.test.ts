@@ -4884,6 +4884,21 @@ test(
         { id: 55, status: "done", label: "ok", prompt: 42 }, // non-string prompt
         { id: 56, status: "done", label: 42, prompt: "ok" }, // non-string label
         {
+          id: 57,
+          callId: 42, // non-string callId: dropped from the seeded row
+          label: "c",
+          prompt: "third",
+          status: "done",
+        },
+        {
+          id: 58,
+          callId: "corrupt-run:9",
+          label: "d",
+          prompt: "fourth",
+          status: "skipped",
+          endedAt: "2026-01-01T00:00:07.000Z", // endedAt-only terminal row: must survive seeding
+        },
+        {
           id: 6,
           callId: "corrupt-run:0",
           label: "a",
@@ -4907,6 +4922,7 @@ test(
           prompt: "second",
           status: "running",
           startedAt: "2026-01-01T00:00:06.000Z",
+          error: "stale-context", // a ghost's prior error field is overwritten by the interrupt cause
         },
       ] as unknown as PersistedAgentState[],
       logs: [],
@@ -4925,11 +4941,16 @@ test(
       assert.equal(typeof row.label, "string", "no label-less garbage row persisted");
       assert.equal(typeof row.prompt, "string", "no prompt-less garbage row persisted");
       assert.match(row.status, /^(queued|running|done|error|skipped)$/);
+      assert.ok(row.callId === undefined || typeof row.callId === "string", "no non-string callId re-persisted");
     }
-    // Seeded: the valid done row + the valid ghost (settled skipped); with no
-    // journal in this fixture BOTH script calls re-execute live, appending one
-    // row each (mirroring the legacy-record ghost test above).
-    assert.equal(persisted?.agents.length, 4);
+    const settledGhost = persisted?.agents.find((a) => a.prompt === "second" && a.status === "skipped");
+    assert.equal(settledGhost?.error, "interrupted", "the ghost's stale error is overwritten by the interrupt cause");
+    const endedOnly = persisted?.agents.find((a) => a.prompt === "fourth");
+    assert.equal(endedOnly?.endedAt, "2026-01-01T00:00:07.000Z", "an endedAt-only terminal row keeps its timestamp");
+    // Seeded: valid done rows ("first", "third") + the valid ghost (settled
+    // skipped); with no journal in this fixture the script's two calls
+    // re-execute live, appending one row each.
+    assert.equal(persisted?.agents.length, 6);
   }),
 );
 
@@ -4943,7 +4964,7 @@ test(
     const seen: string[] = [];
     const state = { agent2Attempts: 0 };
     let markAgent2Started: () => void = () => {};
-    let agent2Started = new Promise<void>((resolve) => {
+    const agent2Started = new Promise<void>((resolve) => {
       markAgent2Started = resolve;
     });
     const runner = {
@@ -5051,6 +5072,9 @@ test(
     }
     const persisted = manager.getPersistence().load("corrupt-shape-run");
     assert.equal(persisted?.status, "completed");
+    for (const entry of persisted?.journal ?? []) {
+      assert.equal(typeof entry?.index, "number", "no index-less journal entry survives re-persist");
+    }
     // No phantom/lease leak: the run is terminal and deletable.
     assert.equal(manager.deleteRun("corrupt-shape-run"), true);
   }),
@@ -5158,6 +5182,123 @@ test(
     assert.ok(
       Date.parse(ghost.endedAt ?? "") >= Date.parse("2027-06-01T00:00:00.000Z"),
       "settle wall-clock clamped to the record's last write",
+    );
+  }),
+);
+
+test(
+  "a replayed call on a terminal row with no timestamps still keeps its seeded tokens (#206)",
+  withTempCwd(async (cwd) => {
+    // Pins the UNCONDITIONAL replay arm: with no seeded timestamp for the call,
+    // a conditional (`priorTimestamp`-gated) arm would let onAgentEnd take the
+    // live branch and overwrite the row's tokens with the replay's 0.
+    const hangManager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string, options?: { signal?: AbortSignal }) {
+          if (prompt === "second") {
+            await new Promise<void>((_resolve, reject) => {
+              options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+            });
+          }
+          return `ran:${prompt}`;
+        },
+      },
+    });
+    hangManager.on("error", () => {});
+    const { runId, promise } = hangManager.startInBackground(twoAgentScript);
+    promise.catch(() => {});
+    for (let i = 0; i < 2000; i++) {
+      const row = hangManager.getRun(runId)?.snapshot.agents.find((a) => a.prompt === "second");
+      if (row?.status === "running") break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(hangManager.pause(runId), true);
+    await promise.catch(() => {});
+
+    // Corrupt the journaled row into a terminal row with NO timestamps.
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    manager.on("error", () => {});
+    const record = manager.getPersistence().load(runId);
+    assert.ok(record);
+    record.agents = record.agents.map((a) =>
+      a.prompt === "first"
+        ? {
+            id: a.id,
+            callId: a.callId,
+            label: a.label,
+            prompt: a.prompt,
+            status: "done" as const,
+            resultPreview: a.resultPreview,
+            tokens: 15,
+          }
+        : a,
+    );
+    manager.getPersistence().save(record);
+
+    assert.equal(await manager.resume(runId), true);
+    for (let i = 0; i < 2000 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    const persisted = manager.getPersistence().load(runId);
+    const replayed = persisted?.agents.find((a) => a.prompt === "first");
+    assert.equal(replayed?.status, "done");
+    assert.equal(replayed?.tokens, 15, "the replay arm is unconditional — seeded tokens survive a timestamp-less row");
+  }),
+);
+
+test(
+  "the empty-fleet warning considers only the current execution, not seeded history (#206)",
+  withTempCwd(async (cwd) => {
+    // Paused record whose done row belongs to a call the EDITED script no
+    // longer makes (no journal hit): every live call returns empty → the
+    // all-null warning must still fire; the seeded done row is history.
+    const scriptV1 = `export const meta = { name: 'fleet_demo', description: 'x' }
+await agent('OLD-A')
+await agent('OLD-B')`;
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          return "";
+        },
+      },
+    });
+    manager.on("error", () => {});
+    manager.getPersistence().save({
+      runId: "fleet-run",
+      workflowName: "fleet_demo",
+      script: scriptV1,
+      status: "paused",
+      phases: [],
+      agents: [
+        {
+          id: 1,
+          callId: "fleet-run:0",
+          label: "a",
+          prompt: "OLD-A",
+          status: "done",
+          resultPreview: "usable",
+          startedAt: "2026-01-01T00:00:00.000Z",
+          endedAt: "2026-01-01T00:00:05.000Z",
+        },
+      ],
+      logs: [],
+      startedAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:10.000Z",
+    });
+
+    const scriptV2 = `export const meta = { name: 'fleet_demo', description: 'x' }
+await agent('NEW-A')
+await agent('NEW-B')`;
+    assert.equal(await manager.resume("fleet-run", { script: scriptV2 }), true);
+    for (let i = 0; i < 2000 && manager.getRun("fleet-run")?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    const logs = manager.getRun("fleet-run")?.snapshot.logs ?? manager.getPersistence().load("fleet-run")?.logs ?? [];
+    assert.ok(
+      logs.some((l) => l.includes("no usable results")),
+      "stale seeded history must not suppress the all-empty warning",
     );
   }),
 );

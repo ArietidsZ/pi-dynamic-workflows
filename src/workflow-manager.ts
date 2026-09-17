@@ -185,6 +185,11 @@ export interface ManagedRun {
   replayedAgentStatesByCallId: Map<string, PersistedAgentState>;
   /** Timestamps carried into replayed snapshot entries. */
   agentTimestampsByCallId: Map<string, { startedAt: string; endedAt?: string }>;
+  /** Rows seeded from the persisted record at resume (#206): snapshot ids
+   * 1..seededAgentCount are history; anything above ran (or was appended) in
+   * this execution. Used to scope completion diagnostics to the current
+   * execution rather than preserved history. */
+  seededAgentCount?: number;
   /** Calls whose onAgentStart/onAgentEnd pair was journal replay, not a launch. */
   replayedAgentCalls: Set<string>;
   /**
@@ -1124,7 +1129,16 @@ export class WorkflowManager extends EventEmitter {
       // completed branch. Surface it loudly so an all-null result can't
       // masquerade as a successful fleet (the single per-agent log line is easy
       // to miss under concurrency). Emitted before the "complete" event.
-      const fleet = emptyFleetSummary(managed.snapshot.agents);
+      // Scope to THIS execution: rows seeded from the persisted record at
+      // resume are history (#206) — a stale done row must not suppress the
+      // all-empty warning when every live/replayed call returned null.
+      const fleet = emptyFleetSummary(
+        managed.snapshot.agents.filter(
+          (agent) =>
+            agent.id > (managed.seededAgentCount ?? 0) ||
+            (agent.callId !== undefined && managed.replayedAgentCalls.has(agent.callId)),
+        ),
+      );
       if (fleet.allEmpty) {
         const labels = fleet.emptyLabels.join(", ");
         const overflow =
@@ -1791,12 +1805,17 @@ export class WorkflowManager extends EventEmitter {
         ? { startedAt, endedAt: endedAt ?? (ghost ? settledAt : undefined) }
         : ghost
           ? { startedAt: settledAt, endedAt: settledAt }
-          : undefined;
+          : // Terminal row with only an endedAt (the codebase's own settle paths
+            // produce these): keep it, anchored as both ends, rather than
+            // dropping the only timing provenance the record has.
+            endedAt
+            ? { startedAt: endedAt, endedAt }
+            : undefined;
       if (callId !== undefined) {
         // Duplicate callIds: the LAST row wins, matching the onAgentStart
         // reverse-scan "latest row is the most recent execution" rule — even
-        // when that last row has no usable timestamps (delete stale earlier
-        // entries instead of leaving them to mis-arm the replay path).
+        // when that last row has no usable timestamps (delete the stale entry:
+        // the replay must not borrow a DIFFERENT execution's timestamps).
         if (rowTimestamps) seededTimestampsByCallId.set(callId, rowTimestamps);
         else seededTimestampsByCallId.delete(callId);
       }
@@ -1914,6 +1933,7 @@ export class WorkflowManager extends EventEmitter {
           .map((agent) => [agent.callId as string, agent] as const),
       ),
       agentTimestampsByCallId: seededTimestampsByCallId,
+      seededAgentCount: seededAgents.length,
       replayedAgentCalls: new Set(),
     };
     this.runs.set(runId, managed);
