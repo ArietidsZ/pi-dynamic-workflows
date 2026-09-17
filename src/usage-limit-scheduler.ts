@@ -204,9 +204,12 @@ export function computeAutoResumeDelayMs(params: AutoResumeDelayParams): number 
   const jittered = jr > 0 ? backoff * (1 - jr + rand() * 2 * jr) : backoff;
   const clamped = Math.min(params.maxDelayMs, Math.max(params.minDelayMs, jittered));
   // A clamped-to-ceiling delay is identical for every run paused by the same
-  // quota event (the herd audit2 #13 targets): spread it downward-only, which
-  // keeps the ceiling intact while decorrelating the arms.
-  if (jr > 0 && clamped === params.maxDelayMs && backoff > params.maxDelayMs) {
+  // quota event (the herd audit2 #13 targets): whenever the JITTERED value
+  // reaches the cap (backoff exactly at the cap included — its upper jitter
+  // half would otherwise pile up as a point mass), spread it downward-only,
+  // keeping the ceiling intact while decorrelating the arms. Ceiling hits draw
+  // a second random sample; sub-ceiling arms use exactly one.
+  if (jr > 0 && jittered >= params.maxDelayMs) {
     return Math.max(params.minDelayMs, Math.round(params.maxDelayMs * (1 - jr * rand())));
   }
   return Math.round(clamped);

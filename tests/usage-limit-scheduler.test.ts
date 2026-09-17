@@ -297,6 +297,29 @@ test("scheduler-level: jitter never arms above maxDelayMs, and ceiling-hit delay
   scheduler.dispose();
 });
 
+test("jitter: a backoff exactly AT the cap still spreads (no point mass at maxDelayMs)", () => {
+  const delays = new Set<number>();
+  for (const sample of [0, 0.25, 0.5, 0.75, 0.999999]) {
+    delays.add(
+      computeAutoResumeDelayMs({
+        resetHint: "resets in 1h",
+        attempts: 1,
+        elapsedMs: 0,
+        minDelayMs: 60_000,
+        fallbackDelayMs: 300_000,
+        maxDelayMs: 3_600_000, // backoff == cap exactly
+        jitterRatio: 0.1,
+        random: () => sample,
+      }),
+    );
+  }
+  assert.ok(
+    [...delays].every((d) => d <= 3_600_000),
+    "ceiling holds in every sample",
+  );
+  assert.ok(delays.size > 1, "same-cap cohorts decorrelate instead of piling onto maxDelayMs");
+});
+
 test("jitter spreads identical arms deterministically with an injected random (audit2 #13)", () => {
   const manager = new FakeManager();
   manager.persistence.seed(makeRun({ resetHint: "resets in 10m" }));
@@ -986,6 +1009,7 @@ test("real manager restart: cold-start rearm continues the backoff via the non-l
       },
     });
     managerB.on("error", () => {});
+    const updatedAtBeforeRestart = managerB.getPersistence().load(runId)?.updatedAt;
     const clockB = createFakeClock();
     const schedulerB = new UsageLimitScheduler(managerB, {
       now: clockB.now,
@@ -995,15 +1019,15 @@ test("real manager restart: cold-start rearm continues the backoff via the non-l
     });
     await flush();
 
-    const persistedBefore = managerB.getPersistence().load(runId);
+    const persistedAfter = managerB.getPersistence().load(runId);
     assert.equal(
-      persistedBefore?.autoResumeAttempts,
+      persistedAfter?.autoResumeAttempts,
       1,
       "a restart re-arms the already-counted attempt — it does not burn the give-up budget (audit2 #11)",
     );
     assert.equal(
-      persistedBefore?.updatedAt,
-      managerA.getPersistence().load(runId)?.updatedAt,
+      persistedAfter?.updatedAt,
+      updatedAtBeforeRestart,
       "the equal-value re-persist is skipped by the real manager's non-live guard (audit2 #15, r2 R5)",
     );
     assert.equal(clockB.pendingCount(), 1, "auto-resume re-armed after restart");
