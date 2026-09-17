@@ -4721,3 +4721,65 @@ test(
     assert.equal(statusRow?.cacheRead, 0);
   }),
 );
+
+test(
+  "a durable checkpoint suspension waits out in-flight siblings instead of aborting them (audit2 #2)",
+  withTempCwd(async (cwd) => {
+    let slowReleased: () => void = () => {};
+    const slowCanFinish = new Promise<void>((resolve) => {
+      slowReleased = resolve;
+    });
+    let slowStarted: () => void = () => {};
+    const slowRunning = new Promise<void>((resolve) => {
+      slowStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          if (prompt === "slow-sibling") {
+            slowStarted();
+            await slowCanFinish; // still in flight when the checkpoint fires
+            return "slow-done";
+          }
+          return "ok";
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'cp_sibling', description: 'checkpoint with sibling' }
+const sibling = agent('slow-sibling', { label: 'slow' })
+await checkpoint({ kind: 'hold', checkpointId: 'hold-1', payload: {} })
+return await sibling`;
+    const { runId, promise } = manager.startInBackground(script);
+    promise.catch(() => {});
+    await slowRunning;
+    // Wait for the checkpoint suspension to pause the run while the sibling is mid-flight.
+    for (let i = 0; i < 2000; i++) {
+      if (manager.getRun(runId)?.status === "paused") break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    // The sibling must NOT have been aborted by the suspension. Release it only
+    // after the top-level drain begins (its "waiting for N outstanding" log) —
+    // the run-fatal seal (if wrongly fired) happens strictly before the drain,
+    // so this ordering makes the seal's effect deterministic.
+    for (let i = 0; i < 2000; i++) {
+      const logs = manager.getRun(runId)?.snapshot.logs ?? [];
+      if (logs.some((l) => l.includes("outstanding agent()"))) break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    slowReleased();
+    await promise.catch(() => {});
+    let persisted = manager.getPersistence().load(runId);
+    for (let i = 0; i < 2000 && !persisted?.journal?.some((entry) => entry.result === "slow-done"); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      persisted = manager.getPersistence().load(runId);
+    }
+    assert.equal(persisted?.status, "paused", "run pauses at the durable checkpoint");
+    assert.equal(persisted?.checkpoint?.checkpointId, "hold-1");
+    assert.ok(
+      persisted?.journal?.some((entry) => entry.result === "slow-done"),
+      "the in-flight sibling completed and journaled — not aborted by the suspension",
+    );
+  }),
+);
