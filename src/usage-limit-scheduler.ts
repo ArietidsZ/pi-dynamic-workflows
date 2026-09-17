@@ -22,6 +22,7 @@
  */
 
 import type { PersistedRunState, RunPersistence, RunStatus } from "./run-persistence.js";
+import { sanitizeAutoResumeAttempts } from "./run-persistence.js";
 
 /** Narrow surface this scheduler depends on — satisfied by WorkflowManager. */
 export interface SchedulableWorkflowManager {
@@ -247,12 +248,8 @@ export class UsageLimitScheduler {
 
     // Validate the persisted counter too (corrupt/foreign JSON): an invalid
     // value would defeat the give-up cap and produce NaN timer delays.
-    const diskAttempts = persisted?.autoResumeAttempts;
-    const validDiskAttempts =
-      typeof diskAttempts === "number" && Number.isFinite(diskAttempts) && diskAttempts >= 0
-        ? diskAttempts
-        : 0;
-    const priorAttempts = this.state.get(runId)?.attempts ?? validDiskAttempts;
+    const priorAttempts =
+      this.state.get(runId)?.attempts ?? sanitizeAutoResumeAttempts(persisted?.autoResumeAttempts) ?? 0;
     this.arm(runId, {
       attempts: priorAttempts + 1,
       resetHint: event.resetHint ?? persisted?.resetHint,
@@ -291,11 +288,7 @@ export class UsageLimitScheduler {
 
       // Validate the persisted counter: a corrupt/foreign value (NaN, string,
       // negative) would defeat the give-up cap and produce NaN timer delays.
-      const persistedAttempts = run.autoResumeAttempts;
-      const priorAttempts =
-        typeof persistedAttempts === "number" && Number.isFinite(persistedAttempts) && persistedAttempts >= 0
-          ? persistedAttempts
-          : 0;
+      const priorAttempts = sanitizeAutoResumeAttempts(run.autoResumeAttempts) ?? 0;
       const updatedAtMs = Date.parse(run.updatedAt);
       const elapsedMs = Number.isFinite(updatedAtMs) ? Math.max(0, this.now() - updatedAtMs) : 0;
       this.arm(run.runId, {

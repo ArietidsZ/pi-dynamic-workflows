@@ -4806,7 +4806,14 @@ test(
     await promise.catch(() => {}); // settle → this manager releases its run lease
 
     // Cold start: a fresh manager on the same cwd does not manage the run.
-    const restarted = new WorkflowManager({ cwd, agent: { async run() { return "ok"; } } });
+    const restarted = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          return "ok";
+        },
+      },
+    });
     restarted.on("error", () => {});
     assert.equal(restarted.getRun(runId), undefined);
 
@@ -4829,5 +4836,43 @@ test(
       undefined,
       "contended merge skipped — the owning process persists authoritatively",
     );
+  }),
+);
+
+test(
+  "recordAutoResumeAttempts rejects corrupt counter values (#207)",
+  withTempCwd(async (cwd) => {
+    let markStarted: () => void = () => {};
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(_prompt, options) {
+          markStarted();
+          await new Promise<void>((_resolve, reject) => {
+            options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+          });
+          return "unreachable";
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    promise.catch(() => {});
+    await started;
+    assert.equal(manager.pause(runId), true);
+
+    for (const corrupt of [Number.NaN, -1, 0.5, Number.POSITIVE_INFINITY]) {
+      manager.recordAutoResumeAttempts(runId, corrupt);
+      assert.equal(
+        manager.getPersistence().load(runId)?.autoResumeAttempts,
+        undefined,
+        `corrupt value ${corrupt} never reaches the record`,
+      );
+    }
+    manager.recordAutoResumeAttempts(runId, 2);
+    assert.equal(manager.getPersistence().load(runId)?.autoResumeAttempts, 2, "valid values still record");
   }),
 );

@@ -785,3 +785,48 @@ test("real manager restart: cold-start rearm continues the backoff via the non-l
     schedulerB.dispose();
   });
 });
+
+test("cold-start rearm sanitizes a corrupt persisted attempt counter (#207)", () => {
+  const manager = new FakeManager();
+  manager.persistence.seed(
+    makeRun({
+      runId: "run-corrupt",
+      status: "paused",
+      pauseReason: "usage_limit",
+      autoResumeAttempts: "oops" as unknown as number,
+      updatedAt: new Date().toISOString(),
+    }),
+  );
+  const clock = createFakeClock();
+  const scheduler = new UsageLimitScheduler(manager, {
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    ...TUNABLES,
+  });
+
+  assert.equal(manager.persistence.get("run-corrupt")?.autoResumeAttempts, 1, "corrupt counter restarts at attempt 1");
+  assert.ok(
+    clock.pendingDelays().every((d) => Number.isFinite(d)),
+    "no NaN delay from a corrupt counter",
+  );
+  scheduler.dispose();
+});
+
+test("a live pause sanitizes a corrupt disk counter (#207)", () => {
+  const manager = new FakeManager();
+  manager.persistence.seed(makeRun({ runId: "run-1", autoResumeAttempts: -2 as unknown as number }));
+  const clock = createFakeClock();
+  const scheduler = new UsageLimitScheduler(manager, {
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    ...TUNABLES,
+  });
+
+  manager.emit("paused", { runId: "run-1", reason: "usage_limit", resetHint: "resets in 10m" });
+
+  assert.equal(manager.persistence.get("run-1")?.autoResumeAttempts, 1);
+  assert.ok(clock.pendingDelays().every((d) => Number.isFinite(d)));
+  scheduler.dispose();
+});

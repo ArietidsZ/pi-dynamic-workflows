@@ -27,6 +27,7 @@ import {
   type RunLease,
   type RunPersistence,
   type RunStatus,
+  sanitizeAutoResumeAttempts,
   settleInterruptedPersistedAgents,
   settleNonTerminalPersistedAgents,
   terminalRunInterruptCause,
@@ -2014,7 +2015,7 @@ export class WorkflowManager extends EventEmitter {
   recordAutoResumeAttempts(runId: string, attempts: number): void {
     // A corrupt/foreign value must never reach the record: NaN/negative would
     // defeat the scheduler's give-up cap and produce NaN timer delays.
-    if (!Number.isFinite(attempts) || attempts < 0) return;
+    if (sanitizeAutoResumeAttempts(attempts) === undefined) return;
     const managed = this.runs.get(runId);
     if (managed) {
       managed.autoResumeAttempts = attempts;
