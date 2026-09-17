@@ -132,7 +132,9 @@ export function fmtTokenCount(fresh: number, cacheRead: number, fmt: (n: number)
  * Like {@link fmtTokenCount}, but "" when nothing is known yet (both figures 0),
  * so surfaces omit the segment instead of rendering a false "0 tok" — e.g. for a
  * journal-replayed resume or a run whose agents were all skipped. Every surface
- * should use this rather than re-implementing the zero guard.
+ * should use this rather than re-implementing the zero guard. When
+ * `figures.estimated` is set the segment is prefixed with `~` (#209) so a
+ * heuristic-derived total never renders as metered.
  */
 export function fmtTokenSegment(
   figures: { fresh: number; cacheRead: number; estimated: boolean },
