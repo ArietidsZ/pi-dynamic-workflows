@@ -4865,7 +4865,7 @@ test(
     const manager = new WorkflowManager({
       cwd,
       agent: {
-        async run(prompt: string) {
+        async run(_prompt: string) {
           if (limitActive) {
             throw new WorkflowError(
               "Codex usage limit reached. Resets in ~3h.",

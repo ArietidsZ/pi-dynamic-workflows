@@ -1594,8 +1594,8 @@ export class WorkflowManager extends EventEmitter {
    *
    * While the suspended execution is still draining its in-flight siblings (the
    * run is deliberately not sealed), the response is written through the LIVE
-   * managed record — the draining execution owns the lease and carries the
-   * response in its final persist — so attach works immediately instead of
+   * managed record with a fail-closed persist (the manager owns this run's
+   * lease via the draining execution) — so attach works immediately instead of
    * blocking on the 1s settle guard. resume() still refuses until the drain
    * settles; hosts should attach first and resume on the "paused" event (the
    * documented flow).
