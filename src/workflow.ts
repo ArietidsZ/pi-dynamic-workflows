@@ -1634,6 +1634,10 @@ export async function runWorkflow<T = unknown>(
 
   const wrapped = `${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`;
   let runSucceeded = false;
+  // The returned object is captured so the finally can refresh its tokenUsage
+  // AFTER the drain — agents settling during the drain commit usage last, and
+  // the result payload must reflect the true final total (audit2 #5).
+  let successResult: WorkflowRunResult<T> | undefined;
   try {
     const result = await new vm.Script(wrapped, { filename: `${meta.name || "workflow"}.js` }).runInContext(context);
     // Even a script-level catch must not convert an accepted durable pause to
@@ -1647,7 +1651,7 @@ export async function runWorkflow<T = unknown>(
     }
 
     runSucceeded = true;
-    return {
+    successResult = {
       meta,
       result: result as T,
       logs: state.logs,
@@ -1657,6 +1661,7 @@ export async function runWorkflow<T = unknown>(
       runId,
       tokenUsage: shared.tokenUsage,
     };
+    return successResult;
   } catch (error) {
     // This error just escaped THIS frame's own vm script execution completely
     // uncaught. For the top-level frame that means nothing anywhere in the
@@ -1732,11 +1737,16 @@ export async function runWorkflow<T = unknown>(
       // Success path only — error/abort accounting is owned by the catch
       // paths (e.g. the provisional-usage rollback), and firing here would
       // clobber their deliberately-empty records.
-      try {
-        if (runSucceeded) options.onTokenUsage?.(shared.tokenUsage);
-      } catch {
-        // Instrumentation must never break teardown (dispose below) or mask the
-        // run's own outcome.
+      if (runSucceeded) {
+        // Refresh the result payload to the post-drain totals too — it was
+        // captured before the drain (audit2 #5's result-payload half).
+        if (successResult) successResult.tokenUsage = { ...shared.tokenUsage };
+        try {
+          options.onTokenUsage?.(shared.tokenUsage);
+        } catch {
+          // Instrumentation must never break teardown (dispose below) or mask
+          // the run's own outcome.
+        }
       }
       store.dispose();
     }
