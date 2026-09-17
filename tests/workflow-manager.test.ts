@@ -4792,3 +4792,35 @@ test(
     assert.equal(statusRow?.cacheRead, 0);
   }),
 );
+
+test(
+  "an exact commit merging onto an estimated aggregate keeps the run flagged — no pause involved (#209)",
+  withTempCwd(async (cwd) => {
+    // Directly pins commitFinalizedAgentUsage's prior-flag merge (mutation:
+    // dropping `estimated: prior.estimated` there must fail this test).
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt, options) {
+          if (prompt === "first") return "a-done"; // no onUsage: fallback estimate
+          options?.onUsage?.({ input: 40, output: 2, cacheRead: 0, cacheWrite: 0, total: 42, cost: 0.01 });
+          return "b-done";
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(twoAgentScript);
+    const result = await promise;
+    assert.ok(result);
+    assert.equal(
+      manager.getRun(runId)?.snapshot.tokenUsage?.estimated,
+      true,
+      "the live aggregate stays flagged after an exact commit lands on an estimated one",
+    );
+    assert.equal(
+      manager.getPersistence().load(runId)?.tokenUsage?.estimated,
+      true,
+      "the terminal persist keeps the flag",
+    );
+  }),
+);

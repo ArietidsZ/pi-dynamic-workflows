@@ -339,3 +339,22 @@ test("status marks heuristic-estimated token totals with ~ and a details flag (#
   assert.match(text(status), /tokens=~200$/, "a char-heuristic total never renders as metered");
   assert.equal((status.details.run as { tokenTotalEstimated: boolean }).tokenTotalEstimated, true);
 });
+
+test("status marks a LIVE snapshot's estimated totals with ~ (#209)", async () => {
+  const live: WorkflowSnapshot = {
+    name: "audit",
+    phases: ["Inspect"],
+    currentPhase: "Inspect",
+    logs: [],
+    agents: [],
+    agentCount: 1,
+    runningCount: 1,
+    doneCount: 0,
+    errorCount: 0,
+    tokenUsage: { input: 0, output: 0, total: 640, estimated: true },
+  } as WorkflowSnapshot;
+  const { manager } = fakeManager([run("running")], { "audit-abc123": live });
+  const status = await execute(manager, { action: "status", runId: "audit-abc123" });
+  assert.match(text(status), /tokens=~640$/, "the live-usage branch carries the flag");
+  assert.equal((status.details.run as { tokenTotalEstimated: boolean }).tokenTotalEstimated, true);
+});

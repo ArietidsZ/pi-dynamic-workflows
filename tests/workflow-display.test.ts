@@ -946,7 +946,7 @@ describe("fmtTokenSegment estimate marking (#209)", () => {
     assert.equal(fmtTokenSegment({ fresh: 1200, cacheRead: 0, estimated: true }, fmtFull), "~1,200 tok");
     assert.equal(fmtTokenSegment({ fresh: 1200, cacheRead: 300, estimated: true }, fmtFull), "~1,200 tok · 300 cached");
     assert.equal(
-      fmtTokenSegment({ fresh: 1200, cacheRead: 0 }, fmtFull),
+      fmtTokenSegment({ fresh: 1200, cacheRead: 0, estimated: false }, fmtFull),
       "1,200 tok",
       "metered figures render unprefixed",
     );

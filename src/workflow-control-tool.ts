@@ -65,7 +65,7 @@ export interface WorkflowControlRunDetails {
   activeLabels: string[];
   tokenTotal: number;
   /** True when tokenTotal includes character-heuristic estimates (#209). */
-  tokenTotalEstimated: boolean;
+  tokenTotalEstimated?: boolean;
 }
 
 type ControlResult = {

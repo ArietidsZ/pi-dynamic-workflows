@@ -1672,11 +1672,13 @@ test("NavigatorModel carries the estimate flag onto run and phase rows (#209)", 
     getRun: (id) => {
       const run = base.getRun(id);
       if (!run) return run;
-      // The run aggregate itself is heuristic-derived (and one agent's too):
-      // the aggregate wins the row's size comparison, so its flag must show.
+      // One agent's figures are heuristic-derived; the run aggregate is
+      // metered but SMALLER, so the flagged agent sum wins the row's size
+      // comparison — the row flag must come from the CHOSEN (displayed)
+      // source, not blanket-ORed from the aggregate.
       const snapshot = {
         ...run.snapshot,
-        tokenUsage: { input: 0, output: 0, total: 1050, cost: 0, cacheRead: 900, cacheWrite: 0, estimated: true },
+        tokenUsage: { input: 0, output: 0, total: 100, cost: 0, cacheRead: 0, cacheWrite: 0 },
         agents: run.snapshot.agents.map((a, i) =>
           i === 0
             ? {
@@ -1700,4 +1702,13 @@ test("NavigatorModel carries the estimate flag onto run and phase rows (#209)", 
   const model = new NavigatorModel(manager);
   assert.equal(model.runs()[0]?.estimated, true, "run row flags estimate-derived figures");
   assert.equal(model.phases("run-1")[0]?.estimated, true, "phase row flags estimate-derived figures");
+
+  // The two-pane header ORs its phase flags into the header's ~ marker.
+  // Phase/agent rows render the same flag alongside the header, so a broken
+  // OR is masked in full renders; the row-level flags are pinned above and
+  // fmtTokenSegment's ~ is pinned in workflow-display.test.ts.
+  const state = new NavigatorState();
+  assert.ok(state.drill(model), "drill into phases");
+  const header = renderNavigator(state, model, 80).join("\n");
+  assert.match(header, /~\d/, "header marks estimate-derived totals with ~");
 });
