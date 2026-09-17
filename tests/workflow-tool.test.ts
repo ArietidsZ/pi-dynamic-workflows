@@ -681,7 +681,7 @@ return 'never reaches agents'`;
 );
 
 test(
-  "workflow tool: the abort path renders the latest coalesced progress frame (audit2 r1 m2)",
+  "workflow tool: the non-abort error path renders the latest coalesced progress frame (audit2 r1 m2)",
   withToolTempCwd(async (cwd) => {
     const manager = new WorkflowManager({
       cwd,

@@ -302,7 +302,10 @@ export function renderWorkflowLines(
   // A non-positive cap falls back to the default (mirrors clampMaxAgents in
   // the task panel): slice(-0) === slice(0) would otherwise render ALL agents
   // (audit2 #31).
-  const maxAgents = options.maxAgents !== undefined && options.maxAgents > 0 ? options.maxAgents : 8;
+  // Math.floor: a fractional cap like 0.5 would pass the >0 guard yet
+  // slice(-0.5) → slice(0) renders ALL agents — same bug class as #31.
+  const maxAgents =
+    options.maxAgents !== undefined && options.maxAgents > 0 ? Math.max(1, Math.floor(options.maxAgents)) : 8;
   const showResultPreviews = options.showResultPreviews ?? false;
   const state =
     snapshot.errorCount > 0

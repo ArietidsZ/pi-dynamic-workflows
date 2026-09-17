@@ -658,6 +658,11 @@ export class NavigatorState {
     top.cursor = snapshot.items.length ? Math.max(0, Math.min(top.cursor, snapshot.items.length - 1)) : 0;
     if (snapshot.items.length) top.selected = snapshot.items[top.cursor]?.identity;
   }
+  /**
+   * @deprecated No-op kept for source compatibility: manager events no longer
+   * cancel confirmations (audit2 #22) and the render frame reconciles.
+   */
+  noteManagerEvent(_snapshot: NavigatorSnapshot): void {}
   currentItem(snapshot: NavigatorSnapshot): VisibleNavigatorItem | undefined {
     this.reconcile(snapshot);
     return snapshot.items.find((item) => sameIdentity(this.top().selected, item.identity));

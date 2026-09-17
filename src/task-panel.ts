@@ -380,12 +380,12 @@ export function sessionFileContainsEntry(path: string, entry: object): boolean {
     // offset (with a needle-length overlap) instead of offset 0. On a tail
     // miss, fall back to one head scan: an entry can precede the cached offset
     // when two deliveries interleave.
-    // - needle.length (NOT +1): the cached offset is one past the last scanned
-    // byte, and a needle straddling it can start at offset-1 — the tail window
-    // must be at least needle.length+1 bytes or a repeat check for an
-    // already-present entry always misses the tail and degenerates to a full
-    // head scan (r1 M1). An entry followed by later writes still falls back to
-    // one head scan — acceptable.
+    // - needle.length (NOT needle.length-1): the cached offset is one past
+    // the last scanned byte and a needle straddling it can start at offset-1,
+    // so the tail window must span needle.length bytes from resumeFrom. One
+    // byte narrower and a repeat check for an already-present entry always
+    // misses the tail and degenerates to a full head scan (r1 M1). An entry
+    // followed by later writes still falls back to one head scan — acceptable.
     const resumeFrom = Math.max(0, (sessionScanOffsets.get(path) ?? 0) - needle.length);
     const foundInTail = scanRegion(fd, needle, resumeFrom);
     const end = lseekEnd(fd);
@@ -401,7 +401,8 @@ export function sessionFileContainsEntry(path: string, entry: object): boolean {
 }
 
 /** Last fully-scanned byte offset per session file (append-only). Bounded:
- * one entry per touched session file; FIFO-evicted past 128. */
+ * one entry per touched session file; LRU-evicted past 128 (delete+set on
+ * every hit keeps the ACK hot path's entries resident). */
 const sessionScanOffsets = new Map<string, number>();
 const SESSION_SCAN_OFFSETS_CAP = 128;
 
