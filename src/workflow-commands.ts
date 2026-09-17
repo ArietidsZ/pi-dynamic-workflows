@@ -74,7 +74,7 @@ function watchRun(manager: WorkflowManager, pi: ExtensionAPI, ctx: ExtensionComm
   };
   let settled = false;
   const progressEvents = ["agentStart", "agentEnd", "phase", "log", "tokenUsage"];
-  const finalEvents = ["complete", "error", "stopped", "paused"];
+  const finalEvents = ["complete", "error", "stopped", "paused", "deleted"];
   const finish = (e: { runId?: string }) => {
     if (e && e.runId !== id) return;
     if (settled) return;
@@ -84,11 +84,15 @@ function watchRun(manager: WorkflowManager, pi: ExtensionAPI, ctx: ExtensionComm
     ctx.ui.setStatus(key, undefined);
     const run = manager.getRun(id);
     if (run) {
-      void pi.sendMessage({
-        customType: "workflows",
-        content: renderWorkflowText(recomputeWorkflowSnapshot(run.snapshot), true),
-        display: true,
-      });
+      try {
+        pi.sendMessage({
+          customType: "workflows",
+          content: renderWorkflowText(recomputeWorkflowSnapshot(run.snapshot), true),
+          display: true,
+        });
+      } catch {
+        // Listeners are already removed; a stale-ctx failure is not actionable.
+      }
     }
   };
   for (const ev of progressEvents) manager.on(ev, onEvent);
@@ -298,7 +302,7 @@ export function registerWorkflowCommands(
             ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
             return;
           }
-          registerSavedWorkflow(
+          const registration = registerSavedWorkflow(
             pi,
             getCwd,
             saved,
@@ -309,7 +313,17 @@ export function registerWorkflowCommands(
             () => getStorage()?.load(name) != null,
             () => getStorage()?.load(name) ?? null,
           );
-          ctx.ui.notify(`Saved /${name} (from ${run.runId})`, "info");
+          // Surface a refused registration (audit2 #35): the file persisted,
+          // but a host/extension-owned name never becomes a slash command —
+          // reporting plain success would silently mislead.
+          if (registration.ok) {
+            ctx.ui.notify(`Saved /${name} (from ${run.runId})`, "info");
+          } else {
+            ctx.ui.notify(
+              `Saved "${name}" to the library, but it cannot be registered as a slash command: ${registration.message}`,
+              "warning",
+            );
+          }
           return;
         }
         default:

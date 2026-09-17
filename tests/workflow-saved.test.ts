@@ -617,3 +617,16 @@ test(
     assert.equal(loaded?.script, "user companion");
   }),
 );
+
+test("save() preserves the PREVIOUS version as .bak on overwrite (audit2 #36)", () => {
+  const storage = createWorkflowStorage(mkdtempSync(join(tmpdir(), "pi-dw-bak-")));
+  storage.save({ name: "demo", description: "v1", script: "SCRIPT_V1", location: "project" });
+  storage.save({ name: "demo", description: "v2", script: "SCRIPT_V2", location: "project" });
+  const loaded = storage.load("demo");
+  assert.equal(loaded?.script, "SCRIPT_V2", "the new version is primary");
+  // Corrupt the primary → recovery must yield the PREVIOUS version, not nothing.
+  const path = loaded!.path;
+  writeFileSync(path, "{ truncated");
+  const recovered = storage.load("demo");
+  assert.equal(recovered?.script, "SCRIPT_V1", "an accidental overwrite leaves the old script recoverable");
+});

@@ -95,6 +95,26 @@ function writeJsonAtomic(fs: PersistenceFsLayer, path: string, data: unknown, st
 }
 
 /**
+ * Atomic write that preserves the file's PREVIOUS content as `.bak`
+ * (version-history semantics, not crash-mirror semantics): an accidental
+ * same-name overwrite leaves the prior version recoverable instead of
+ * destroying it with zero remaining bytes (audit2 #36). Recovery via
+ * readJsonWithBackupRecovery() then yields the previous version when the new
+ * primary is unreadable — strictly better than an unrecoverable loss.
+ */
+export function writeJsonAtomicPreservingPreviousBackup(fs: PersistenceFsLayer, path: string, data: unknown): void {
+  const previous = fs.existsSync(path) ? fs.readFileSync(path, "utf8") : undefined;
+  const json = JSON.stringify(data, null, 2);
+  fs.writeFileSync(`${path}.tmp`, json);
+  fs.renameSync(`${path}.tmp`, path);
+  try {
+    fs.writeFileSync(`${path}.bak`, previous ?? json);
+  } catch {
+    // Backup is best-effort; the primary write already succeeded.
+  }
+}
+
+/**
  * Read JSON from `path`, falling back to `path.bak` if the primary is
  * missing or fails to parse. Returns null if neither candidate parses.
  */

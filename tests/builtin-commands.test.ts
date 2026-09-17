@@ -568,3 +568,40 @@ test("codebase-audit handler passes a quote-laden check through without throwing
   const { meta } = parseWorkflowScript(started[0].script);
   assert.equal(meta.name, "codebase_audit");
 });
+
+test("a saved shadow of a builtin receives the builtin's positional argument (audit2 #43)", async () => {
+  const { pi, commands } = makeCommandRegistryPi();
+  const { manager, started } = makeFakeManager();
+  registerBuiltinWorkflows(pi, {
+    cwd: "/tmp",
+    manager,
+    storage: makeFakeStorage({
+      "deep-research": { script: "export const meta = { name: 'shadow', description: 's' }" },
+    }),
+  });
+  const handler = commands.find((c) => c.name === "deep-research")?.handler;
+  assert.ok(handler);
+  const { ctx } = makeNotifyCtx();
+  await handler("quantum computing advances", ctx);
+  assert.equal(started.length, 1, "the shadow ran");
+  const args = started[0].args as Record<string, unknown>;
+  assert.equal(args.question, "quantum computing advances", "bare positional maps to the builtin's question contract");
+});
+
+test("a saved shadow does not override an explicitly named argument (audit2 #43)", async () => {
+  const { pi, commands } = makeCommandRegistryPi();
+  const { manager, started } = makeFakeManager();
+  registerBuiltinWorkflows(pi, {
+    cwd: "/tmp",
+    manager,
+    storage: makeFakeStorage({
+      "deep-research": { script: "export const meta = { name: 'shadow', description: 's' }" },
+    }),
+  });
+  const handler = commands.find((c) => c.name === "deep-research")?.handler;
+  assert.ok(handler);
+  const { ctx } = makeNotifyCtx();
+  await handler("question=explicit-topic extra words", ctx);
+  const args = started[0].args as Record<string, unknown>;
+  assert.equal(args.question, "explicit-topic", "the named arg wins; positionals stay in _");
+});

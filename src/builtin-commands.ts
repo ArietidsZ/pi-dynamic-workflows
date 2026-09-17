@@ -366,10 +366,27 @@ export function registerBuiltinWorkflows(
    * context) so a shadowed command behaves identically to how it would if the
    * saved workflow itself had been registered under this name.
    */
+  // Positional-argument contract of each shadowable builtin: the builtin maps
+  // the bare argument string to this key (e.g. /deep-research X → {question: X}).
+  // A saved shadow must honor the same contract, or every invocation runs with
+  // an empty/garbage primary arg (audit2 #43).
+  const SHADOW_POSITIONAL_KEY: Record<string, string> = {
+    "deep-research": "question",
+    "adversarial-review": "task",
+    "code-review": "diff",
+    "multi-perspective": "topic",
+    "codebase-audit": "scope",
+  };
+
   function runSavedShadowIfPresent(name: string, rawArgs: string, ctx: ExtensionCommandContext): boolean {
     const saved = getStorage().load(name);
     if (!saved) return false;
-    startBackground(getManager(), ctx, name, saved.script, parseCommandArgs(rawArgs, saved.parameters));
+    const parsed = parseCommandArgs(rawArgs, saved.parameters);
+    const positionalKey = SHADOW_POSITIONAL_KEY[name];
+    if (positionalKey && parsed[positionalKey] === undefined && typeof parsed._ === "string" && parsed._.trim()) {
+      parsed[positionalKey] = parsed._;
+    }
+    startBackground(getManager(), ctx, name, saved.script, parsed);
     return true;
   }
 

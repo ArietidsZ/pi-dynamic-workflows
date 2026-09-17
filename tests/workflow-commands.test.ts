@@ -563,3 +563,47 @@ test("/workflows <unknown> warns usage", async () => {
   assert.equal(h.notified[0].type, "warning");
   assert.match(h.notified[0].message, /Unknown subcommand/);
 });
+
+test("/workflows status watch ends when the run is deleted (audit2 #34)", async () => {
+  const snapshot = {
+    name: "demo",
+    phases: [],
+    logs: [],
+    agents: [],
+    agentCount: 1,
+    runningCount: 1,
+    doneCount: 0,
+    errorCount: 0,
+  };
+  const manager: any = new EventEmitter();
+  manager.getRun = (id: string) => (id === "run-1" ? { runId: "run-1", status: "running", snapshot } : undefined);
+  manager.getSnapshot = () => null;
+  manager.listRuns = () => [];
+
+  const statusLine: Array<string | undefined> = [];
+  let handler: ((a: string, c: any) => Promise<void>) | undefined;
+  const pi: any = {
+    getCommands: () => [],
+    registerCommand: (_n: string, o: any) => {
+      handler = o.handler;
+    },
+    sendMessage: async () => {},
+  };
+  registerWorkflowCommands(pi as unknown as ExtensionAPI, manager as unknown as WorkflowManager);
+  const ctx = { ui: { notify: () => {}, setStatus: (_k: string, t?: string) => statusLine.push(t) } };
+  await handler!("status run-1", ctx);
+  const listenersBefore = progressAndFinalListenerCount(manager);
+  assert.ok(listenersBefore > 0, "watch subscribed");
+
+  // Deleting the watched run emits "deleted" — the watcher must finish and
+  // remove every listener instead of leaking them for the process lifetime.
+  manager.emit("deleted", { runId: "run-1" });
+  assert.equal(progressAndFinalListenerCount(manager), 0, "all watch listeners removed on delete");
+  assert.ok(statusLine.includes(undefined), "the status-bar entry is cleared");
+});
+
+function progressAndFinalListenerCount(manager: EventEmitter): number {
+  return ["agentStart", "agentEnd", "phase", "log", "tokenUsage", "complete", "error", "stopped", "paused", "deleted"]
+    .map((ev) => manager.listenerCount(ev))
+    .reduce((a, b) => a + b, 0);
+}
