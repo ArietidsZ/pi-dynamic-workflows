@@ -134,7 +134,9 @@ export function fmtTokenCount(fresh: number, cacheRead: number, fmt: (n: number)
  * journal-replayed resume or a run whose agents were all skipped. Every surface
  * should use this rather than re-implementing the zero guard. When
  * `figures.estimated` is set the segment is prefixed with `~` (#209) so a
- * heuristic-derived total never renders as metered.
+ * heuristic-derived total never renders as metered. The marker covers the whole
+ * segment (fresh + cached) even when only one component is heuristic —
+ * conservative by design.
  */
 export function fmtTokenSegment(
   figures: { fresh: number; cacheRead: number; estimated: boolean },

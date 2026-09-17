@@ -1703,12 +1703,11 @@ test("NavigatorModel carries the estimate flag onto run and phase rows (#209)", 
   assert.equal(model.runs()[0]?.estimated, true, "run row flags estimate-derived figures");
   assert.equal(model.phases("run-1")[0]?.estimated, true, "phase row flags estimate-derived figures");
 
-  // The two-pane header ORs its phase flags into the header's ~ marker.
-  // Phase/agent rows render the same flag alongside the header, so a broken
-  // OR is masked in full renders; the row-level flags are pinned above and
-  // fmtTokenSegment's ~ is pinned in workflow-display.test.ts.
+  // The two-pane header ORs its phase flags into the header's ~ marker. Assert
+  // the header's own summary line (line 1: status + totals) — agent/phase rows
+  // below also render ~, so a whole-render regex would mask a broken header OR.
   const state = new NavigatorState();
   assert.ok(state.drill(model), "drill into phases");
-  const header = renderNavigator(state, model, 80).join("\n");
-  assert.match(header, /~\d/, "header marks estimate-derived totals with ~");
+  const rendered = renderNavigator(state, model, 80);
+  assert.match(rendered[1] ?? "", /~\d/, "header summary line marks estimate-derived totals with ~");
 });

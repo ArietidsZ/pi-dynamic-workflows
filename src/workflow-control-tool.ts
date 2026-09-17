@@ -65,6 +65,7 @@ export interface WorkflowControlRunDetails {
   activeLabels: string[];
   tokenTotal: number;
   /** True when tokenTotal includes character-heuristic estimates (#209). */
+  /** Always emitted by the built-in tool; optional only for external constructors of this exported shape. */
   tokenTotalEstimated?: boolean;
 }
 

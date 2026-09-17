@@ -4796,8 +4796,9 @@ test(
 test(
   "an exact commit merging onto an estimated aggregate keeps the run flagged — no pause involved (#209)",
   withTempCwd(async (cwd) => {
-    // Directly pins commitFinalizedAgentUsage's prior-flag merge (mutation:
-    // dropping `estimated: prior.estimated` there must fail this test).
+    // The terminal onTokenUsage flush also carries the flag, so this test pins
+    // the END-TO-END invariant; the manager-side merge (commitFinalizedAgentUsage)
+    // is pinned separately by the pause-after-exact-commit test below.
     const manager = new WorkflowManager({
       cwd,
       agent: {
@@ -4821,6 +4822,51 @@ test(
       manager.getPersistence().load(runId)?.tokenUsage?.estimated,
       true,
       "the terminal persist keeps the flag",
+    );
+  }),
+);
+
+test(
+  "a pause after an exact commit lands keeps the run flagged in the paused record (#209)",
+  withTempCwd(async (cwd) => {
+    // commitFinalizedAgentUsage is the ONLY writer of snapshot.tokenUsage on the
+    // pause path (the terminal onTokenUsage flush never runs), so this pins its
+    // prior-flag merge: drop it and the paused record reads unflagged.
+    let thirdStarted: () => void = () => {};
+    const thirdAgentStarted = new Promise<void>((resolve) => {
+      thirdStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt, options) {
+          if (prompt === "first") return "a-done"; // no onUsage: fallback estimate
+          if (prompt === "second") {
+            options?.onUsage?.({ input: 40, output: 2, cacheRead: 0, cacheWrite: 0, total: 42, cost: 0.01 });
+            return "b-done"; // exact commit lands BEFORE the pause
+          }
+          thirdStarted();
+          await new Promise<void>((_resolve, reject) => {
+            options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+          });
+          return "unreachable";
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const threeAgentScript = `export const meta = { name: 'three_agent_demo', description: 'three agents' }
+await agent('first')
+await agent('second')
+await agent('third')`;
+    const { runId, promise } = manager.startInBackground(threeAgentScript);
+    promise.catch(() => {});
+    await thirdAgentStarted;
+    assert.equal(manager.pause(runId), true);
+    await promise.catch(() => {});
+    assert.equal(
+      manager.getPersistence().load(runId)?.tokenUsage?.estimated,
+      true,
+      "paused record: exact commit merged onto an estimated aggregate keeps the flag",
     );
   }),
 );
