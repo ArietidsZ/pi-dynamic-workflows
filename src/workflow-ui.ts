@@ -243,6 +243,12 @@ export class NavigatorModel {
     return this.frameRuns;
   }
 
+  // Rehydrated persisted snapshots, keyed by the parsed record OBJECT
+  // (audit2 #25): persistedToSnapshot re-stringifies every agent's full
+  // result — without this, browsing a completed run paid 4-17ms per frame.
+  // A fresh disk parse yields a new object, so invalidation is automatic.
+  private rehydratedSnapshots = new WeakMap<PersistedRunState, { snapshot: WorkflowSnapshot; status: string }>();
+
   private snapshot(runId: string): { snapshot: WorkflowSnapshot; status: string } | undefined {
     if (this.frameDepth > 0 && this.frameSnapshots.has(runId)) return this.frameSnapshots.get(runId);
     const live = this.manager.getRun(runId);
@@ -250,7 +256,13 @@ export class NavigatorModel {
       ? { snapshot: live.snapshot, status: live.status }
       : (() => {
           const p = this.persistedRuns().find((r) => r.runId === runId);
-          return p ? { snapshot: persistedToSnapshot(p), status: p.status } : undefined;
+          if (!p) return undefined;
+          let cached = this.rehydratedSnapshots.get(p);
+          if (!cached) {
+            cached = { snapshot: persistedToSnapshot(p), status: p.status };
+            this.rehydratedSnapshots.set(p, cached);
+          }
+          return cached;
         })();
     if (this.frameDepth > 0) this.frameSnapshots.set(runId, value);
     return value;
@@ -359,11 +371,15 @@ export class NavigatorModel {
     const order = Array.isArray(snap.phases) ? snap.phases.map(asText) : [];
     const byPhase = new Map<string, AgentRow[]>();
     const agents = Array.isArray(snap.agents) ? snap.agents : [];
+    const seenPhases = new Set<string>(order); // seeded: order starts from snap.phases
     for (const a of agents) {
       const key = agentPhaseKey(a);
       if (!byPhase.has(key)) byPhase.set(key, []);
       byPhase.get(key)?.push(a);
-      if (!order.includes(key)) order.push(key);
+      if (!seenPhases.has(key)) {
+        seenPhases.add(key);
+        order.push(key);
+      }
     }
     return order.map((title) => {
       const agents = byPhase.get(title) ?? [];
@@ -428,6 +444,9 @@ function persistedToSnapshot(p: PersistedRunState): WorkflowSnapshot {
   const snapshotAgents = agents.map((a, callIndex) => {
     const journalResult = a.callId ? journalByCallId.get(a.callId) : journalByIndex.get(callIndex);
     const result = a.result === undefined && a.status === "done" ? journalResult : a.result;
+    // resultPreview for string results is the result itself — no extra
+    // stringify. Non-string results stringify ONCE here; callers browsing the
+    // same run hit the cache below instead of re-stringifying per frame.
     return {
       id: a.id,
       callId: a.callId,
@@ -622,7 +641,12 @@ export class NavigatorState {
   /** Reconcile selection after any list/filter/manager change without drifting. */
   reconcile(snapshot: NavigatorSnapshot, managerEvent = false): void {
     if (this.kind !== "runs") return;
-    if (managerEvent) this.cancelConfirmation();
+    // Do NOT cancel a pending confirmation on manager events (audit2 #22):
+    // tokenUsage alone fires ~4/s per streaming agent, so the double-tap
+    // window never survived. confirm() re-validates cursor/filter/context and
+    // the TARGET identity against the current item, so a stale confirmation
+    // cannot act on the wrong row.
+    void managerEvent;
     const top = this.top();
     const index = snapshot.items.findIndex((item) => sameIdentity(top.selected, item.identity));
     if (index >= 0) {
@@ -1357,11 +1381,23 @@ function renderNavigatorFrame(
   const lines: string[] = [];
   let visibleSnapshot: NavigatorSnapshot | undefined;
   state.setPageSize(Math.max(1, viewportRows - 5));
+  // Resolve the selected identity ONCE per frame, lazily (audit2 #28):
+  // currentItem() reconciles and searches the full list — calling it per
+  // rendered row made every frame O(rows × items). Lazy because
+  // visibleSnapshot is only assigned inside the runs branch below.
+  let selectedIdentity: ItemIdentity | undefined;
+  let selectedIdentityResolved = false;
+  const selectedId = (): ItemIdentity | undefined => {
+    if (!selectedIdentityResolved) {
+      selectedIdentityResolved = true;
+      selectedIdentity = visibleSnapshot ? state.currentItem(visibleSnapshot)?.identity : undefined;
+    }
+    return selectedIdentity;
+  };
   const sel = (i: number, text: string) => {
     const selected =
       state.kind !== "runs" ||
-      (visibleSnapshot !== undefined &&
-        sameIdentity(visibleSnapshot.items[i]?.identity, state.currentItem(visibleSnapshot)?.identity));
+      (visibleSnapshot !== undefined && sameIdentity(visibleSnapshot.items[i]?.identity, selectedId()));
     return selected ? theme.fg("accent", theme.bold(`❯ ${text}`)) : `  ${text}`;
   };
   const dim = (t: string) => theme.fg("dim", t);
@@ -1960,7 +1996,11 @@ export function openWorkflowNavigator(
         "resumed",
       ];
       const onEvent = () => {
-        if (state.kind === "runs") state.noteManagerEvent(model.visible(state.filter));
+        // No eager model.visible() here (audit2 #23): each call rebuilds the
+        // entire visible model (storage.list() + a SHA-256 per saved script +
+        // runs aggregation), and events fire at ~4/s per streaming agent. The
+        // render frame computes model.visible() and reconciles selection
+        // itself, so the rebuild is coalesced into the frame.
         rerender();
       };
       for (const ev of events) manager.on(ev, onEvent);

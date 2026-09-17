@@ -7,7 +7,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { closeSync, openSync, readSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readSync } from "node:fs";
 import { join } from "node:path";
 import { AgentSession, type ExtensionAPI, type ExtensionUIContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
@@ -370,24 +370,54 @@ function deliveryIdFromDetails(details: unknown): string | undefined {
 }
 
 /** Scan the SDK's JSONL record without allocating the entire session history. */
-function sessionFileContainsEntry(path: string, entry: object): boolean {
+export function sessionFileContainsEntry(path: string, entry: object): boolean {
   const needle = Buffer.from(`\n${JSON.stringify(entry)}\n`);
   let fd: number | undefined;
   try {
     fd = openSync(path, "r");
-    const chunk = Buffer.allocUnsafe(64 * 1024);
-    let tail: Buffer = Buffer.alloc(0);
-    for (;;) {
-      const count = readSync(fd, chunk);
-      if (count === 0) return false;
-      const window = Buffer.concat([tail, chunk.subarray(0, count)]);
-      if (window.indexOf(needle) !== -1) return true;
-      tail = window.subarray(Math.max(0, window.length - needle.length + 1));
-    }
+    // Incremental scan (audit2 #29): the session file is append-only and the
+    // delivery-ACK path re-scans it per check — resume from the last scanned
+    // offset (with a needle-length overlap) instead of offset 0. On a tail
+    // miss, fall back to one head scan: an entry can precede the cached offset
+    // when two deliveries interleave.
+    const resumeFrom = Math.max(0, (sessionScanOffsets.get(path) ?? 0) - needle.length + 1);
+    const foundInTail = scanRegion(fd, needle, resumeFrom);
+    const end = lseekEnd(fd);
+    sessionScanOffsets.set(path, end);
+    if (foundInTail) return true;
+    if (resumeFrom > 0) return scanRegion(fd, needle, 0, resumeFrom + needle.length - 1);
+    return false;
   } catch {
     return false;
   } finally {
     if (fd !== undefined) closeSync(fd);
+  }
+}
+
+/** Last fully-scanned byte offset per session file (append-only). */
+const sessionScanOffsets = new Map<string, number>();
+
+function lseekEnd(fd: number): number {
+  try {
+    return fstatSync(fd).size;
+  } catch {
+    return 0;
+  }
+}
+
+function scanRegion(fd: number, needle: Buffer, start: number, end?: number): boolean {
+  const chunk = Buffer.allocUnsafe(64 * 1024);
+  let position = start;
+  let tail: Buffer = Buffer.alloc(0);
+  for (;;) {
+    const budget = end === undefined ? chunk.length : Math.min(chunk.length, end - position);
+    if (budget <= 0) return false;
+    const count = readSync(fd, chunk, 0, budget, position);
+    if (count === 0) return false;
+    position += count;
+    const window = Buffer.concat([tail, chunk.subarray(0, count)]);
+    if (window.indexOf(needle) !== -1) return true;
+    tail = window.subarray(Math.max(0, window.length - needle.length + 1));
   }
 }
 
@@ -1650,7 +1680,10 @@ export function installTaskPanel(
       // token/s rate keeps updating between sparse token events — and decays to 0
       // when an agent stalls. Gated + unref'd so it costs nothing when idle.
       const timer = setInterval(() => {
-        if (settings().progressPanelMode === "detailed" && hasActiveRun()) tui.requestRender();
+        // hasActiveRun() first: settings() is a synchronous disk read, and the
+        // tick (2s) always outlives its cache TTL — with zero workflows this
+        // ordering avoids ~43k pointless config reads/day (audit2 #32).
+        if (hasActiveRun() && settings().progressPanelMode === "detailed") tui.requestRender();
       }, 2000);
       (timer as { unref?: () => void }).unref?.();
       // Purely informational: it lists running runs and re-renders on events. To

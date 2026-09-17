@@ -3464,3 +3464,22 @@ describe("deliverText", () => {
     assert.ok(/…\(truncated/.test(over), "a 406-char dump exceeds the default 400");
   });
 });
+
+it("sessionFileContainsEntry finds entries before AND after the incremental scan offset (audit2 #29)", async () => {
+  const { sessionFileContainsEntry } = await import("../src/task-panel.js");
+  const dir = mkdtempSync(join(tmpdir(), "pdw-scan-"));
+  const file = join(dir, "session.jsonl");
+  const entry1 = { id: "e1", type: "custom_message", customType: "workflow-result", details: { deliveryId: "d1" } };
+  const entry2 = { id: "e2", type: "custom_message", customType: "workflow-result", details: { deliveryId: "d2" } };
+  // A header line first: the needle carries a leading \n, so a first-line
+  // entry is unmatchable by design (production session files always have one).
+  writeFileSync(file, `${JSON.stringify({ id: "header" })}\n${JSON.stringify(entry1)}\n`);
+  // First scan caches the offset at EOF (miss for an absent needle is fine).
+  assert.equal(sessionFileContainsEntry(file, { id: "absent" }), false);
+  // New content appended AFTER the cached offset: found via the tail scan.
+  appendFileSync(file, `${JSON.stringify(entry2)}\n`);
+  assert.equal(sessionFileContainsEntry(file, entry2), true, "appended entry found from the resumed offset");
+  // Content written BEFORE the cached offset (interleaved delivery): head fallback.
+  assert.equal(sessionFileContainsEntry(file, entry1), true, "pre-offset entry found via the head fallback");
+  assert.equal(sessionFileContainsEntry(file, { id: "never" }), false);
+});
