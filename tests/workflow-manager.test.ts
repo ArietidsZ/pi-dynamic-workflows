@@ -455,6 +455,58 @@ test(
 );
 
 test(
+  "autoResumeAttempts recorded through the manager survives its later persists (#207)",
+  withTempCwd(async (cwd) => {
+    // The scheduler's backoff counter used to be merge-saved straight into
+    // persistence, so the next writeRunToDisk (a literal without the field)
+    // erased it — across a restart the give-up cap reset. Drive the exact
+    // sequence: pause → record attempts → resume → terminal persist.
+    let attempts = 0;
+    let markStarted: () => void = () => {};
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(_prompt, options) {
+          attempts++;
+          if (attempts === 1) {
+            markStarted();
+            await new Promise<void>((_resolve, reject) => {
+              options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+            });
+          }
+          return "resumed";
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    promise.catch(() => {});
+    await started;
+    assert.equal(manager.pause(runId), true);
+
+    manager.recordAutoResumeAttempts(runId, 2);
+    assert.equal(manager.getPersistence().load(runId)?.autoResumeAttempts, 2, "recorded attempts reach disk");
+
+    assert.equal(await manager.resume(runId), true);
+    while (manager.getRun(runId)?.status === "running") {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    const completed = manager.getPersistence().load(runId);
+    assert.equal(completed?.status, "completed");
+    assert.equal(
+      completed?.autoResumeAttempts,
+      2,
+      "a later manager persist must not erase the scheduler's backoff counter",
+    );
+  }),
+);
+
+test(
   "manager attributes concurrent same-label usage by call identity",
   withTempCwd(async (cwd) => {
     let started = 0;

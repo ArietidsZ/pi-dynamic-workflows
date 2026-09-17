@@ -90,6 +90,15 @@ class FakeManager extends EventEmitter implements SchedulableWorkflowManager {
   getPersistence(): RunPersistence {
     return this.persistence.asRunPersistence();
   }
+
+  recordAutoResumeAttempts(runId: string, attempts: number): void {
+    // The fake has no live-run map: merge straight into persistence, matching
+    // the real manager's non-live path.
+    const persistence = this.persistence.asRunPersistence();
+    const current = persistence.load(runId);
+    if (!current) return;
+    persistence.save({ ...current, autoResumeAttempts: attempts });
+  }
 }
 
 function makeRun(overrides: Partial<PersistedRunState> = {}): PersistedRunState {

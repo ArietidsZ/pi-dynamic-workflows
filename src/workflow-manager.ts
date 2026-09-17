@@ -117,6 +117,13 @@ export interface ManagedRun {
    */
   autoResume?: boolean;
   /**
+   * Usage-limit auto-resume backoff counter, owned in-memory here and persisted
+   * on every manager write — a raw side-channel persistence.save would be
+   * erased by the next writeRunToDisk (#207). Written through
+   * recordAutoResumeAttempts(); read on cold start by the scheduler.
+   */
+  autoResumeAttempts?: number;
+  /**
    * A user-requested lifecycle transition that aborted this exact execution.
    *
    * `pause` and `stop` already emit their own semantic events synchronously.
@@ -1507,6 +1514,9 @@ export class WorkflowManager extends EventEmitter {
         // "paused" event race (see UsageLimitScheduler) is still correct — this
         // is fixed at run-start and doesn't change over the run's lifetime.
         autoResume: managed.autoResume,
+        // The scheduler's backoff counter — must round-trip or restarts reset
+        // the give-up cap (#207).
+        autoResumeAttempts: managed.autoResumeAttempts,
         // Start-time execution context, re-read by resume() (see ManagedRun).
         tokenBudget: managed.tokenBudget,
         toolset: managed.toolset,
@@ -1742,6 +1752,9 @@ export class WorkflowManager extends EventEmitter {
       // Carry the original opt-out forward across resumes; it's fixed at
       // run-start and persistRun() re-persists it on every subsequent write.
       autoResume: persisted.autoResume,
+      // Same for the usage-limit backoff counter — it must survive manager
+      // persists and process restarts or the give-up cap resets (#207).
+      autoResumeAttempts: persisted.autoResumeAttempts,
       // Restore start-time execution context: the budget the run started with
       // (legacy runs without one resume unbudgeted — never re-apply the current
       // default to a run that predates it) and the toolset tag executeRun
@@ -1991,6 +2004,25 @@ export class WorkflowManager extends EventEmitter {
   /**
    * Get the persistence layer (for saving workflows).
    */
+  /**
+   * Record the usage-limit scheduler's auto-resume backoff counter for a run.
+   * Live runs go through the managed state (so the next persistRun carries it);
+   * non-live runs (paused on disk from a prior process) merge into the
+   * persisted record directly. Never write this field via a raw
+   * persistence.save side-channel — writeRunToDisk would erase it (#207).
+   */
+  recordAutoResumeAttempts(runId: string, attempts: number): void {
+    const managed = this.runs.get(runId);
+    if (managed) {
+      managed.autoResumeAttempts = attempts;
+      this.persistRun(managed);
+      return;
+    }
+    const current = this.persistence.load(runId);
+    if (!current) return;
+    this.persistence.save({ ...current, autoResumeAttempts: attempts });
+  }
+
   getPersistence(): RunPersistence {
     return this.persistence;
   }

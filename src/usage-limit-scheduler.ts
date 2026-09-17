@@ -25,6 +25,12 @@ export interface SchedulableWorkflowManager {
   listAllRuns(): PersistedRunState[];
   resume(runId: string): Promise<boolean>;
   getPersistence(): RunPersistence;
+  /**
+   * Record the auto-resume backoff counter THROUGH the manager so the next
+   * manager persist carries it — a raw persistence.save side-channel gets
+   * erased by writeRunToDisk (#207).
+   */
+  recordAutoResumeAttempts(runId: string, attempts: number): void;
 }
 
 /** Opaque timer handle so tests can inject a fake clock/timer. */
@@ -407,10 +413,9 @@ export class UsageLimitScheduler {
     queueMicrotask(() => {
       if (this.disposed) return;
       try {
-        const persistence = this.manager.getPersistence();
-        const current = persistence.load(runId);
-        if (!current) return;
-        persistence.save({ ...current, autoResumeAttempts: attempts });
+        // Through the manager (never a raw persistence.save) so the next
+        // manager persist cannot erase the field (#207).
+        this.manager.recordAutoResumeAttempts(runId, attempts);
       } catch (err) {
         this.diagnostic(`[usage-limit-scheduler] ${runId}: failed to persist autoResumeAttempts`, err);
       }
