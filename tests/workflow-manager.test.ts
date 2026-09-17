@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -4771,5 +4771,63 @@ test(
     const statusRow = new NavigatorModel(manager).runs().find((run) => run.runId === runId);
     assert.equal(statusRow?.fresh, 0, "status-facing usage must reflect committed usage only");
     assert.equal(statusRow?.cacheRead, 0);
+  }),
+);
+
+test(
+  "recordAutoResumeAttempts skips the disk merge when a live foreign lease holds the run (#207)",
+  withTempCwd(async (cwd) => {
+    let attempts = 0;
+    let markStarted: () => void = () => {};
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(_prompt, options) {
+          attempts++;
+          if (attempts === 1) {
+            markStarted();
+            // First attempt: hang so pause() interrupts mid-flight, then reject.
+            await new Promise<void>((_resolve, reject) => {
+              options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+            });
+          }
+          return "ok";
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    promise.catch(() => {});
+    await started;
+    assert.equal(manager.pause(runId), true);
+    await promise.catch(() => {}); // settle → this manager releases its run lease
+
+    // Cold start: a fresh manager on the same cwd does not manage the run.
+    const restarted = new WorkflowManager({ cwd, agent: { async run() { return "ok"; } } });
+    restarted.on("error", () => {});
+    assert.equal(restarted.getRun(runId), undefined);
+
+    // Simulate another process owning the run: a lock file with a LIVE pid.
+    const runsDir = restarted.getPersistence().getRunsDir();
+    writeFileSync(
+      join(runsDir, `${runId}.lock`),
+      JSON.stringify({
+        runId,
+        runPath: join(runsDir, `${runId}.json`),
+        pid: process.pid,
+        startedAt: new Date().toISOString(),
+        token: "foreign-owner",
+      }),
+    );
+
+    restarted.recordAutoResumeAttempts(runId, 3);
+    assert.equal(
+      restarted.getPersistence().load(runId)?.autoResumeAttempts,
+      undefined,
+      "contended merge skipped — the owning process persists authoritatively",
+    );
   }),
 );

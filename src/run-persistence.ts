@@ -164,9 +164,10 @@ export interface PersistedRunState {
    */
   agentRetries?: number;
   /**
-   * Auto-resume attempt counter for the current usage_limit pause-cycle, owned
-   * and persisted by UsageLimitScheduler (best-effort). Absent/0 means no
-   * auto-resume attempt has been recorded yet.
+   * Auto-resume attempt counter for the current usage_limit pause-cycle.
+   * Owned by WorkflowManager (written on every persistRun; the scheduler
+   * records through recordAutoResumeAttempts, never a raw save — #207).
+   * Absent/0 means no auto-resume attempt has been recorded yet.
    */
   autoResumeAttempts?: number;
   /**

@@ -2004,9 +2004,6 @@ export class WorkflowManager extends EventEmitter {
   }
 
   /**
-   * Get the persistence layer (for saving workflows).
-   */
-  /**
    * Record the usage-limit scheduler's auto-resume backoff counter for a run.
    * Live runs go through the managed state (so the next persistRun carries it);
    * non-live runs (paused on disk from a prior process) merge into the
@@ -2015,6 +2012,9 @@ export class WorkflowManager extends EventEmitter {
    * a raw persistence.save side-channel — writeRunToDisk would erase it (#207).
    */
   recordAutoResumeAttempts(runId: string, attempts: number): void {
+    // A corrupt/foreign value must never reach the record: NaN/negative would
+    // defeat the scheduler's give-up cap and produce NaN timer delays.
+    if (!Number.isFinite(attempts) || attempts < 0) return;
     const managed = this.runs.get(runId);
     if (managed) {
       managed.autoResumeAttempts = attempts;

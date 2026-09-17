@@ -9,6 +9,11 @@
  * the provider's quota is likely to have refilled — with exponential backoff if
  * it keeps hitting the wall, and a hard attempt cap so it never retries forever.
  *
+ * Seam note: the authoritative attempt counter lives in memory here and on
+ * ManagedRun/persisted records (written through recordAutoResumeAttempts); the
+ * two can drift briefly when the manager's lease-guarded disk merge skips on
+ * contention — harmless, since the owning process then persists the record.
+ *
  * Deliberately standalone: it consumes ONLY WorkflowManager's public surface
  * (on/off, listAllRuns, resume, getPersistence, recordAutoResumeAttempts) so it
  * stays decoupled from manager/persistence internals. It owns its own timers
@@ -240,7 +245,14 @@ export class UsageLimitScheduler {
       return;
     }
 
-    const priorAttempts = this.state.get(runId)?.attempts ?? persisted?.autoResumeAttempts ?? 0;
+    // Validate the persisted counter too (corrupt/foreign JSON): an invalid
+    // value would defeat the give-up cap and produce NaN timer delays.
+    const diskAttempts = persisted?.autoResumeAttempts;
+    const validDiskAttempts =
+      typeof diskAttempts === "number" && Number.isFinite(diskAttempts) && diskAttempts >= 0
+        ? diskAttempts
+        : 0;
+    const priorAttempts = this.state.get(runId)?.attempts ?? validDiskAttempts;
     this.arm(runId, {
       attempts: priorAttempts + 1,
       resetHint: event.resetHint ?? persisted?.resetHint,
@@ -277,7 +289,13 @@ export class UsageLimitScheduler {
       if (run.autoResume === false) continue;
       if (this.state.has(run.runId)) continue;
 
-      const priorAttempts = run.autoResumeAttempts ?? 0;
+      // Validate the persisted counter: a corrupt/foreign value (NaN, string,
+      // negative) would defeat the give-up cap and produce NaN timer delays.
+      const persistedAttempts = run.autoResumeAttempts;
+      const priorAttempts =
+        typeof persistedAttempts === "number" && Number.isFinite(persistedAttempts) && persistedAttempts >= 0
+          ? persistedAttempts
+          : 0;
       const updatedAtMs = Date.parse(run.updatedAt);
       const elapsedMs = Number.isFinite(updatedAtMs) ? Math.max(0, this.now() - updatedAtMs) : 0;
       this.arm(run.runId, {

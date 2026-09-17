@@ -661,10 +661,9 @@ test("attempts and opt-out are persisted (best-effort) for a future cold start",
   });
 
   manager.emit("paused", { runId: "run-1", reason: "usage_limit", resetHint: "resets in 10m" });
-  await flush();
 
   const persisted = manager.persistence.get("run-1");
-  assert.equal(persisted?.autoResumeAttempts, 1, "attempt count persisted after the microtask flush");
+  assert.equal(persisted?.autoResumeAttempts, 1, "attempt count persisted synchronously");
   scheduler.dispose();
 });
 
