@@ -2573,3 +2573,26 @@ return await agent('flaky')`;
     assert.ok(elapsed >= 240 && elapsed < 5_000, `default backoff used (${elapsed}ms)`);
   }
 });
+
+test("the timeoutMs validation throws SYNCHRONOUSLY (no leaked rejection for void agent())", async () => {
+  // Regression pin for the sync-throw property: a Promise.reject would surface
+  // as an unhandled rejection for fire-and-forget calls and the run would
+  // RESOLVE instead of rejecting.
+  const script = `export const meta = { name: 'sync_throw', description: 'sync throw' }
+void agent('x', { timeoutMs: 0 })
+return 'frame-returned'`;
+  let unhandled = 0;
+  const onUnhandled = () => unhandled++;
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    await assert.rejects(
+      () => runWorkflow(script, { agent: fakeAgent({}), persistLogs: false }),
+      (e: unknown) => e instanceof WorkflowError && e.code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      "the run rejects (a Promise.reject would let it resolve 'frame-returned')",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(unhandled, 0, "no unhandled rejection leaked");
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});

@@ -514,10 +514,13 @@ export async function runWorkflow<T = unknown>(
   let agentTimeoutMs = options.agentTimeoutMs !== undefined ? options.agentTimeoutMs : DEFAULT_AGENT_TIMEOUT_MS;
   if (
     agentTimeoutMs !== null &&
-    (typeof agentTimeoutMs !== "number" || !Number.isFinite(agentTimeoutMs) || agentTimeoutMs < 1)
+    (typeof agentTimeoutMs !== "number" ||
+      !Number.isFinite(agentTimeoutMs) ||
+      agentTimeoutMs < 1 ||
+      agentTimeoutMs > 2_147_483_647)
   ) {
     options.onLog?.(
-      `ignoring invalid agentTimeoutMs (${String(options.agentTimeoutMs)}); using the default ${DEFAULT_AGENT_TIMEOUT_MS}ms`,
+      `ignoring invalid agentTimeoutMs (${String(options.agentTimeoutMs)}); using the configured default instead`,
     );
     agentTimeoutMs = DEFAULT_AGENT_TIMEOUT_MS;
   }
@@ -1128,7 +1131,7 @@ export async function runWorkflow<T = unknown>(
                     injected === 0
                       ? 0
                       : typeof injected === "number" && Number.isFinite(injected) && injected > 0
-                        ? injected
+                        ? Math.min(injected, 2_147_483_647) // above that, setTimeout overflows to ~1ms
                         : defaultBackoffMs;
                 } catch {
                   backoffMs = defaultBackoffMs; // a throwing callback must not abandon the retry
