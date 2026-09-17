@@ -1985,7 +1985,12 @@ export class WorkflowManager extends EventEmitter {
       clearTimeout(timer);
       this.persistTimers.delete(runId);
     }
-    return this.persistence.delete(runId);
+    const deleted = this.persistence.delete(runId);
+    // Notify watchers (watchRun subscribes to "deleted"): without an event, a
+    // /workflows watch on a deleted run leaks all of its listeners and strands
+    // the status-bar entry forever (audit2 #34).
+    if (deleted) this.emit("deleted", { runId });
+    return deleted;
   }
 
   /**

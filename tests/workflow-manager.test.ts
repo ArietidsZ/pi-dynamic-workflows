@@ -4721,3 +4721,20 @@ test(
     assert.equal(statusRow?.cacheRead, 0);
   }),
 );
+
+test(
+  'deleteRun emits "deleted" so watchers can tear down (audit2 #34)',
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent({}) });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'del_emit', description: 'del emit' }
+return await agent('x')`;
+    const { runId, promise } = manager.startInBackground(script);
+    await promise;
+    const events: string[] = [];
+    manager.on("deleted", ({ runId: id }: { runId: string }) => events.push(id));
+    assert.equal(manager.deleteRun(runId), true);
+    assert.deepEqual(events, [runId], "deleteRun notifies watchers");
+    assert.equal(manager.getPersistence().load(runId), null);
+  }),
+);
