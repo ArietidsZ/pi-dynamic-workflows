@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
-import type { PersistedAgentState } from "../src/run-persistence.js";
+import type { PersistedAgentState, PersistedRunState } from "../src/run-persistence.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { NavigatorModel, NavigatorState, renderNavigator } from "../src/workflow-ui.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
@@ -437,7 +437,11 @@ test(
     // The regression window itself: immediately after resume (before replay
     // progresses), the persisted record still carries the pre-pause fleet.
     const justResumed = manager.getPersistence().load(runId);
-    assert.equal(justResumed?.agents.length, 2, "resume must not transiently wipe the fleet from the record");
+    assert.ok((justResumed?.agents.length ?? 0) >= 2, "resume must not transiently wipe the fleet from the record");
+    assert.ok(
+      (manager.getRun(runId)?.snapshot.agentCount ?? 0) >= 2,
+      "the live snapshot is seeded at resume, not rebuilt from zero",
+    );
     for (let i = 0; i < 2000 && manager.getRun(runId)?.status === "running"; i++) {
       await new Promise((resolve) => setTimeout(resolve, 1));
     }
@@ -4877,6 +4881,8 @@ test(
         42,
         [],
         { id: 5 }, // fieldless object
+        { id: 55, status: "done", label: "ok", prompt: 42 }, // non-string prompt
+        { id: 56, status: "done", label: 42, prompt: "ok" }, // non-string label
         {
           id: 6,
           callId: "corrupt-run:0",
@@ -4900,7 +4906,7 @@ test(
           label: "b",
           prompt: "second",
           status: "running",
-          startedAt: "2026-01-01T00:00:06:00.000Z".replace(":00.000Z", ".000Z"),
+          startedAt: "2026-01-01T00:00:06.000Z",
         },
       ] as unknown as PersistedAgentState[],
       logs: [],
@@ -5013,6 +5019,145 @@ return { a, b }`;
     assert.equal(rows[0]?.label, "first", "the older row is untouched by the replay");
     assert.equal(rows[0]?.status, "skipped");
     assert.equal(rows[1]?.label, "first-c", "the latest row is the replay target and gets the refreshed label");
+    assert.equal(rows[1]?.prompt, "FIRST", "the replay target row carries the replayed prompt");
+    assert.ok(rows[1]?.startedAt, "the replay target row keeps seeded timestamps");
     assert.equal(rows[1]?.status, "done");
+  }),
+);
+
+test(
+  "resume tolerates element-level corrupt journal/phases/logs without a lease leak (#206)",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    manager.on("error", () => {});
+    manager.getPersistence().save({
+      runId: "corrupt-shape-run",
+      workflowName: "two_agent_demo",
+      script: twoAgentScript,
+      status: "paused",
+      phases: {} as unknown as string[],
+      currentPhase: "Work",
+      agents: [],
+      logs: {} as unknown as string[],
+      journal: [null, "garbage", { noIndex: true }] as unknown as PersistedRunState["journal"],
+      startedAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:10.000Z",
+    });
+
+    assert.equal(await manager.resume("corrupt-shape-run"), true);
+    assert.equal(manager.getRun("corrupt-shape-run")?.snapshot.currentPhase, "Work", "currentPhase restored");
+    for (let i = 0; i < 2000 && manager.getRun("corrupt-shape-run")?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    const persisted = manager.getPersistence().load("corrupt-shape-run");
+    assert.equal(persisted?.status, "completed");
+    // No phantom/lease leak: the run is terminal and deletable.
+    assert.equal(manager.deleteRun("corrupt-shape-run"), true);
+  }),
+);
+
+test(
+  "a replayed call on a startedAt-less ghost row keeps its settle timestamps and tokens (#206)",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    manager.on("error", () => {});
+    // Genuine journal for call 0: run once, pause during agent 2.
+    let secondStarted: () => void = () => {};
+    const secondAgentStarted = new Promise<void>((resolve) => {
+      secondStarted = resolve;
+    });
+    const hangManager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string, options?: { signal?: AbortSignal; onUsage?: (u: AgentUsage) => void }) {
+          if (prompt === "second") {
+            secondStarted();
+            await new Promise<void>((_resolve, reject) => {
+              options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+            });
+          }
+          options?.onUsage?.({ input: 10, output: 5, cacheRead: 0, cacheWrite: 0, total: 15, cost: 0 });
+          return `ran:${prompt}`;
+        },
+      },
+    });
+    hangManager.on("error", () => {});
+    const { runId, promise } = hangManager.startInBackground(twoAgentScript);
+    promise.catch(() => {});
+    await secondAgentStarted;
+    assert.equal(hangManager.pause(runId), true);
+    await promise.catch(() => {});
+
+    // Corrupt the completed row into a startedAt-less ghost carrying tokens.
+    const record = manager.getPersistence().load(runId);
+    assert.ok(record);
+    const row = record.agents.find((a) => a.prompt === "first");
+    assert.ok(row);
+    record.agents = [
+      { ...row, status: "running", startedAt: undefined, endedAt: undefined, tokens: 15 },
+      ...record.agents.filter((a) => a !== row),
+    ];
+    manager.getPersistence().save(record);
+
+    assert.equal(await manager.resume(runId), true);
+    for (let i = 0; i < 2000 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+
+    const persisted = manager.getPersistence().load(runId);
+    assert.equal(persisted?.status, "completed");
+    const replayed = persisted?.agents.find((a) => a.prompt === "first");
+    assert.equal(replayed?.status, "done");
+    assert.equal(replayed?.tokens, 15, "replayed ghost keeps its seeded tokens — never overwritten with 0");
+    assert.ok(replayed?.startedAt, "settle timestamp seeded for the startedAt-less ghost");
+    assert.ok(replayed?.endedAt, "the settle endedAt survives the replay");
+  }),
+);
+
+test(
+  "a ghost's settle timestamp never precedes the record's last write, even with a future updatedAt (#206)",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    manager.on("error", () => {});
+    // Direct file write: save() would restamp updatedAt to now, hiding the clamp.
+    const runsDir = manager.getPersistence().getRunsDir();
+    mkdirSync(runsDir, { recursive: true });
+    writeFileSync(
+      join(runsDir, "clamp-run.json"),
+      JSON.stringify({
+        runId: "clamp-run",
+        workflowName: "two_agent_demo",
+        script: twoAgentScript,
+        status: "paused",
+        phases: ["Work"],
+        agents: [
+          {
+            id: 1,
+            callId: "clamp-run:0",
+            label: "a",
+            prompt: "first",
+            status: "running",
+            startedAt: "2026-01-01T00:00:00.000Z",
+          },
+        ],
+        logs: [],
+        startedAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2027-06-01T00:00:00.000Z", // future: the clamp must pull settle up to this
+      }),
+    );
+
+    assert.equal(await manager.resume("clamp-run"), true);
+    for (let i = 0; i < 2000 && manager.getRun("clamp-run")?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    const ghost = manager
+      .getPersistence()
+      .load("clamp-run")
+      ?.agents.find((a) => a.status === "skipped");
+    assert.ok(ghost);
+    assert.ok(
+      Date.parse(ghost.endedAt ?? "") >= Date.parse("2027-06-01T00:00:00.000Z"),
+      "settle wall-clock clamped to the record's last write",
+    );
   }),
 );

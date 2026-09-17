@@ -158,9 +158,11 @@ export interface ManagedRun {
    */
   toolset?: string;
   /**
-   * Real per-agent start/end timestamps, captured at onAgentStart/onAgentEnd
-   * (never fabricated), keyed by the agent's snapshot id. A running agent has
-   * an entry with no endedAt; persistRun() reads from here instead of stamping
+   * Per-agent start/end timestamps keyed by the agent's snapshot id. Live rows
+   * carry real onAgentStart/onAgentEnd captures; resume seeding (#206) carries
+   * persisted values, and a ghost without a persisted startedAt gets the
+   * settle wall-clock (documented fabrication, clamped to >= the record's
+   * last write). A running agent has an entry with no endedAt; persistRun() reads from here instead of stamping
    * every agent with the run's startedAt / "now".
    */
   agentTimestamps: Map<number, { startedAt: string; endedAt?: string }>;
@@ -1746,9 +1748,12 @@ export class WorkflowManager extends EventEmitter {
     // Replayed journaled calls update their seeded entry in place (see
     // onAgentStart) instead of pushing duplicates. Non-object entries (corrupt
     // or legacy records, #110-hardened everywhere else) are skipped.
-    // Shape-guard the persisted journal: a corrupt/non-array value must not
-    // throw AFTER the run lease is acquired and the managed run registered.
-    const persistedJournal = Array.isArray(persisted.journal) ? persisted.journal : [];
+    // Shape-guard the persisted journal, container AND elements: a corrupt
+    // entry (null, non-object, index-less) must not throw AFTER the run lease
+    // is acquired and the managed run registered (lease leak + phantom run).
+    const persistedJournal = (Array.isArray(persisted.journal) ? persisted.journal : []).filter(
+      (entry) => entry && typeof entry === "object" && typeof entry.index === "number",
+    );
     const seededAgentTimestamps = new Map<number, { startedAt: string; endedAt?: string }>();
     // Settle ghosts at wall-clock, but never BEFORE the record's last write:
     // a backwards clock jump must not produce endedAt < updatedAt.
@@ -1768,37 +1773,51 @@ export class WorkflowManager extends EventEmitter {
         !agent ||
         typeof agent !== "object" ||
         Array.isArray(agent) ||
-        !VALID_PERSISTED_AGENT_STATUSES.has(agent.status as string) ||
+        !VALID_PERSISTED_AGENT_STATUSES.has(agent.status as PersistedAgentState["status"]) ||
         typeof agent.label !== "string" ||
         typeof agent.prompt !== "string"
       ) {
         continue;
       }
       const id = seededAgents.length + 1;
-      const { startedAt, endedAt, ...snapshotFields } = agent;
+      const { startedAt: rawStartedAt, endedAt: rawEndedAt, callId: rawCallId, ...snapshotFields } = agent;
+      // Per-field type hygiene (corrupt records): non-string timestamps/callIds
+      // are dropped from the seeded row rather than re-persisted as garbage.
+      const startedAt = typeof rawStartedAt === "string" ? rawStartedAt : undefined;
+      const endedAt = typeof rawEndedAt === "string" ? rawEndedAt : undefined;
+      const callId = typeof rawCallId === "string" ? rawCallId : undefined;
       const ghost = agentHasNonTerminalStatus(agent.status);
       const rowTimestamps = startedAt
         ? { startedAt, endedAt: endedAt ?? (ghost ? settledAt : undefined) }
         : ghost
           ? { startedAt: settledAt, endedAt: settledAt }
           : undefined;
+      if (callId !== undefined) {
+        // Duplicate callIds: the LAST row wins, matching the onAgentStart
+        // reverse-scan "latest row is the most recent execution" rule — even
+        // when that last row has no usable timestamps (delete stale earlier
+        // entries instead of leaving them to mis-arm the replay path).
+        if (rowTimestamps) seededTimestampsByCallId.set(callId, rowTimestamps);
+        else seededTimestampsByCallId.delete(callId);
+      }
       if (rowTimestamps) {
         seededAgentTimestamps.set(id, rowTimestamps);
-        // Duplicate callIds: the LAST row wins, matching the onAgentStart
-        // reverse-scan "latest row is the most recent execution" rule.
-        if (typeof agent.callId === "string") seededTimestampsByCallId.set(agent.callId, rowTimestamps);
       }
       seededAgents.push(
         ghost
           ? {
               ...snapshotFields,
               id,
+              callId,
+              // Align with settleInterruptedPersistedAgents: the interrupt cause
+              // overwrites unconditionally — a ghost's stale error field is not
+              // meaningful provenance.
               status: "skipped",
-              error: agent.error ?? INTERRUPTED_AGENT_CAUSE.error,
-              errorCode: agent.errorCode ?? INTERRUPTED_AGENT_CAUSE.errorCode,
+              error: INTERRUPTED_AGENT_CAUSE.error,
+              errorCode: INTERRUPTED_AGENT_CAUSE.errorCode,
               recoverable: false,
             }
-          : { ...snapshotFields, id },
+          : { ...snapshotFields, id, callId },
       );
     }
     const managed: ManagedRun = {
@@ -1808,7 +1827,7 @@ export class WorkflowManager extends EventEmitter {
         name: persisted.workflowName,
         phases: Array.isArray(persisted.phases) ? persisted.phases : [],
         currentPhase: persisted.currentPhase,
-        logs: persisted.logs ?? [],
+        logs: Array.isArray(persisted.logs) ? persisted.logs : [],
         agents: seededAgents,
         agentCount: 0,
         runningCount: 0,
