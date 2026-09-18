@@ -1475,7 +1475,7 @@ test(
 );
 
 test(
-  "deleteRun refuses for a paused in-memory run leased by a foreign process (audit2 #16 r1)",
+  "deleteRun refuses for a terminal in-memory run leased by a foreign process (audit2 #16 r1)",
   withTempCwd(async (cwd) => {
     // r1 MAJOR 1: a PAUSED run stays in this.runs but its lease was released
     // at pause settle — the managed branch must not bypass the lease gate.
