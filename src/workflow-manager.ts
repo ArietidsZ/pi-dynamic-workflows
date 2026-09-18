@@ -1982,17 +1982,33 @@ export class WorkflowManager extends EventEmitter {
    */
   deleteRun(runId: string): boolean {
     const managed = this.runs.get(runId);
+    // Lease ownership gate (audit2 #16, r1 MAJOR 1): only skip the acquire
+    // when the managed entry ACTUALLY owns its lease. A paused/terminal
+    // in-memory entry released its lease at pause settle (:1144) — a foreign
+    // process that resumed the run holds it, and an ungated delete here would
+    // be resurrected by that process's next persist.
+    let heldLease: RunLease | undefined;
     if (managed) {
       if (!managed.controller.signal.aborted) managed.controller.abort();
-      this.releaseRunLease(managed);
+      if (managed.lease) {
+        // Hold across the delete (r1 MINOR 4): releasing before the unlink
+        // opens a window for a foreign acquire whose next persist resurrects
+        // the run after a "successful" delete. Release below; deleteRunFiles
+        // already unlinks the lock sidecar, making that release a harmless
+        // no-op.
+        heldLease = managed.lease;
+        managed.lease = undefined;
+      } else {
+        heldLease = this.tryAcquireDeleteLease(runId);
+        if (!heldLease) return false;
+      }
     } else {
       // Cross-process delete (audit2 #16): the owning process's next persist
       // would silently resurrect a deleted run. Refuse while another live
       // process holds the run lease — mirroring stop()'s persisted-fallback
-      // path. (In-process deletes own the lease already, above.)
-      const lease = this.persistence.acquireRunLease(runId);
-      if (!lease) return false;
-      this.persistence.releaseRunLease(lease);
+      // path.
+      heldLease = this.tryAcquireDeleteLease(runId);
+      if (!heldLease) return false;
     }
     this.runs.delete(runId);
     // Cancel any pending throttled write so a deferred persist can't fire after
@@ -2002,7 +2018,22 @@ export class WorkflowManager extends EventEmitter {
       clearTimeout(timer);
       this.persistTimers.delete(runId);
     }
-    return this.persistence.delete(runId);
+    try {
+      return this.persistence.delete(runId);
+    } finally {
+      if (heldLease) this.persistence.releaseRunLease(heldLease);
+    }
+  }
+
+  /** Best-effort lease probe for deleteRun: any fs failure means REFUSE the
+   * delete (r1 MINOR 1 — deleteRun must keep its no-throw contract; a probe
+   * failure cannot prove ownership). */
+  private tryAcquireDeleteLease(runId: string): RunLease | undefined {
+    try {
+      return this.persistence.acquireRunLease(runId) ?? undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   /**

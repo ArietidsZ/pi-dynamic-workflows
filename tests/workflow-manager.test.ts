@@ -1475,6 +1475,40 @@ test(
 );
 
 test(
+  "deleteRun refuses for a paused in-memory run leased by a foreign process (audit2 #16 r1)",
+  withTempCwd(async (cwd) => {
+    // r1 MAJOR 1: a PAUSED run stays in this.runs but its lease was released
+    // at pause settle — the managed branch must not bypass the lease gate.
+    const owner = new WorkflowManager({ cwd, agent: fakeAgent() });
+    const { runId } = owner.startInBackground(oneAgentScript);
+    await new Promise((r) => setTimeout(r, 30));
+    assert.ok(owner.getRun(runId), "run is managed in-memory");
+    assert.equal(owner.getRun(runId)?.status, "completed");
+    // Terminal in-memory entries hold no lease; a foreign process holds it now.
+    const foreign = new WorkflowManager({ cwd });
+    const lease = foreign.getPersistence().acquireRunLease(runId);
+    assert.ok(lease, "foreign lease acquired (stands in for a foreign resume)");
+    try {
+      assert.equal(owner.deleteRun(runId), false, "managed-branch delete must respect the foreign lease");
+      assert.ok(owner.getPersistence().load(runId), "the run file survived the refused delete");
+    } finally {
+      if (lease) foreign.getPersistence().releaseRunLease(lease);
+    }
+    assert.equal(owner.deleteRun(runId), true, "delete proceeds once the lease is gone");
+  }),
+);
+
+test(
+  "deleteRun keeps its no-throw contract when the lease probe fails (audit2 #16 r1)",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd });
+    // A runId containing a path separator makes the lock-file probe throw
+    // ENOENT — deleteRun must refuse gracefully, not crash /workflows rm.
+    assert.equal(manager.deleteRun("a/b"), false);
+  }),
+);
+
+test(
   "deleteRun returns false for nonexistent run",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd });

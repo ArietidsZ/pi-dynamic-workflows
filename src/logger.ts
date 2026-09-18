@@ -32,24 +32,29 @@ export function createWorkflowLogger(options: WorkflowLoggerOptions = {}): Workf
   const runId = options.runId ?? `run-${Date.now()}`;
   const runsDir = workflowProjectPaths(cwd).runsDir;
   let logFile: string | null = null;
-  // Lines already written to logFile — persist() appends only the pending
-  // slice (audit2 #39): a full rewrite per persist doubles write volume, and
+  // Per-entry on-disk flags (audit2 #39 + r1 MINOR 3): persist() appends only
+  // unflagged entries — a full rewrite per persist doubles write volume, and
   // a RESUMED run's fresh logger would wipe the earlier execution's lines.
-  let persistedUpTo = 0;
+  // A watermark (persistedUpTo) would be WRONG here: a successful
+  // write-through append must not mark EARLIER entries — whose own appends
+  // failed silently — as on-disk, or persist() could never re-append them.
+  const persisted: boolean[] = [];
 
   const write = (level: string, message: string) => {
     const timestamp = new Date().toISOString();
     const entry = `[${timestamp}] [${level}] ${message}`;
+    const idx = logs.length;
     logs.push(entry);
+    persisted.push(false);
     options.onLog?.(message);
 
     if (persistLogs && logFile) {
       try {
         appendFileSync(logFile, `${entry}\n`);
-        // Written through: keep persist()'s pending slice from re-appending it.
-        persistedUpTo = logs.length;
+        // Written through: flag ONLY this entry so persist() skips it.
+        persisted[idx] = true;
       } catch {
-        // Silent fail for log persistence
+        // Silent fail for log persistence — persist() retries unflagged lines.
       }
     }
   };
@@ -72,12 +77,15 @@ export function createWorkflowLogger(options: WorkflowLoggerOptions = {}): Workf
       try {
         mkdirSync(runsDir, { recursive: true });
         logFile = join(runsDir, `${runId}.log`);
-        const pending = logs.slice(persistedUpTo);
-        if (pending.length > 0) {
+        const pendingIdx: number[] = [];
+        for (let i = 0; i < logs.length; i++) {
+          if (!persisted[i]) pendingIdx.push(i);
+        }
+        if (pendingIdx.length > 0) {
           // Append, not rewrite: an earlier execution of this runId (pause /
           // resume) already wrote its lines to this file.
-          appendFileSync(logFile, `${pending.join("\n")}\n`);
-          persistedUpTo = logs.length;
+          appendFileSync(logFile, `${pendingIdx.map((i) => logs[i]).join("\n")}\n`);
+          for (const i of pendingIdx) persisted[i] = true;
         } else if (!existsSync(logFile)) {
           writeFileSync(logFile, "");
         }

@@ -167,7 +167,9 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     if (provided) return provided;
     if (!fallbackManager) {
       fallbackManager = new WorkflowManager({
-        cwd: options.cwd,
+        // Bind to the factory-time cwd, not a re-read of process.cwd() at
+        // execute time (r1 NIT: split-brain with fallbackStorage).
+        cwd: options.cwd ?? fallbackCwd,
         concurrency: defaults.concurrency,
         loadSavedWorkflow: (name: string) => fallbackStorage.load(name)?.script,
         defaultAgentTimeoutMs: defaults.agentTimeoutMs,

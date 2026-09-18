@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -212,6 +212,32 @@ describe("logger", () => {
       const afterResume = readFileSync(file, "utf8");
       assert.ok(afterResume.includes("line-1"), "earlier execution's lines survived resume");
       assert.ok(afterResume.includes("line-3"));
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("persist re-appends lines whose write-through append failed transiently (audit2 #39 r1)", async () => {
+    const { createWorkflowLogger } = await loadLogger();
+    const cwd = mkdtempSync(join(tmpdir(), "pi-wf-log-"));
+    try {
+      const log = createWorkflowLogger({ cwd, runId: "run-y" });
+      log.log("a"); // creates the file, written through
+      const file = log.persist();
+      assert.ok(file);
+      // Transient failure window (synced/cloud disk, perms flip): b and c are
+      // swallowed; a watermark would then mark them on-disk on d's success.
+      chmodSync(file, 0o444);
+      log.log("b");
+      log.log("c");
+      chmodSync(file, 0o644);
+      log.log("d"); // write-through succeeds again
+      log.persist();
+      const content = readFileSync(file, "utf8");
+      for (const line of ["a", "b", "c", "d"]) {
+        assert.ok(content.includes(` ${line}\n`), `line ${line} on disk`);
+      }
+      assert.equal(content.match(/ a\n/g)?.length, 1, "no duplicate re-append of a");
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }

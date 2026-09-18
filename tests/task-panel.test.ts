@@ -1569,6 +1569,30 @@ describe("installResultDelivery", () => {
     );
   });
 
+  it("registers turn_end per ExtensionAPI generation, not once per process (audit2 #33 r1)", async () => {
+    // r1 MAJOR 2: the built dist module is cached across pi session
+    // generations while pi re-runs the factory with a NEW ExtensionAPI — a
+    // bare module-level boolean would leave generations 2+ with NO turn_end
+    // handler (fail-closed deliveries never re-probed until session_start).
+    const pi1 = createMockPi();
+    const pi2 = createMockPi();
+    const m1 = createMockManager(makeRun());
+    m1.setSessionId("sess-g1");
+    const m2 = createMockManager(makeRun());
+    m2.setSessionId("sess-g2");
+
+    mod.installResultDelivery(pi1, m1);
+    mod.installResultDelivery(pi2, m2); // generation 2: same module, NEW pi
+
+    const stableSend: StableSend = () => Promise.resolve();
+    mod._registerBoundSessionSendForTests("sess-g2", stableSend);
+
+    pi2.emit?.("turn_end", {}, {});
+    await Promise.resolve();
+
+    assert.ok(mod._getSessionDeliveryEndpointForTests("sess-g2"), "generation-2 pi must have its own turn_end handler");
+  });
+
   it("recovers and flushes pending delivery on turn_end when sender becomes available", async () => {
     let sends = 0;
     const pi = createMockPi();

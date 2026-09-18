@@ -1215,8 +1215,12 @@ export function resumeResultDelivery(manager: WorkflowManager): void {
  * replacement the manager (and these listeners) survive via the handoff path;
  * each new generation calls {@link bindSessionDelivery} on session_start.
  */
-// Process-wide turn_end registration state (see installResultDelivery).
-let deliveryTurnEndInstalled = false;
+// Process-wide turn_end registration state (see installResultDelivery). The
+// guard is keyed to the ExtensionAPI INSTANCE, not a bare boolean (r1 MAJOR
+// 2): the built dist module is cached across pi session generations while pi
+// re-runs the factory with a NEW pi per generation — a bare boolean would
+// leave generations 2+ with no turn_end handler at all.
+let turnEndInstalledPi: ExtensionAPI | undefined;
 let currentDeliveryManager: WorkflowManager | undefined;
 
 export function installResultDelivery(
@@ -1257,14 +1261,13 @@ export function installResultDelivery(
     manager.on("stopped", emitLifecycle("stopped"));
   }
 
-  // Process-wide turn_end dispatch (audit2 #33): pi.on has no off(), so a
-  // PER-MANAGER registration closes over the old manager at every
-  // cross-project session_start rebuild — rooting it (and its whole run
-  // history) for the process lifetime, and running a stale handler on every
-  // turn_end forever. Register once; dispatch to the CURRENT manager.
+  // Process-wide turn_end dispatch (audit2 #33): within one pi generation,
+  // per-manager registration would stack a handler per cross-project rebuild
+  // (pi.on has no off()), each closing over a stale manager. Register once
+  // PER PI INSTANCE; dispatch to the CURRENT manager.
   currentDeliveryManager = manager;
-  if (!deliveryTurnEndInstalled) {
-    deliveryTurnEndInstalled = true;
+  if (turnEndInstalledPi !== pi) {
+    turnEndInstalledPi = pi;
     pi.on?.("turn_end", (_event: unknown, ctx?: { sessionManager?: { getSessionId?: () => string } }) => {
       const activeManager = currentDeliveryManager;
       if (!activeManager) return;
@@ -1381,9 +1384,9 @@ export function _resetDeliveryRegistriesForTests(): void {
   deliveredAwaitingClear.clear();
   inFlightSeq = 0;
   probedSessionIds.clear();
-  // Process-wide turn_end dispatch state (audit2 #33): production keeps the
-  // single registration for the process lifetime; tests need isolation.
-  deliveryTurnEndInstalled = false;
+  // Process-wide turn_end dispatch state (audit2 #33): within one pi
+  // generation the single registration persists; a new pi gets a fresh one.
+  turnEndInstalledPi = undefined;
   currentDeliveryManager = undefined;
 }
 
