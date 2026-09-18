@@ -51,7 +51,16 @@ interface ExternalAbort {
   abortReason: object;
 }
 
-const PAUSED_EXECUTION_SETTLE_TIMEOUT_MS = 1_000;
+// A human's checkpoint reply fails with "still settling" when the pause tail
+// (a full-state persist on a slow/synced disk) exceeds this cap (audit2 #19).
+// 10s bounds the attach wait without flaking on Dropbox-hosted projects.
+const DEFAULT_PAUSED_EXECUTION_SETTLE_TIMEOUT_MS = 10_000;
+let pausedExecutionSettleTimeoutMs = DEFAULT_PAUSED_EXECUTION_SETTLE_TIMEOUT_MS;
+
+/** @internal test hook — shrink the settle grace without 10s-long tests. */
+export function _setPausedExecutionSettleTimeoutForTests(ms: number | undefined): void {
+  pausedExecutionSettleTimeoutMs = ms ?? DEFAULT_PAUSED_EXECUTION_SETTLE_TIMEOUT_MS;
+}
 
 async function waitForPausedExecutionSettlement(execution: Promise<unknown>): Promise<boolean> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -60,7 +69,7 @@ async function waitForPausedExecutionSettlement(execution: Promise<unknown>): Pr
     () => true,
   );
   const timeout = new Promise<boolean>((resolve) => {
-    timer = setTimeout(() => resolve(false), PAUSED_EXECUTION_SETTLE_TIMEOUT_MS);
+    timer = setTimeout(() => resolve(false), pausedExecutionSettleTimeoutMs);
     timer.unref?.();
   });
   const didSettle = await Promise.race([settled, timeout]);
@@ -1976,6 +1985,14 @@ export class WorkflowManager extends EventEmitter {
     if (managed) {
       if (!managed.controller.signal.aborted) managed.controller.abort();
       this.releaseRunLease(managed);
+    } else {
+      // Cross-process delete (audit2 #16): the owning process's next persist
+      // would silently resurrect a deleted run. Refuse while another live
+      // process holds the run lease — mirroring stop()'s persisted-fallback
+      // path. (In-process deletes own the lease already, above.)
+      const lease = this.persistence.acquireRunLease(runId);
+      if (!lease) return false;
+      this.persistence.releaseRunLease(lease);
     }
     this.runs.delete(runId);
     // Cancel any pending throttled write so a deferred persist can't fire after

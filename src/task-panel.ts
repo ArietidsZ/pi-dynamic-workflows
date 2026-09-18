@@ -609,7 +609,6 @@ export interface WorkflowLifecycleEvent {
 
 type DeliveryManager = WorkflowManager & {
   __deliveryInstalled?: boolean;
-  __deliveryTurnEndInstalled?: boolean;
   __lifecycleEventInstalled?: boolean;
   __lifecycleEventEmitter?: (data: WorkflowLifecycleEvent) => void;
   /** Last loadSettings seen on install — used when binding endpoints. */
@@ -1216,6 +1215,10 @@ export function resumeResultDelivery(manager: WorkflowManager): void {
  * replacement the manager (and these listeners) survive via the handoff path;
  * each new generation calls {@link bindSessionDelivery} on session_start.
  */
+// Process-wide turn_end registration state (see installResultDelivery).
+let deliveryTurnEndInstalled = false;
+let currentDeliveryManager: WorkflowManager | undefined;
+
 export function installResultDelivery(
   pi: ExtensionAPI,
   manager: WorkflowManager,
@@ -1254,14 +1257,23 @@ export function installResultDelivery(
     manager.on("stopped", emitLifecycle("stopped"));
   }
 
-  if (!m.__deliveryTurnEndInstalled) {
-    m.__deliveryTurnEndInstalled = true;
+  // Process-wide turn_end dispatch (audit2 #33): pi.on has no off(), so a
+  // PER-MANAGER registration closes over the old manager at every
+  // cross-project session_start rebuild — rooting it (and its whole run
+  // history) for the process lifetime, and running a stale handler on every
+  // turn_end forever. Register once; dispatch to the CURRENT manager.
+  currentDeliveryManager = manager;
+  if (!deliveryTurnEndInstalled) {
+    deliveryTurnEndInstalled = true;
     pi.on?.("turn_end", (_event: unknown, ctx?: { sessionManager?: { getSessionId?: () => string } }) => {
+      const activeManager = currentDeliveryManager;
+      if (!activeManager) return;
+      const active = deliveryManager(activeManager);
       let sid: string | undefined;
       try {
-        sid = ctx?.sessionManager?.getSessionId?.() ?? manager.getSessionId?.();
+        sid = ctx?.sessionManager?.getSessionId?.() ?? activeManager.getSessionId?.();
       } catch {
-        sid = manager.getSessionId?.();
+        sid = activeManager.getSessionId?.();
       }
       if (!sid) return;
 
@@ -1271,8 +1283,8 @@ export function installResultDelivery(
         const stolen = boundSessionSends.get(sid);
         if (stolen) {
           bindSessionDelivery(sid, pi, {
-            loadSettings: opts.loadSettings ?? m.__deliveryLoadSettings,
-            manager,
+            loadSettings: active.__deliveryLoadSettings,
+            manager: activeManager,
             sessionManager: ctx?.sessionManager,
           });
           endpoint = sessionEndpoints.get(sid);
@@ -1369,6 +1381,10 @@ export function _resetDeliveryRegistriesForTests(): void {
   deliveredAwaitingClear.clear();
   inFlightSeq = 0;
   probedSessionIds.clear();
+  // Process-wide turn_end dispatch state (audit2 #33): production keeps the
+  // single registration for the process lifetime; tests need isolation.
+  deliveryTurnEndInstalled = false;
+  currentDeliveryManager = undefined;
 }
 
 export function _setStreamingAckTimeoutForTests(timeoutMs: number): void {

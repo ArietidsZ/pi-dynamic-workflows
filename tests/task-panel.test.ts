@@ -1538,6 +1538,37 @@ describe("installResultDelivery", () => {
     assert.equal(run.pendingDelivery?.deliveryId, deliveryId, "stale generation send cannot ACK");
   });
 
+  it("registers turn_end once per process and dispatches to the CURRENT manager (audit2 #33)", async () => {
+    const pi = createMockPi();
+    // m1 = the OLD project's manager; m2 = current after a cross-project
+    // session_start rebuild. Per-manager registration would stack one handler
+    // per rebuild, each closing over its own (stale) manager.
+    const m1 = createMockManager(makeRun());
+    m1.setSessionId("sess-old");
+    const m2 = createMockManager(makeRun());
+    m2.setSessionId("sess-new");
+
+    mod.installResultDelivery(pi, m1);
+    mod.installResultDelivery(pi, m2);
+
+    // Stolen sends for BOTH sessions: any handler that fires and resolves a
+    // sid will bind an endpoint for it. A stacked stale handler would bind
+    // sess-old too; the single process-wide dispatch must bind ONLY sess-new.
+    const stableSend: StableSend = () => Promise.resolve();
+    mod._registerBoundSessionSendForTests("sess-old", stableSend);
+    mod._registerBoundSessionSendForTests("sess-new", stableSend);
+
+    pi.emit?.("turn_end", {}, {});
+    await Promise.resolve();
+
+    assert.ok(mod._getSessionDeliveryEndpointForTests("sess-new"), "turn_end dispatched to the current manager");
+    assert.equal(
+      mod._getSessionDeliveryEndpointForTests("sess-old"),
+      undefined,
+      "no stacked stale handler binding the old manager's session",
+    );
+  });
+
   it("recovers and flushes pending delivery on turn_end when sender becomes available", async () => {
     let sends = 0;
     const pi = createMockPi();

@@ -2,7 +2,7 @@
  * Workflow logger with file persistence.
  */
 
-import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { workflowProjectPaths } from "./workflow-paths.js";
 
@@ -32,6 +32,10 @@ export function createWorkflowLogger(options: WorkflowLoggerOptions = {}): Workf
   const runId = options.runId ?? `run-${Date.now()}`;
   const runsDir = workflowProjectPaths(cwd).runsDir;
   let logFile: string | null = null;
+  // Lines already written to logFile — persist() appends only the pending
+  // slice (audit2 #39): a full rewrite per persist doubles write volume, and
+  // a RESUMED run's fresh logger would wipe the earlier execution's lines.
+  let persistedUpTo = 0;
 
   const write = (level: string, message: string) => {
     const timestamp = new Date().toISOString();
@@ -42,6 +46,8 @@ export function createWorkflowLogger(options: WorkflowLoggerOptions = {}): Workf
     if (persistLogs && logFile) {
       try {
         appendFileSync(logFile, `${entry}\n`);
+        // Written through: keep persist()'s pending slice from re-appending it.
+        persistedUpTo = logs.length;
       } catch {
         // Silent fail for log persistence
       }
@@ -66,7 +72,15 @@ export function createWorkflowLogger(options: WorkflowLoggerOptions = {}): Workf
       try {
         mkdirSync(runsDir, { recursive: true });
         logFile = join(runsDir, `${runId}.log`);
-        writeFileSync(logFile, `${logs.join("\n")}\n`);
+        const pending = logs.slice(persistedUpTo);
+        if (pending.length > 0) {
+          // Append, not rewrite: an earlier execution of this runId (pause /
+          // resume) already wrote its lines to this file.
+          appendFileSync(logFile, `${pending.join("\n")}\n`);
+          persistedUpTo = logs.length;
+        } else if (!existsSync(logFile)) {
+          writeFileSync(logFile, "");
+        }
         return logFile;
       } catch {
         return null;

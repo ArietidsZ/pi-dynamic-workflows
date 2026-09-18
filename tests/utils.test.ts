@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import type { WorkflowAgentSnapshot } from "../src/display.js";
 import type { WorkflowMeta } from "../src/workflow.js";
@@ -185,6 +188,33 @@ describe("logger", () => {
     const log = createWorkflowLogger({ persist: false });
     const result = log.persist();
     assert.equal(result, null);
+  });
+
+  it("persist appends only pending lines and a resumed logger never wipes earlier lines (audit2 #39)", async () => {
+    const { createWorkflowLogger } = await loadLogger();
+    const cwd = mkdtempSync(join(tmpdir(), "pi-wf-log-"));
+    try {
+      const first = createWorkflowLogger({ cwd, runId: "run-x" });
+      first.log("line-1");
+      const file = first.persist();
+      assert.ok(file);
+      first.log("line-2");
+      first.persist();
+      const afterFirst = readFileSync(file, "utf8");
+      assert.ok(afterFirst.includes("line-1"));
+      assert.ok(afterFirst.includes("line-2"));
+      assert.equal(afterFirst.match(/line-1/g)?.length, 1, "no duplicate rewrite of line-1");
+      // A RESUMED run gets a fresh logger for the same runId: it must append,
+      // not truncate the earlier execution's lines.
+      const resumed = createWorkflowLogger({ cwd, runId: "run-x" });
+      resumed.log("line-3");
+      resumed.persist();
+      const afterResume = readFileSync(file, "utf8");
+      assert.ok(afterResume.includes("line-1"), "earlier execution's lines survived resume");
+      assert.ok(afterResume.includes("line-3"));
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   it("onLog callback is called for each message", async () => {
