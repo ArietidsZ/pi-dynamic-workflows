@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -204,7 +204,10 @@ test("a timed-out worktree add cleans up the half-created branch and tree (audit
 
     process.env.PATH = `${shimDir}:${originalPath}`;
     const started = Date.now();
-    const wt = await createWorktreeLive(repo, "run-addhang-0-task", { timeoutMs: 200 });
+    // 2s is comfortably above the tiny repo's real `worktree add` (r3: 200ms
+    // raced it — under load the add was killed before registering, making the
+    // cleanup assertions vacuous again).
+    const wt = await createWorktreeLive(repo, "run-addhang-0-task", { timeoutMs: 2_000 });
     const elapsed = Date.now() - started;
     process.env.PATH = originalPath;
 
@@ -213,7 +216,10 @@ test("a timed-out worktree add cleans up the half-created branch and tree (audit
     assert.ok(elapsed < 15_000, `bounded (took ${elapsed}ms)`);
     const branches = git("branch", "--list", "pi/wf/*");
     assert.equal(branches.trim(), "", "the half-created branch was cleaned up");
-    assert.equal(existsSync(join(repo, ".pi", "worktrees")), false, "no partial checkout left behind");
+    const worktreesDir = join(repo, ".pi", "worktrees");
+    assert.ok(!existsSync(worktreesDir) || readdirSync(worktreesDir).length === 0, "no partial checkout left behind");
+    const registrations = git("worktree", "list", "--porcelain");
+    assert.equal(registrations.includes(".pi/worktrees"), false, "no stale worktree registration");
   } finally {
     process.env.PATH = originalPath;
     rmSync(shimDir, { recursive: true, force: true });

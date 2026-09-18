@@ -97,21 +97,31 @@ function describeGitFailure(error: unknown, fallback: string): string {
  * and failure-tolerant — the spawn path must not hang on cleanup. */
 async function cleanupFailedWorktreeAdd(repoRoot: string, path: string, branch: string): Promise<void> {
   const quick = { timeout: 5_000, maxBuffer: 1024 * 1024 } as const;
+  // Order matters (r3 MAJOR): if the killed `worktree add` had already
+  // REGISTERED the worktree, `branch -D` is refused ("used by worktree")
+  // until the registration is gone. Deregister first, then delete the branch.
   try {
-    await exec("git", ["-C", repoRoot, "worktree", "prune"], quick);
+    // Registered case: removes the tree AND the registration in one step.
+    await exec("git", ["-C", repoRoot, "worktree", "remove", "--force", path], quick);
   } catch {
-    // best-effort
-  }
-  try {
-    await exec("git", ["-C", repoRoot, "branch", "-D", branch], quick);
-  } catch {
-    // best-effort
+    // best-effort — unregistered partial tree falls through to rm + prune
   }
   try {
     // maxRetries: a SIGTERM'd git can keep writing for a few hundred ms after
     // the exec rejects — an unretried recursive rm aborts on the first
     // ENOTEMPTY and leaves the partial tree behind (r2 MINOR).
     await rm(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 });
+  } catch {
+    // best-effort
+  }
+  try {
+    // Drop any stale registration left by the manual rm above.
+    await exec("git", ["-C", repoRoot, "worktree", "prune"], quick);
+  } catch {
+    // best-effort
+  }
+  try {
+    await exec("git", ["-C", repoRoot, "branch", "-D", branch], quick);
   } catch {
     // best-effort
   }
