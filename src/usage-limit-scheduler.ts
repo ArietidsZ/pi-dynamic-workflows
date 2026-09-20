@@ -187,16 +187,16 @@ export interface AutoResumeDelayParams {
 }
 
 /**
- * delay = clamp(minDelayMs, remaining * 2^(attempts-1), maxDelayMs), where
- * remaining = parsed(resetHint) ?? fallbackDelayMs, minus time already elapsed.
+ * Compute the original capped, jittered arm delay, then subtract time elapsed
+ * since that pause. Applying elapsed before backoff would multiply elapsed too,
+ * and applying it before the cap would restart a capped wait after every restart.
  * The exponent is capped defensively so a pathological attempt count can't
  * overflow the multiplication to Infinity/NaN before the maxDelayMs clamp runs.
  */
 export function computeAutoResumeDelayMs(params: AutoResumeDelayParams): number {
   const base = parseResetHintMs(params.resetHint, params.nowMs) ?? params.fallbackDelayMs;
-  const remaining = base - params.elapsedMs;
   const exponent = Math.min(Math.max(params.attempts - 1, 0), 30);
-  const backoff = remaining * 2 ** exponent;
+  const backoff = base * 2 ** exponent;
   // Jitter BEFORE the clamp so the documented minDelayMs floor and maxDelayMs
   // ceiling both still hold on the armed delay.
   const jr = params.jitterRatio ?? 0;
@@ -209,10 +209,11 @@ export function computeAutoResumeDelayMs(params: AutoResumeDelayParams): number 
   // half would otherwise pile up as a point mass), spread it downward-only,
   // keeping the ceiling intact while decorrelating the arms. Ceiling hits draw
   // a second random sample; sub-ceiling arms use exactly one.
-  if (jr > 0 && jittered >= params.maxDelayMs) {
-    return Math.max(params.minDelayMs, Math.round(params.maxDelayMs * (1 - jr * rand())));
-  }
-  return Math.round(clamped);
+  const initialDelay =
+    jr > 0 && jittered >= params.maxDelayMs
+      ? Math.max(params.minDelayMs, Math.round(params.maxDelayMs * (1 - jr * rand())))
+      : Math.round(clamped);
+  return Math.max(params.minDelayMs, Math.round(initialDelay - Math.max(0, params.elapsedMs)));
 }
 
 /**

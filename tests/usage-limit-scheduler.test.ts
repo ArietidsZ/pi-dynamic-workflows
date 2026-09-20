@@ -416,6 +416,29 @@ test("computeAutoResumeDelayMs: delay floor is enforced", () => {
   assert.equal(delay, 60_000, "1s base is below the floor, floor wins");
 });
 
+test("cold-start elapsed time is subtracted after backoff and the original delay ceiling", () => {
+  const params = {
+    resetHint: "resets in 10m",
+    attempts: 2,
+    elapsedMs: 5 * 60_000,
+    minDelayMs: 1_000,
+    maxDelayMs: 60 * 60_000,
+    fallbackDelayMs: 300_000,
+    jitterRatio: 0,
+  };
+  assert.equal(computeAutoResumeDelayMs(params), 15 * 60_000, "20m original delay minus 5m elapsed");
+  assert.equal(
+    computeAutoResumeDelayMs({ ...params, attempts: 10, elapsedMs: 30 * 60_000 }),
+    30 * 60_000,
+    "a capped one-hour arm has only 30m left after 30m elapsed",
+  );
+  assert.equal(
+    computeAutoResumeDelayMs({ ...params, attempts: 10, elapsedMs: 61 * 60_000 }),
+    1_000,
+    "an overdue capped arm uses only the retry floor",
+  );
+});
+
 test("computeAutoResumeDelayMs: backoff grows with attempts and is capped by maxDelayMs", () => {
   const base = { resetHint: "resets in 10m", elapsedMs: 0, minDelayMs: 1_000, fallbackDelayMs: 300_000 };
   const attempt1 = computeAutoResumeDelayMs({ ...base, attempts: 1, maxDelayMs: 3_600_000 });
