@@ -16,6 +16,8 @@ import { Type } from "typebox";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
 import {
   DEFAULT_EXCLUDED_SUBAGENT_TOOLS,
+  DEFAULT_PROVIDER_MIDDLEWARE_EXTENSIONS,
+  isProviderMiddlewareExtensionPath,
   listAvailableModelSpecs,
   resolveAgentModelSpec,
   runtimeOf,
@@ -32,6 +34,7 @@ import {
 } from "../src/model-tier-config.js";
 import { type JournalEntry, runWorkflow } from "../src/workflow.js";
 import { withFakeHome, withFakeHomeAsync } from "./helpers/fake-home.js";
+import { fauxRegistry, fauxRegistryFor } from "./helpers/faux-registry.js";
 import { readProviderSystemPrompt } from "./helpers/pi-context.js";
 
 // Private methods used for testing - cast to this type to access them without `any`
@@ -43,41 +46,8 @@ type WorkflowAgentPrivates = {
   agentIdFor(options: AgentRunOptions<any>, runCwd: string): string;
   restoreThreadLeaf(manager: SessionManager, leafId: string | null): void;
   getRegistry(perRunRegistry?: ModelRegistry): Promise<ModelRegistry>;
+  getSharedResourceLoader(agentDir: string, cwd?: string): Promise<DefaultResourceLoader>;
 };
-
-async function fauxRegistryFor(
-  home: string,
-  entries: ReadonlyArray<readonly [string, ReturnType<typeof createFauxCore>]>,
-): Promise<ModelRegistry> {
-  const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
-  for (const [provider, core] of entries) {
-    runtime.registerProvider(provider, {
-      name: `Faux Test ${provider}`,
-      baseUrl: "http://127.0.0.1:9/faux",
-      apiKey: "faux-dummy-key-not-used",
-      api: core.api,
-      streamSimple: core.streamSimple as never,
-      models: core.models.map((model) => ({
-        id: model.id,
-        name: model.name ?? model.id,
-        reasoning: model.reasoning ?? false,
-        input: ["text"] as ("text" | "image")[],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: model.contextWindow ?? 128000,
-        maxTokens: model.maxTokens ?? 4096,
-      })),
-    });
-  }
-  return new ModelRegistry(runtime);
-}
-
-async function fauxRegistry(
-  home: string,
-  provider: string,
-  core: ReturnType<typeof createFauxCore>,
-): Promise<ModelRegistry> {
-  return fauxRegistryFor(home, [[provider, core]]);
-}
 
 function bashToolResultText(context: unknown): string {
   const messages = (context as { messages?: Array<Record<string, unknown>> }).messages ?? [];
@@ -469,6 +439,11 @@ test("WorkflowAgent.run keeps injected settings and resources while using the ex
         agentDir: home,
         settingsManager,
         noExtensions: true,
+        extensionFactories: [
+          (pi) => {
+            pi.on("before_agent_start", (event) => ({ systemPrompt: `${event.systemPrompt}\nINJECTED_HOOK_BOUND` }));
+          },
+        ],
       });
       await resourceLoader.reload();
       let injectedSettingsReads = 0;
@@ -501,6 +476,7 @@ test("WorkflowAgent.run keeps injected settings and resources while using the ex
 
       const initialRequest = JSON.stringify(contexts[0]);
       assert.match(initialRequest, /INJECTED_RESOURCE_LOADER_MARKER/);
+      assert.match(initialRequest, /INJECTED_HOOK_BOUND/, "injected resource loaders bypass middleware discovery");
       assert.doesNotMatch(initialRequest, /TARGET_RESOURCE_LOADER_MARKER/);
       assert.ok(injectedSettingsReads > 0, "the SDK session must retain the host-injected SettingsManager");
       assert.match(
@@ -807,6 +783,32 @@ test("resolveAgentModelSpec: untagged agent with NO config falls through to sess
 test("resolveAgentModelSpec: untagged agent with a config lacking a medium tier => session default", () => {
   const noMedium = () => ({ tiers: { small: "vendor/small" } });
   assert.equal(resolveAgentModelSpec({}, "main/model", noMedium), undefined);
+});
+
+test("resolveAgentModelSpec: inheritMainModel routes untagged agents to the session's main model", () => {
+  // The native inheritance opt-in: no tier config required, and a configured
+  // medium tier no longer captures untagged agents.
+  assert.equal(resolveAgentModelSpec({}, "main/model", noCfg, undefined, { inheritMainModel: true }), "main/model");
+  assert.equal(resolveAgentModelSpec({}, "main/model", loadCfg, undefined, { inheritMainModel: true }), "main/model");
+});
+
+test("resolveAgentModelSpec: inheritMainModel does not affect explicit model or tier tags", () => {
+  assert.equal(
+    resolveAgentModelSpec({ model: "explicit/model" }, "main/model", loadCfg, undefined, { inheritMainModel: true }),
+    "explicit/model",
+  );
+  assert.equal(
+    resolveAgentModelSpec({ tier: "big" }, "main/model", loadCfg, undefined, { inheritMainModel: true }),
+    "vendor/big",
+  );
+});
+
+test("resolveAgentModelSpec: inheritMainModel with no main model falls back to legacy routing", () => {
+  // Nothing to inherit: the legacy untagged route applies instead of silently
+  // pinning the settings default — a configured medium tier still wins, and
+  // with no config the session default is used.
+  assert.equal(resolveAgentModelSpec({}, undefined, loadCfg, undefined, { inheritMainModel: true }), "vendor/medium");
+  assert.equal(resolveAgentModelSpec({}, undefined, noCfg, undefined, { inheritMainModel: true }), undefined);
 });
 
 test("resolveAgentModelSpec: tier with no main model and no config yields undefined", () => {
@@ -1435,10 +1437,11 @@ test("WorkflowAgent.run(): an untagged agent's IMPLICIT default medium tier degr
         fauxAssistantMessage("untagged-second", { stopReason: "stop" }),
       ]);
 
-      const fallbacks: Array<{ tier: string; requestedSpec: string }> = [];
+      const fallbacks: Array<{ tier: string; requestedSpec: string; source: string }> = [];
       const resolvedModels: string[] = [];
       const agent = new WorkflowAgent({ cwd, modelRegistry: registry });
-      const onModelFallback = (info: { tier: string; requestedSpec: string }) => fallbacks.push(info);
+      const onModelFallback = (info: { tier: string; requestedSpec: string; source: "medium-tier" | "inherit-main" }) =>
+        fallbacks.push(info);
 
       const first = await agent.run("task one", {
         label: "untagged-1",
@@ -1455,7 +1458,7 @@ test("WorkflowAgent.run(): an untagged agent's IMPLICIT default medium tier degr
       assert.ok(second.includes("untagged-second"), "second untagged agent should still complete via session default");
       assert.deepEqual(
         fallbacks,
-        [{ tier: "medium", requestedSpec: "deadprov/ghost-model" }],
+        [{ tier: "medium", requestedSpec: "deadprov/ghost-model", source: "medium-tier" }],
         "onModelFallback fires exactly once across both run() calls on the same instance",
       );
       assert.deepEqual(
@@ -1702,6 +1705,216 @@ return "done";`,
   }
 });
 
+test("WorkflowAgent.run(): inheritMainModel makes an untagged agent run on the session's main model", async () => {
+  // The native inheritance opt-in end-to-end: no model, no tier, no
+  // model-tiers.json — with the setting on, the subagent binds mainModel
+  // instead of the settings.json defaultProvider/defaultModel.
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-inherit-main-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-inherit-main-cwd-"));
+  const mainCore = createFauxCore({
+    provider: "fauxtest-main",
+    models: [{ id: "main-model", name: "Main Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  const defaultCore = createFauxCore({
+    provider: "fauxtest-default",
+    models: [{ id: "default-model", name: "Default Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const agentDir = join(home, ".pi", "agent");
+      mkdirSync(agentDir, { recursive: true });
+      // The settings default is a DIFFERENT model than the session's main model,
+      // so a fall-through to the settings default is observable in the response.
+      writeFileSync(
+        join(agentDir, "settings.json"),
+        JSON.stringify({ defaultProvider: "fauxtest-default", defaultModel: "default-model" }),
+      );
+
+      const registry = await fauxRegistryFor(home, [
+        ["fauxtest-main", mainCore],
+        ["fauxtest-default", defaultCore],
+      ]);
+      mainCore.setResponses([fauxAssistantMessage("ran-on-main-model", { stopReason: "stop" })]);
+      defaultCore.setResponses([fauxAssistantMessage("ran-on-settings-default", { stopReason: "stop" })]);
+
+      const resolved: string[] = [];
+      const agent = new WorkflowAgent({
+        cwd,
+        modelRegistry: registry,
+        mainModel: "fauxtest-main/main-model",
+        inheritMainModel: true,
+      });
+      const result = await agent.run("task", { label: "untagged", onModelResolved: (id) => resolved.push(id) });
+
+      assert.ok(result.includes("ran-on-main-model"), "untagged agent must run on the session's main model");
+      assert.deepEqual(resolved, ["fauxtest-main/main-model"], "the resolved id must reach onModelResolved");
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent.run(): an unavailable inherited main model degrades loudly, reported as inherit-main (not a medium-tier fallback)", async () => {
+  // With inheritMainModel on, an unresolvable mainModel must still degrade to
+  // the session default (never throw, never silently) — and the fallback
+  // payload must say inherit-main, not medium-tier, or debugging a routing
+  // surprise sends the user to a model-tiers.json that was never consulted.
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-inherit-degrade-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-inherit-degrade-cwd-"));
+  const defaultCore = createFauxCore({
+    provider: "fauxtest-default",
+    models: [{ id: "default-model", name: "Default Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const agentDir = join(home, ".pi", "agent");
+      mkdirSync(agentDir, { recursive: true });
+      writeFileSync(
+        join(agentDir, "settings.json"),
+        JSON.stringify({ defaultProvider: "fauxtest-default", defaultModel: "default-model" }),
+      );
+      const registry = await fauxRegistryFor(home, [["fauxtest-default", defaultCore]]);
+      defaultCore.setResponses([fauxAssistantMessage("ran-on-settings-default", { stopReason: "stop" })]);
+
+      const fallbacks: Array<{ tier: string; requestedSpec: string; source: string }> = [];
+      const agent = new WorkflowAgent({
+        cwd,
+        modelRegistry: registry,
+        mainModel: "fauxtest-ghost/ghost-model",
+        inheritMainModel: true,
+      });
+      const result = await agent.run("task", {
+        label: "untagged",
+        onModelFallback: (info) => fallbacks.push(info),
+      });
+
+      assert.ok(result.includes("ran-on-settings-default"), "an unavailable inherited model degrades, not throws");
+      assert.deepEqual(fallbacks, [
+        { tier: "medium", requestedSpec: "fauxtest-ghost/ghost-model", source: "inherit-main" },
+      ]);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent.run(): inheritMainModel with NO main model takes the medium-tier route, and its degrade is reported as medium-tier", async () => {
+  // The source discriminator must follow the route ACTUALLY taken, not the
+  // setting: flag on + no mainModel falls through to the medium tier, so a
+  // ghost medium entry degrades with source "medium-tier" (blaming a main
+  // model that does not exist would misdirect debugging).
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-no-main-degrade-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-no-main-degrade-cwd-"));
+  const defaultCore = createFauxCore({
+    provider: "fauxtest-default",
+    models: [{ id: "default-model", name: "Default Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const tiersDir = join(home, ".pi", "workflows");
+      mkdirSync(tiersDir, { recursive: true });
+      writeFileSync(
+        join(tiersDir, "model-tiers.json"),
+        JSON.stringify({ tiers: { medium: "fauxtest-ghost/ghost-model" } }),
+      );
+      const agentDir = join(home, ".pi", "agent");
+      mkdirSync(agentDir, { recursive: true });
+      writeFileSync(
+        join(agentDir, "settings.json"),
+        JSON.stringify({ defaultProvider: "fauxtest-default", defaultModel: "default-model" }),
+      );
+      const registry = await fauxRegistryFor(home, [["fauxtest-default", defaultCore]]);
+      defaultCore.setResponses([fauxAssistantMessage("ran-on-settings-default", { stopReason: "stop" })]);
+
+      const fallbacks: Array<{ tier: string; requestedSpec: string; source: string }> = [];
+      const agent = new WorkflowAgent({ cwd, modelRegistry: registry, inheritMainModel: true });
+      const result = await agent.run("task", {
+        label: "untagged",
+        onModelFallback: (info) => fallbacks.push(info),
+      });
+
+      assert.ok(result.includes("ran-on-settings-default"));
+      assert.deepEqual(fallbacks, [
+        { tier: "medium", requestedSpec: "fauxtest-ghost/ghost-model", source: "medium-tier" },
+      ]);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runWorkflow(): the degrade log names the route that actually degraded (inherit-main vs medium tier)", async () => {
+  // The onModelFallback log branch must not blame the medium tier when the
+  // inheritMainModel route degraded — pinning both messages end-to-end so a
+  // swapped branch or renamed message fails CI.
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-fallback-log-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-fallback-log-cwd-"));
+  const defaultCore = createFauxCore({
+    provider: "fauxtest-default",
+    models: [{ id: "default-model", name: "Default Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const agentDir = join(home, ".pi", "agent");
+      mkdirSync(agentDir, { recursive: true });
+      writeFileSync(
+        join(agentDir, "settings.json"),
+        JSON.stringify({ defaultProvider: "fauxtest-default", defaultModel: "default-model" }),
+      );
+      const registry = await fauxRegistryFor(home, [["fauxtest-default", defaultCore]]);
+      const script = `export const meta = { name: "fallback_log_demo", description: "one untagged agent" }
+await agent("task", { label: "untagged" });
+return "done";`;
+
+      // inheritMainModel on, inherited model unavailable → inherit-main message.
+      defaultCore.setResponses([fauxAssistantMessage("degraded-1", { stopReason: "stop" })]);
+      const inheritLogs: string[] = [];
+      await runWorkflow(script, {
+        cwd,
+        modelRegistry: registry,
+        mainModel: "fauxtest-ghost/ghost-model",
+        inheritMainModel: true,
+        onLog: (message) => inheritLogs.push(message),
+      });
+      assert.ok(
+        inheritLogs.some(
+          (m) => m === 'inherited main model "fauxtest-ghost/ghost-model" unavailable — using the session default',
+        ),
+        `expected the inherit-main degrade message, got: ${JSON.stringify(inheritLogs)}`,
+      );
+
+      // Legacy route: medium tier configured but unavailable → medium-tier message.
+      const tiersDir = join(home, ".pi", "workflows");
+      mkdirSync(tiersDir, { recursive: true });
+      writeFileSync(
+        join(tiersDir, "model-tiers.json"),
+        JSON.stringify({ tiers: { medium: "fauxtest-ghost/ghost-model" } }),
+      );
+      defaultCore.setResponses([fauxAssistantMessage("degraded-2", { stopReason: "stop" })]);
+      const tierLogs: string[] = [];
+      await runWorkflow(script, {
+        cwd,
+        modelRegistry: registry,
+        mainModel: "fauxtest-default/default-model",
+        onLog: (message) => tierLogs.push(message),
+      });
+      assert.ok(
+        tierLogs.some(
+          (m) =>
+            m === 'default "medium" tier model "fauxtest-ghost/ghost-model" unavailable — using the session default',
+        ),
+        `expected the medium-tier degrade message, got: ${JSON.stringify(tierLogs)}`,
+      );
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("WorkflowAgent.run() still completes with a normal object schema (no regression)", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-dw-schema-ok-home-"));
   const cwd = mkdtempSync(join(tmpdir(), "pi-dw-schema-ok-cwd-"));
@@ -1798,9 +2011,9 @@ test("subagentExcludedTools always includes the defaults, plus caller/session na
   assert.ok(merged.includes("session-denied") && merged.includes("extra"), "both caller lists are folded in");
 });
 
-test("the subagent resource loader is built once per directory and shared across subagents (#109)", () => {
-  // The #109 mitigation: one no-extensions loader per run, reused by every
-  // subagent, instead of createAgentSession re-running every extension factory
+test("the subagent resource loader is built once per directory and shared across subagents (#109)", async () => {
+  // The #109 mitigation: one filtered loader per directory, reused by every
+  // subagent there, instead of createAgentSession re-running every extension factory
   // (and rooting each disposed session) per subagent. Memoization is the invariant.
   const agent = new WorkflowAgent({ cwd: "/tmp" });
   type Priv = { getSharedResourceLoader(agentDir: string): Promise<unknown> };
@@ -1809,8 +2022,232 @@ test("the subagent resource loader is built once per directory and shared across
   const second = a.getSharedResourceLoader("/tmp/agentdir");
   assert.equal(first, second, "same promise — the loader is built once and shared, not rebuilt per subagent");
   // reload() may reject in a bare temp dir; we only assert memoization here.
-  first.catch(() => {});
-  second.catch(() => {});
+  await Promise.allSettled([first, second]);
+});
+
+test("provider middleware approval does not inherit from unrelated ancestor directories", () => {
+  const allowed = ["example-provider-adapter"];
+  assert.equal(isProviderMiddlewareExtensionPath("/example-provider-adapter/project/unrelated.js", allowed), false);
+  assert.equal(
+    isProviderMiddlewareExtensionPath("/node_modules/@other/example-provider-adapter/index.js", allowed),
+    false,
+  );
+  assert.equal(
+    isProviderMiddlewareExtensionPath("/packages/adapter/index.js", allowed, "npm:example-provider-adapter@1.0.0"),
+    true,
+  );
+  assert.equal(
+    isProviderMiddlewareExtensionPath("/packages/adapter/index.js", allowed, "/local/example-provider-adapter"),
+    true,
+  );
+  assert.equal(
+    isProviderMiddlewareExtensionPath("/packages/adapter/index.js", allowed, "/example-provider-adapter/unrelated"),
+    false,
+  );
+});
+
+test("provider middleware path matching uses exact identities and always denies recursion", () => {
+  const allowed = [" Example-Provider-Adapter ", "workflow", "pi-dynamic-workflows", "pi-subagents"];
+  for (const path of [
+    "/extensions/example-provider-adapter.ts",
+    "/node_modules/example-provider-adapter/src/index.js",
+    "C:\\extensions\\EXAMPLE-PROVIDER-ADAPTER.cjs",
+  ]) {
+    assert.equal(isProviderMiddlewareExtensionPath(path, allowed), true, path);
+    assert.equal(isProviderMiddlewareExtensionPath(path, []), false, path);
+  }
+  for (const path of [
+    "/extensions/not-example-provider-adapter.ts",
+    "/extensions/workflow.ts",
+    "/extensions/pi-subagents.js",
+    "/node_modules/pi-dynamic-workflows/extensions/index.ts",
+    "/example-provider-adapter/workflow.mjs",
+    "/pi-subagents/example-provider-adapter.ts",
+  ]) {
+    assert.equal(isProviderMiddlewareExtensionPath(path, allowed), false, path);
+  }
+});
+
+for (const allowlist of [
+  undefined,
+  [],
+  ["example-provider-adapter", "workflow", "pi-subagents", "pi-dynamic-workflows"],
+]) {
+  test(`child middleware binds before prompting only when opted in (${JSON.stringify(allowlist)})`, async () => {
+    const home = mkdtempSync(join(tmpdir(), "pi-dw-middleware-home-"));
+    const cwd = mkdtempSync(join(tmpdir(), "pi-dw-middleware-cwd-"));
+    const extensionDir = join(home, ".pi", "agent", "extensions");
+    const core = createFauxCore({
+      provider: "fauxtest-middleware",
+      models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+    });
+    try {
+      mkdirSync(extensionDir, { recursive: true });
+      writeFileSync(
+        join(extensionDir, "example-provider-adapter.js"),
+        `export default function (pi) {
+          let started = false;
+          pi.on("session_start", () => { started = true; });
+          pi.on("before_agent_start", (event) => ({ systemPrompt: event.systemPrompt + "\\nADAPTER_BOUND" }));
+          pi.on("before_provider_request", (event) => ({ ...event.payload, adapterStarted: started }));
+        }`,
+      );
+      for (const name of ["workflow", "pi-subagents", "pi-dynamic-workflows", "unrelated-extension"]) {
+        writeFileSync(
+          join(extensionDir, `${name}.js`),
+          `export default function () { throw new Error("excluded extension factory loaded"); }`,
+        );
+      }
+      await withFakeHomeAsync(home, async () => {
+        const registry = await fauxRegistry(home, "fauxtest-middleware", core);
+        const agent = new WorkflowAgent({ cwd, modelRegistry: registry, providerMiddlewareExtensions: allowlist });
+        const loader = await (agent as unknown as WorkflowAgentPrivates).getSharedResourceLoader(
+          join(home, ".pi", "agent"),
+        );
+        const result = loader.getExtensions();
+        assert.deepEqual(DEFAULT_PROVIDER_MIDDLEWARE_EXTENSIONS, []);
+        assert.deepEqual(result.errors, [], "excluded factories must never execute");
+        assert.deepEqual(
+          result.extensions.map((entry) => entry.path),
+          allowlist?.length ? [join(extensionDir, "example-provider-adapter.js")] : [],
+        );
+        let requests = 0;
+        core.setResponses([
+          async (context, options, _state, model) => {
+            requests++;
+            assert.equal(JSON.stringify(context).includes("ADAPTER_BOUND"), Boolean(allowlist?.length));
+            // Faux transport does not serialize HTTP payloads. Exercise the SDK's
+            // actual request hook locally, without contacting an external provider.
+            assert.ok(options?.onPayload);
+            const payload = await options.onPayload({ task: "example" }, model);
+            assert.deepEqual(
+              payload,
+              allowlist?.length ? { task: "example", adapterStarted: true } : { task: "example" },
+            );
+            return fauxAssistantMessage("middleware checked", { stopReason: "stop" });
+          },
+        ]);
+        await agent.run("task", { model: "fauxtest-middleware/faux-model" });
+        assert.equal(requests, 1, "the real child SDK session must reach the faux provider");
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+}
+
+test("provider middleware resolves package entrypoints without loading disabled or recursive factories", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-dw-middleware-package-"));
+  try {
+    const packageDir = join(root, "example-provider-adapter");
+    mkdirSync(packageDir);
+    writeFileSync(
+      join(packageDir, "package.json"),
+      JSON.stringify({ pi: { extensions: ["index.js", "disabled.js", "workflow.js"] } }),
+    );
+    writeFileSync(join(packageDir, "index.js"), "export default function () {}");
+    for (const file of ["disabled.js", "workflow.js"]) {
+      writeFileSync(
+        join(packageDir, file),
+        'export default function () { throw new Error("excluded factory loaded"); }',
+      );
+    }
+    const agent = new WorkflowAgent({
+      cwd: root,
+      providerMiddlewareExtensions: ["example-provider-adapter", "workflow"],
+      session: {
+        settingsManager: SettingsManager.inMemory({
+          packages: [{ source: packageDir, extensions: ["index.js", "workflow.js"] }],
+        }),
+      },
+    });
+    const loader = await (agent as unknown as WorkflowAgentPrivates).getSharedResourceLoader(join(root, "agent"));
+    assert.deepEqual(loader.getExtensions().errors, []);
+    assert.deepEqual(
+      loader.getExtensions().extensions.map((entry) => entry.path),
+      [join(packageDir, "index.js")],
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("provider middleware resolves per run cwd using injected project trust settings", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-middleware-cwd-home-"));
+  const root = mkdtempSync(join(tmpdir(), "pi-dw-middleware-cwd-"));
+  const first = join(root, "first");
+  const second = join(root, "second");
+  const core = createFauxCore({
+    provider: "fauxtest-middleware-cwd",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    for (const [cwd, marker] of [
+      [first, "FIRST_ADAPTER_BOUND"],
+      [second, "SECOND_ADAPTER_BOUND"],
+    ]) {
+      const extensionDir = join(cwd, ".pi", "extensions");
+      mkdirSync(extensionDir, { recursive: true });
+      writeFileSync(
+        join(extensionDir, "example-provider-adapter.js"),
+        `export default function (pi) {
+          let turns = 0;
+          pi.on("before_agent_start", (event) => ({ systemPrompt: event.systemPrompt + "\\n${marker}:" + (++turns) }));
+        }`,
+      );
+    }
+    await withFakeHomeAsync(home, async () => {
+      const registry = await fauxRegistry(home, "fauxtest-middleware-cwd", core);
+      const settingsManager = SettingsManager.inMemory({}, { projectTrusted: true });
+      const agent = new WorkflowAgent({
+        cwd: first,
+        modelRegistry: registry,
+        providerMiddlewareExtensions: ["example-provider-adapter"],
+        session: { settingsManager },
+      });
+      const contexts: unknown[] = [];
+      core.setResponses(
+        [1, 2, 3].map(() => (context) => {
+          contexts.push(context);
+          return fauxAssistantMessage("cwd middleware bound", { stopReason: "stop" });
+        }),
+      );
+      const model = "fauxtest-middleware-cwd/faux-model";
+      await agent.run("first", { cwd: first, model });
+      await agent.run("second", { cwd: second, model });
+      await agent.run("first again", { cwd: first, model });
+      const requests = contexts.map((context) => JSON.stringify(context));
+      assert.match(requests[0], /FIRST_ADAPTER_BOUND:1/);
+      assert.doesNotMatch(requests[0], /SECOND_ADAPTER_BOUND/);
+      assert.match(requests[1], /SECOND_ADAPTER_BOUND:1/);
+      assert.doesNotMatch(requests[1], /FIRST_ADAPTER_BOUND/);
+      assert.match(
+        requests[2],
+        /FIRST_ADAPTER_BOUND:1/,
+        "each child needs its own extension runtime and factory state",
+      );
+      const privateAgent = agent as unknown as WorkflowAgentPrivates;
+      const agentDir = join(home, ".pi", "agent");
+      const [firstLoader, repeatedLoader, secondLoader] = await Promise.all([
+        privateAgent.getSharedResourceLoader(agentDir, first),
+        privateAgent.getSharedResourceLoader(agentDir, first),
+        privateAgent.getSharedResourceLoader(agentDir, second),
+      ]);
+      assert.notEqual(firstLoader, repeatedLoader);
+      assert.notEqual(firstLoader, secondLoader);
+      const untrusted = new WorkflowAgent({
+        cwd: first,
+        providerMiddlewareExtensions: ["example-provider-adapter"],
+        session: { settingsManager: SettingsManager.inMemory({}, { projectTrusted: false }) },
+      });
+      const untrustedLoader = await (untrusted as unknown as WorkflowAgentPrivates).getSharedResourceLoader(agentDir);
+      assert.deepEqual(untrustedLoader.getExtensions().extensions, [], "allowlist must not bypass project trust");
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("a failed per-directory resource loader is evicted before the next attempt (#109)", async () => {
@@ -1832,6 +2269,26 @@ test("a failed per-directory resource loader is evicted before the next attempt 
     assert.equal(reloadAttempts, 2, "the next call must construct and reload a fresh loader");
   } finally {
     DefaultResourceLoader.prototype.reload = originalReload;
+  }
+});
+
+test("the shared resource-loader memo is bounded while loaders are still pending (#109)", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-loader-pending-root-"));
+  const agentDir = mkdtempSync(join(root, "agent-"));
+  try {
+    const agent = new WorkflowAgent({ cwd: root });
+    type Priv = { getSharedResourceLoader(agentDir: string, cwd: string): Promise<unknown> };
+    const privateAgent = agent as unknown as Priv;
+    const promises = Array.from({ length: 12 }, (_, i) => {
+      const cwd = mkdtempSync(join(root, `cwd-${i}-`));
+      return privateAgent.getSharedResourceLoader(agentDir, cwd);
+    });
+    const loaders = (agent as unknown as { resourceLoaders: Map<string, unknown> }).resourceLoaders;
+
+    assert.ok(loaders.size <= 8, `the memo must be bounded before any loader resolves (got ${loaders.size})`);
+    await Promise.all(promises);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -2685,5 +3142,33 @@ test("fallback registry resolves to a real ModelRegistry on stock pi and is cach
     });
   } finally {
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent.run bounds the loader memo: one-off cwds are LRU-evicted (audit2 #41)", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-loader-lru-home-"));
+  const root = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-loader-lru-root-"));
+  const core = createFauxCore({
+    provider: "fauxtest-loader-lru",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const registry = await fauxRegistry(home, "fauxtest-loader-lru", core);
+      core.setResponses(
+        Array.from({ length: 12 }, (_, i) => fauxAssistantMessage(`answer ${i}`, { stopReason: "stop" })),
+      );
+      const agent = new WorkflowAgent({ cwd: root, modelRegistry: registry });
+      // Worktree-style fan-out: every call has a unique explicit cwd.
+      for (let i = 0; i < 12; i++) {
+        const dir = mkdtempSync(join(root, `wt-${i}-`));
+        await agent.run(`call ${i}`, { cwd: dir, model: "fauxtest-loader-lru/faux-model" });
+      }
+      const loaders = (agent as unknown as { resourceLoaders: Map<string, unknown> }).resourceLoaders;
+      assert.ok(loaders.size <= 8, `one-off worktree loaders are LRU-evicted (got ${loaders.size}, cap is 8)`);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
   }
 });

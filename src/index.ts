@@ -1,7 +1,12 @@
 export type { AdversarialReviewConfig } from "./adversarial-review.js";
 export { generateAdversarialReviewWorkflow, generateMultiPerspectiveWorkflow } from "./adversarial-review.js";
 export type { AgentRunOptions, AgentRunResult, WorkflowAgentOptions } from "./agent.js";
-export { listAvailableModelSpecs, listAvailableModels, WorkflowAgent } from "./agent.js";
+export {
+  DEFAULT_PROVIDER_MIDDLEWARE_EXTENSIONS,
+  listAvailableModelSpecs,
+  listAvailableModels,
+  WorkflowAgent,
+} from "./agent.js";
 export type { AgentHistoryEntry, AgentHistoryKind, AgentHistoryRole } from "./agent-history.js";
 export { compactAgentHistory } from "./agent-history.js";
 export type { AgentDefinition, AgentRegistry } from "./agent-registry.js";
@@ -207,5 +212,5 @@ export {
   type ViewKind,
 } from "./workflow-ui.js";
 export { registerWorkflowModelsCommand } from "./workflows-models-command.js";
-export type { Worktree } from "./worktree.js";
+export type { Worktree, WorktreeExecOptions } from "./worktree.js";
 export { createWorktree, removeWorktree } from "./worktree.js";

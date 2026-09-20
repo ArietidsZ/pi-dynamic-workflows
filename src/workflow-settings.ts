@@ -42,6 +42,17 @@ export interface WorkflowSettings {
    */
   persistAgentSessions?: boolean;
   /**
+   * Route UNTAGGED agent() calls (no `model`, no `tier`) to the orchestrating
+   * session's main model instead of the implicit medium tier (when
+   * configured) or the settings default. Default false (legacy routing).
+   * Explicit `model`/`tier` tags are unaffected. Applies when the session has
+   * a main model; with none set, legacy routing applies. The inherited model
+   * is the main model in effect when the RUN starts; a mid-run /model switch
+   * applies to subsequent runs. An unavailable inherited model degrades to
+   * the settings default with a run-visible warning instead of throwing.
+   */
+  inheritMainModel?: boolean;
+  /**
    * Character cap on a delivered background-run result's JSON-dump fallback
    * before truncation (default 400). String results and `verdict`/`report`/
    * `summary`/`synthesis` fields are never truncated.
@@ -54,6 +65,12 @@ export interface WorkflowSettings {
    * tool) so a subagent can't fan out through them.
    */
   excludeSubagentTools?: string[];
+  /**
+   * Trusted provider/auth middleware extension names allowed in child sessions.
+   * Omitted or [] loads no host extensions. Recursive workflow/subagent
+   * extensions are always excluded.
+   */
+  providerMiddlewareExtensions?: string[];
 }
 
 export interface WorkflowSettingsStore {
@@ -200,11 +217,19 @@ function normalizeSettings(value: unknown): WorkflowSettings {
   if (typeof raw.persistAgentSessions === "boolean") {
     settings.persistAgentSessions = raw.persistAgentSessions;
   }
+  if (typeof raw.inheritMainModel === "boolean") {
+    settings.inheritMainModel = raw.inheritMainModel;
+  }
   const deliveredResultMaxChars = normalizeInteger(raw.deliveredResultMaxChars, 1, 1_000_000);
   if (deliveredResultMaxChars !== undefined) settings.deliveredResultMaxChars = deliveredResultMaxChars;
   if (Array.isArray(raw.excludeSubagentTools)) {
     const names = raw.excludeSubagentTools.filter((t): t is string => typeof t === "string" && t.trim().length > 0);
     if (names.length) settings.excludeSubagentTools = names;
+  }
+  if (Array.isArray(raw.providerMiddlewareExtensions)) {
+    settings.providerMiddlewareExtensions = raw.providerMiddlewareExtensions
+      .filter((name): name is string => typeof name === "string" && name.trim().length > 0)
+      .map((name) => name.trim());
   }
   return settings;
 }

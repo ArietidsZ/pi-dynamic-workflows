@@ -97,11 +97,13 @@ function buildManagerOptions(cwd: string, storage: WorkflowStorage) {
       "web-research": () => [...createCodingTools(cwd), ...createWebTools()],
     },
     excludeSubagentTools: settings.excludeSubagentTools,
+    providerMiddlewareExtensions: settings.providerMiddlewareExtensions,
     defaultAgentTimeoutMs: settings.defaultAgentTimeoutMs ?? null,
     defaultTokenBudget: settings.defaultTokenBudget ?? null,
     concurrency: settings.defaultConcurrency,
     defaultAgentRetries: settings.defaultAgentRetries,
     persistAgentSessions: settings.persistAgentSessions,
+    inheritMainModel: settings.inheritMainModel,
   };
 }
 

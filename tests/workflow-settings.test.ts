@@ -124,6 +124,32 @@ describe("workflow settings", () => {
     });
   });
 
+  it("loads the provider middleware allowlist and preserves an explicit empty list", () => {
+    withSettingsPath((settingsPath) => {
+      mkdirSync(dirname(settingsPath), { recursive: true });
+      writeFileSync(
+        settingsPath,
+        JSON.stringify({ providerMiddlewareExtensions: [" example-provider-adapter ", 42, "", "  ", null] }),
+        "utf-8",
+      );
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {
+        providerMiddlewareExtensions: ["example-provider-adapter"],
+      });
+      for (const value of [[], [42, "  ", null]]) {
+        writeFileSync(settingsPath, JSON.stringify({ providerMiddlewareExtensions: value }), "utf-8");
+        assert.deepEqual(loadWorkflowSettings(settingsPath), { providerMiddlewareExtensions: [] });
+      }
+      for (const value of [null, "example-provider-adapter", {}]) {
+        writeFileSync(settingsPath, JSON.stringify({ providerMiddlewareExtensions: value }), "utf-8");
+        assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+      }
+      saveWorkflowSettings({ providerMiddlewareExtensions: ["example-provider-adapter"] }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {
+        providerMiddlewareExtensions: ["example-provider-adapter"],
+      });
+    });
+  });
+
   it("normalizes default concurrency and agent retries", () => {
     withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });
@@ -357,6 +383,50 @@ describe("workflow settings", () => {
 
       writeFileSync(settingsPath, JSON.stringify({ persistAgentSessions: null }), "utf-8");
       assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+    });
+  });
+
+  it("saves, loads, and normalizes inheritMainModel", () => {
+    withSettingsPath((settingsPath) => {
+      saveWorkflowSettings({ inheritMainModel: true }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { inheritMainModel: true });
+
+      saveWorkflowSettings({ inheritMainModel: false }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { inheritMainModel: false });
+
+      writeFileSync(settingsPath, JSON.stringify({ inheritMainModel: "true" }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+
+      writeFileSync(settingsPath, JSON.stringify({ inheritMainModel: 1 }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+    });
+  });
+
+  it("applies inheritMainModel through the repo-local and project overlays", () => {
+    withSettingsPath((settingsPath) => {
+      const projectLocalSettingsPath = join(dirname(settingsPath), "repo-settings.json");
+      const projectSettingsPath = join(dirname(settingsPath), "project-settings.json");
+      const options = { settingsPath, projectLocalSettingsPath, projectSettingsPath };
+      saveWorkflowSettings({ inheritMainModel: true }, settingsPath);
+
+      assert.deepEqual(loadWorkflowSettings(options), { inheritMainModel: true });
+
+      // A repo-local explicit false cancels the global opt-in.
+      writeFileSync(projectLocalSettingsPath, JSON.stringify({ inheritMainModel: false }));
+      assert.deepEqual(loadWorkflowSettings(options), { inheritMainModel: false });
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { inheritMainModel: true });
+
+      // Invalid overlay values must not clobber the global setting.
+      for (const value of [{ inheritMainModel: "true" }, { inheritMainModel: 1 }, [], null]) {
+        writeFileSync(projectLocalSettingsPath, JSON.stringify(value));
+        assert.deepEqual(loadWorkflowSettings(options), { inheritMainModel: true });
+      }
+
+      // An external project overlay wins over the repo-local file.
+      writeFileSync(projectLocalSettingsPath, JSON.stringify({ inheritMainModel: true }));
+      saveWorkflowSettings({ inheritMainModel: false }, { ...options, scope: "project" });
+      assert.deepEqual(loadWorkflowSettings(options), { inheritMainModel: false });
+      assert.deepEqual(JSON.parse(readFileSync(projectLocalSettingsPath, "utf-8")), { inheritMainModel: true });
     });
   });
 
