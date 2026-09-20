@@ -353,7 +353,9 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    * Top-level workflow error observed before runWorkflow drains in-flight agents.
    * This preserves error provenance for hosts whose own lifecycle control can race
    * with that cooperative drain. Observational only: callback failures (sync or
-   * async) are ignored.
+   * async) are ignored. A durable checkpoint suspension does NOT invoke this —
+   * an intentional human-in-the-loop pause is not a fatal error (in-flight
+   * siblings are waited out, not aborted).
    */
   onRunFatal?: (error: unknown) => void | PromiseLike<void>;
 }
@@ -1038,7 +1040,13 @@ export async function runWorkflow<T = unknown>(
             void runPromise.catch(() => undefined);
             const result = await withTimeout(runPromise, timeout, label, () => agentController.abort());
 
-            throwIfAborted();
+            // Abort-only check, deliberately NOT throwIfAborted(): the result is
+            // paid for at this point, so a pending durable checkpoint suspension
+            // must not discard it un-journaled (audit2 #2 — the suspension
+            // re-checks at the next script-level gate and at the top level).
+            if (isAborted()) {
+              throw new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true });
+            }
             if (isEmptyTextAgentResult(result, agentOptions.schema)) {
               throw new WorkflowError("Subagent produced no assistant output", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, {
                 recoverable: true,
@@ -1702,7 +1710,13 @@ export async function runWorkflow<T = unknown>(
     // journal — this stops burning an already-exhausted budget right now, at
     // the cost of that sibling's work being thrown away and re-run live when
     // the paused run resumes (it was never journaled, so it isn't cached).
-    if (isTopLevelRun) {
+    // A durable checkpoint suspension is an intentional pause, not a fatal
+    // error: do NOT seal the run for it. Sealing would abort every in-flight
+    // sibling mid-call — their paid work is discarded un-journaled and re-run
+    // (double-paid) on resume. The finally drain below waits them out so their
+    // results journal for free before the suspension propagates.
+    const isCheckpointSuspension = shared.checkpointSuspension !== undefined && error === shared.checkpointSuspension;
+    if (isTopLevelRun && !isCheckpointSuspension) {
       // Notify the host before the cooperative drain below. A pause/stop can be
       // requested while siblings settle, but it must not erase a provider-limit
       // error that had already escaped this top-level workflow.
