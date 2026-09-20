@@ -32,6 +32,7 @@ import {
 } from "../src/model-tier-config.js";
 import { type JournalEntry, runWorkflow } from "../src/workflow.js";
 import { withFakeHome, withFakeHomeAsync } from "./helpers/fake-home.js";
+import { readProviderSystemPrompt } from "./helpers/pi-context.js";
 
 // Private methods used for testing - cast to this type to access them without `any`
 type WorkflowAgentPrivates = {
@@ -542,7 +543,7 @@ test("WorkflowAgent.run lets the default resource loader use an injected Setting
 
       assert.match(result, /settings loader marker observed/);
       assert.match(
-        (contexts[0] as { systemPrompt?: string }).systemPrompt ?? "",
+        readProviderSystemPrompt(contexts[0]),
         new RegExp(marker),
         "the default loader must read project APPEND_SYSTEM.md using the injected trust settings",
       );
