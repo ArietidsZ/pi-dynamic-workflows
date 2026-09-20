@@ -234,10 +234,18 @@ describe("logger", () => {
       log.log("d"); // write-through succeeds again
       log.persist();
       const content = readFileSync(file, "utf8");
-      for (const line of ["a", "b", "c", "d"]) {
-        assert.ok(content.includes(` ${line}\n`), `line ${line} on disk`);
+      const messages = content
+        .trimEnd()
+        .split("\n")
+        .map((line) => line.slice(line.lastIndexOf("] ") + 2));
+      assert.deepEqual(messages, ["a", "b", "c", "d"], "retried entries preserve original append order");
+      for (const message of messages) {
+        assert.equal(
+          messages.filter((candidate) => candidate === message).length,
+          1,
+          `${message} appears exactly once after retry`,
+        );
       }
-      assert.equal(content.match(/ a\n/g)?.length, 1, "no duplicate re-append of a");
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }

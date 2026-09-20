@@ -32,29 +32,29 @@ export function createWorkflowLogger(options: WorkflowLoggerOptions = {}): Workf
   const runId = options.runId ?? `run-${Date.now()}`;
   const runsDir = workflowProjectPaths(cwd).runsDir;
   let logFile: string | null = null;
-  // Per-entry on-disk flags (audit2 #39 + r1 MINOR 3): persist() appends only
-  // unflagged entries — a full rewrite per persist doubles write volume, and
-  // a RESUMED run's fresh logger would wipe the earlier execution's lines.
-  // A watermark (persistedUpTo) would be WRONG here: a successful
-  // write-through append must not mark EARLIER entries — whose own appends
-  // failed silently — as on-disk, or persist() could never re-append them.
-  const persisted: boolean[] = [];
+  // One continuous in-memory append cursor. A failed write must not advance it:
+  // the next successful append writes every missing entry in original order.
+  // A resumed logger starts at zero but only holds its new execution's logs, so
+  // it appends without rewriting the earlier execution's file contents.
+  let nextUnpersisted = 0;
+
+  const flushPendingEntries = () => {
+    if (!logFile || logs.length === nextUnpersisted) return;
+    appendFileSync(logFile, `${logs.slice(nextUnpersisted).join("\n")}\n`);
+    nextUnpersisted = logs.length;
+  };
 
   const write = (level: string, message: string) => {
     const timestamp = new Date().toISOString();
     const entry = `[${timestamp}] [${level}] ${message}`;
-    const idx = logs.length;
     logs.push(entry);
-    persisted.push(false);
     options.onLog?.(message);
 
     if (persistLogs && logFile) {
       try {
-        appendFileSync(logFile, `${entry}\n`);
-        // Written through: flag ONLY this entry so persist() skips it.
-        persisted[idx] = true;
+        flushPendingEntries();
       } catch {
-        // Silent fail for log persistence — persist() retries unflagged lines.
+        // Silent fail for log persistence — a later flush retries in order.
       }
     }
   };
@@ -77,16 +77,8 @@ export function createWorkflowLogger(options: WorkflowLoggerOptions = {}): Workf
       try {
         mkdirSync(runsDir, { recursive: true });
         logFile = join(runsDir, `${runId}.log`);
-        const pendingIdx: number[] = [];
-        for (let i = 0; i < logs.length; i++) {
-          if (!persisted[i]) pendingIdx.push(i);
-        }
-        if (pendingIdx.length > 0) {
-          // Append, not rewrite: an earlier execution of this runId (pause /
-          // resume) already wrote its lines to this file.
-          appendFileSync(logFile, `${pendingIdx.map((i) => logs[i]).join("\n")}\n`);
-          for (const i of pendingIdx) persisted[i] = true;
-        } else if (!existsSync(logFile)) {
+        flushPendingEntries();
+        if (!existsSync(logFile)) {
           writeFileSync(logFile, "");
         }
         return logFile;
