@@ -2367,6 +2367,143 @@ return main`;
   assert.equal(calls.main, 1, "the awaited agent's cached result must replay, not re-run, on resume");
 });
 
+test("an aborted run's drain abandons signal-ignoring agents after drainAbortGraceMs (audit2 #3)", async () => {
+  // Un-awaited agent whose runner NEVER settles and ignores its abort signal:
+  // without the grace the drain (and the run) would wedge forever.
+  const script = `export const meta = { name: 'hung_drain', description: 'hung drain' }
+void agent('wedged', { label: 'wedged' })
+return 'script-done'`;
+  for (const abortTiming of ["during-drain", "before-drain"] as const) {
+    const controller = new AbortController();
+    const logs: string[] = [];
+    const started = Date.now();
+    let agentStarted!: () => void;
+    const agentGate = new Promise<void>((resolve) => (agentStarted = resolve));
+    const pending = runWorkflow<string>(script, {
+      agent: {
+        async run() {
+          agentStarted();
+          return new Promise<string>(() => {}); // never settles, ignores signal
+        },
+      },
+      signal: controller.signal,
+      drainAbortGraceMs: 50,
+      persistLogs: false,
+      onLog: (m) => logs.push(m),
+    });
+    await agentGate; // the hung agent is in-flight
+    if (abortTiming === "before-drain") {
+      // Abort immediately: the script may not have returned yet — the drain
+      // starts already-aborted.
+      controller.abort();
+    } else {
+      // Wait for the drain to start (its log line), then abort mid-drain.
+      for (let i = 0; i < 2000 && !logs.some((l) => l.includes("outstanding agent()")); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+      controller.abort();
+    }
+    await pending.catch(() => {});
+    assert.ok(
+      Date.now() - started < 5_000,
+      `${abortTiming}: the run settles promptly after the grace instead of wedging`,
+    );
+    assert.ok(
+      logs.some((l) => l.includes("abandoning 1 outstanding agent()")),
+      `${abortTiming}: the abandonment is logged`,
+    );
+  }
+});
+
+test("drainAbortGraceMs: Infinity restores unbounded waiting (no busy-spin) (audit2 #3)", async () => {
+  const script = `export const meta = { name: 'hung_inf', description: 'hung inf' }
+void agent('wedged', { label: 'wedged' })
+return 'script-done'`;
+  const controller = new AbortController();
+  const logs: string[] = [];
+  let agentStarted!: () => void;
+  const agentGate = new Promise<void>((resolve) => (agentStarted = resolve));
+  const pending = runWorkflow<string>(script, {
+    agent: {
+      async run() {
+        agentStarted();
+        return new Promise<string>(() => {});
+      },
+    },
+    signal: controller.signal,
+    drainAbortGraceMs: Number.POSITIVE_INFINITY,
+    persistLogs: false,
+    onLog: (m) => logs.push(m),
+  });
+  await agentGate;
+  controller.abort();
+  // With Infinity the drain must NOT abandon: it keeps waiting. Give it ample
+  // time to (wrongly) abandon or (wrongly) busy-spin, then confirm neither.
+  const settled = await Promise.race([
+    pending.then(
+      () => true,
+      () => true,
+    ),
+    new Promise((r) => setTimeout(() => r(false), 300)),
+  ]);
+  assert.equal(settled, false, "Infinity grace: the drain must not abandon the hung agent");
+  assert.ok(!logs.some((l) => l.includes("abandoning")), "no abandonment logged");
+  // Cleanup: not observable further (the run stays wedged by design) — the
+  // process exits because nothing else holds the loop (agent promise is not a
+  // handle).
+});
+
+test("a NON-abort (success) drain still waits without a bound for a slow un-awaited agent (audit2 #3)", async () => {
+  // The success-path drain must not be grace-limited: the slow sibling's
+  // result is still wanted (it journals when it completes).
+  const script = `export const meta = { name: 'slow_drain', description: 'slow drain' }
+const pending = agent('slow', { label: 'slow' })
+return 'script-done'`;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const started = Date.now();
+  const result = await runWorkflow<string>(script, {
+    agent: {
+      async run() {
+        setTimeout(release, 150);
+        await gate;
+        return "slow-done";
+      },
+    },
+    drainAbortGraceMs: 10, // even with a tiny grace, the success drain waits
+    persistLogs: false,
+  });
+  assert.equal(result.result, "script-done");
+  assert.ok(Date.now() - started >= 140, "the success drain waited out the slow sibling");
+});
+
+test("aborted drain finalizes reported terminal usage before flushing the returned totals", async () => {
+  const controller = new AbortController();
+  const totals: number[] = [];
+  const result = await runWorkflow(
+    `export const meta = { name: 'abandon_usage', description: 'usage' }
+void agent('reported but hung')
+return 'script-done'`,
+    {
+      agent: {
+        async run(_prompt, options) {
+          options?.onUsage?.({ input: 40, output: 2, total: 42, cost: 0, cacheRead: 0, cacheWrite: 0 });
+          return new Promise(() => {});
+        },
+      },
+      signal: controller.signal,
+      drainAbortGraceMs: 5,
+      persistLogs: false,
+      onLog: (message) => {
+        if (message.includes("outstanding agent()")) controller.abort();
+      },
+      onTokenUsage: (usage) => totals.push(usage.total),
+    },
+  );
+  assert.equal(result.tokenUsage?.total, 42);
+  assert.deepEqual(totals, [42]);
+});
+
 test("runWorkflow's final onTokenUsage flush includes agents that settle during the drain (audit2 #5)", async () => {
   // The script returns while an un-awaited sibling is still running; the drain
   // waits it out, and the final flush must carry the sibling's spend.

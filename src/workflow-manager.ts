@@ -255,6 +255,12 @@ export interface ExecOptions {
   agentTimeoutMs?: number | null;
   /** Host signal (e.g. tool/Esc) that should abort this run when fired. */
   externalSignal?: AbortSignal;
+  /**
+   * Grace (ms) for the terminal drain once this run's abort has fired
+   * (default 10_000; Infinity = unbounded). Not frozen/persisted — a host
+   * reliability knob, not run semantics. See WorkflowRunOptions.drainAbortGraceMs.
+   */
+  drainAbortGraceMs?: number;
   /** Called with the live snapshot on every progress event. */
   onProgress?: (snapshot: WorkflowSnapshot) => void;
   /** Hard token budget for this run; once spent reaches it, agent() throws. */
@@ -840,6 +846,7 @@ export class WorkflowManager extends EventEmitter {
       confirm,
       tools,
       initialTokenUsage,
+      drainAbortGraceMs,
       initialPhaseBudgets,
     } = exec;
     // Adopted baselines belong on the managed record even if no NEW phase
@@ -920,6 +927,7 @@ export class WorkflowManager extends EventEmitter {
         agentRetries: resolvedAgentRetries,
         maxAgents: resolvedMaxAgents,
         agentTimeoutMs: resolvedAgentTimeoutMs,
+        drainAbortGraceMs,
         tokenBudget: resolvedTokenBudget,
         tools: resolvedTools,
         excludeTools: this.excludeSubagentTools,
@@ -1183,6 +1191,24 @@ export class WorkflowManager extends EventEmitter {
         managed.snapshot.logs.push(warning);
         this.emitLive(managed, "log", { runId: managed.runId, message: warning });
         console.warn(`[workflow] ${warning.replace(/\n\s*/g, " ")}`);
+      }
+
+      // A pause() requested while the terminal drain was settling (the run's
+      // script had already returned, so the drain was the only thing keeping
+      // it non-terminal) owns the lifecycle: keep the run paused/resumable
+      // instead of overwriting to completed — the result is already in
+      // managed.result below and the journal carries the work, so a later
+      // resume replays instantly and completes (audit2 #3 drain-grace makes
+      // this window reachable for hung-then-abandoned agents).
+      if (managed.status === "paused") {
+        managed.result = result;
+        // Fail-closed display: the drain's abandoned/slow siblings never get an
+        // onAgentEnd post-abort — without this they would sit at "running"
+        // forever on a settled, paused run (mirrors the catch-branch pause tail).
+        this.settleManagedInterruptedAgents(managed, INTERRUPTED_AGENT_CAUSE, new Date());
+        this.persistRun(managed);
+        if (this.isCurrent(managed)) this.releaseRunLease(managed);
+        return result;
       }
 
       managed.status = "completed";
