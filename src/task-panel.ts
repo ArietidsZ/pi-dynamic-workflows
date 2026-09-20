@@ -1215,13 +1215,11 @@ export function resumeResultDelivery(manager: WorkflowManager): void {
  * replacement the manager (and these listeners) survive via the handoff path;
  * each new generation calls {@link bindSessionDelivery} on session_start.
  */
-// Process-wide turn_end registration state (see installResultDelivery). The
-// guard is keyed to the ExtensionAPI INSTANCE, not a bare boolean (r1 MAJOR
-// 2): the built dist module is cached across pi session generations while pi
-// re-runs the factory with a NEW pi per generation — a bare boolean would
-// leave generations 2+ with no turn_end handler at all.
-let turnEndInstalledPi: ExtensionAPI | undefined;
-let currentDeliveryManager: WorkflowManager | undefined;
+// Register turn_end once for each ExtensionAPI instance. The handler looks up
+// its own latest manager rather than a process-global one: multiple live pi
+// instances can interleave A/B/A installs, and each callback must stay scoped
+// to the instance that emitted it.
+let turnEndDeliveryManagers = new WeakMap<ExtensionAPI, { manager: WorkflowManager }>();
 
 export function installResultDelivery(
   pi: ExtensionAPI,
@@ -1261,15 +1259,17 @@ export function installResultDelivery(
     manager.on("stopped", emitLifecycle("stopped"));
   }
 
-  // Process-wide turn_end dispatch (audit2 #33): within one pi generation,
+  // Per-instance turn_end dispatch (audit2 #33): within one pi generation,
   // per-manager registration would stack a handler per cross-project rebuild
-  // (pi.on has no off()), each closing over a stale manager. Register once
-  // PER PI INSTANCE; dispatch to the CURRENT manager.
-  currentDeliveryManager = manager;
-  if (turnEndInstalledPi !== pi) {
-    turnEndInstalledPi = pi;
+  // (pi.on has no off()). Register once per pi, updating only that pi's latest
+  // manager on repeat installs.
+  const existingTurnEnd = turnEndDeliveryManagers.get(pi);
+  if (existingTurnEnd) {
+    existingTurnEnd.manager = manager;
+  } else {
+    turnEndDeliveryManagers.set(pi, { manager });
     pi.on?.("turn_end", (_event: unknown, ctx?: { sessionManager?: { getSessionId?: () => string } }) => {
-      const activeManager = currentDeliveryManager;
+      const activeManager = turnEndDeliveryManagers.get(pi)?.manager;
       if (!activeManager) return;
       const active = deliveryManager(activeManager);
       let sid: string | undefined;
@@ -1300,20 +1300,19 @@ export function installResultDelivery(
     });
   }
 
-  if (m.__deliveryInstalled) {
-    // Listeners survive session replacement. Refresh loadSettings / manager
-    // pointers only — do NOT mutate send, generation, or suspended here.
-    // Factory runs before bindCore; session_start calls bindSessionDelivery.
-    const sid = manager.getSessionId?.();
-    if (sid) {
-      const endpoint = sessionEndpoints.get(sid);
-      if (endpoint) {
-        endpoint.loadSettings = opts.loadSettings ?? endpoint.loadSettings;
-        endpoint.manager = manager;
-      }
+  // A newly-created manager can replace the current project while this pi and
+  // session endpoint remain live. Refresh only the routing pointers; preserve
+  // the session transport, generation, and suspension state until bindCore.
+  const sid = manager.getSessionId?.();
+  if (sid) {
+    const endpoint = sessionEndpoints.get(sid);
+    if (endpoint) {
+      endpoint.loadSettings = opts.loadSettings ?? endpoint.loadSettings;
+      endpoint.manager = manager;
     }
-    return;
   }
+
+  if (m.__deliveryInstalled) return;
   m.__deliveryInstalled = true;
 
   manager.on("complete", ({ runId }: { runId: string }) => {
@@ -1384,10 +1383,7 @@ export function _resetDeliveryRegistriesForTests(): void {
   deliveredAwaitingClear.clear();
   inFlightSeq = 0;
   probedSessionIds.clear();
-  // Process-wide turn_end dispatch state (audit2 #33): within one pi
-  // generation the single registration persists; a new pi gets a fresh one.
-  turnEndInstalledPi = undefined;
-  currentDeliveryManager = undefined;
+  turnEndDeliveryManagers = new WeakMap<ExtensionAPI, { manager: WorkflowManager }>();
 }
 
 export function _setStreamingAckTimeoutForTests(timeoutMs: number): void {
