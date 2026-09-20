@@ -7,6 +7,7 @@ import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import type { PersistedAgentState, PersistedRunState } from "../src/run-persistence.js";
+import { UsageLimitScheduler } from "../src/usage-limit-scheduler.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { NavigatorModel, NavigatorState, renderNavigator } from "../src/workflow-ui.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
@@ -635,6 +636,58 @@ test(
     assert.equal(completed?.status, "completed");
     assert.equal(completed?.tokenUsage?.total, 35);
     assert.equal(attempts, 2);
+  }),
+);
+
+test(
+  "autoResumeAttempts recorded through the manager survives its later persists (#207)",
+  withTempCwd(async (cwd) => {
+    // The scheduler's backoff counter used to be merge-saved straight into
+    // persistence, so the next writeRunToDisk (a literal without the field)
+    // erased it — across a restart the give-up cap reset. Drive the exact
+    // sequence: pause → record attempts → resume → terminal persist.
+    let attempts = 0;
+    let markStarted: () => void = () => {};
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(_prompt, options) {
+          attempts++;
+          if (attempts === 1) {
+            markStarted();
+            await new Promise<void>((_resolve, reject) => {
+              options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+            });
+          }
+          return "resumed";
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    promise.catch(() => {});
+    await started;
+    assert.equal(manager.pause(runId), true);
+
+    manager.recordAutoResumeAttempts(runId, 2);
+    assert.equal(manager.getPersistence().load(runId)?.autoResumeAttempts, 2, "recorded attempts reach disk");
+
+    assert.equal(await manager.resume(runId), true);
+    while (manager.getRun(runId)?.status === "running") {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    const completed = manager.getPersistence().load(runId);
+    assert.equal(completed?.status, "completed");
+    assert.equal(
+      completed?.autoResumeAttempts,
+      2,
+      "a later manager persist must not erase the scheduler's backoff counter",
+    );
   }),
 );
 
@@ -4992,6 +5045,234 @@ test(
     const statusRow = new NavigatorModel(manager).runs().find((run) => run.runId === runId);
     assert.equal(statusRow?.fresh, 0, "status-facing usage must reflect committed usage only");
     assert.equal(statusRow?.cacheRead, 0);
+  }),
+);
+
+test(
+  "recordAutoResumeAttempts skips the disk merge when a live foreign lease holds the run (#207)",
+  withTempCwd(async (cwd) => {
+    let attempts = 0;
+    let markStarted: () => void = () => {};
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(_prompt, options) {
+          attempts++;
+          if (attempts === 1) {
+            markStarted();
+            // First attempt: hang so pause() interrupts mid-flight, then reject.
+            await new Promise<void>((_resolve, reject) => {
+              options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+            });
+          }
+          return "ok";
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    promise.catch(() => {});
+    await started;
+    assert.equal(manager.pause(runId), true);
+    await promise.catch(() => {}); // settle → this manager releases its run lease
+
+    // Cold start: a fresh manager on the same cwd does not manage the run.
+    const restarted = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          return "ok";
+        },
+      },
+    });
+    restarted.on("error", () => {});
+    assert.equal(restarted.getRun(runId), undefined);
+
+    // Simulate another process owning the run: a lock file with a LIVE pid.
+    const runsDir = restarted.getPersistence().getRunsDir();
+    writeFileSync(
+      join(runsDir, `${runId}.lock`),
+      JSON.stringify({
+        runId,
+        runPath: join(runsDir, `${runId}.json`),
+        pid: process.pid,
+        startedAt: new Date().toISOString(),
+        token: "foreign-owner",
+      }),
+    );
+
+    restarted.recordAutoResumeAttempts(runId, 3);
+    assert.equal(
+      restarted.getPersistence().load(runId)?.autoResumeAttempts,
+      undefined,
+      "contended merge skipped — the owning process persists authoritatively",
+    );
+  }),
+);
+
+test(
+  "recordAutoResumeAttempts never writes a stale managed snapshot after it released its lease (#207)",
+  withTempCwd(async (cwd) => {
+    let markStarted: () => void = () => {};
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(_prompt, options) {
+          markStarted();
+          await new Promise<void>((_resolve, reject) => {
+            options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+          });
+          return "unreachable";
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    promise.catch(() => {});
+    await started;
+    assert.equal(manager.pause(runId), true);
+    await promise.catch(() => {});
+
+    // The paused object remains in this manager's cache but no longer owns a
+    // lease. Model a newer foreign owner with deliberately distinct lifecycle
+    // and agent data; writing the old managed object would regress both fields.
+    const persistence = manager.getPersistence();
+    const stale = persistence.load(runId);
+    assert.equal(stale?.status, "paused");
+    assert.ok(stale);
+    persistence.save({
+      ...stale,
+      status: "running",
+      agents: [
+        {
+          id: "foreign-agent",
+          callId: "foreign-call",
+          label: "foreign",
+          status: "running",
+          tokens: 17,
+        },
+      ],
+    });
+    const runsDir = persistence.getRunsDir();
+    writeFileSync(
+      join(runsDir, `${runId}.lock`),
+      JSON.stringify({
+        runId,
+        runPath: join(runsDir, `${runId}.json`),
+        pid: process.pid,
+        startedAt: new Date().toISOString(),
+        token: "foreign-owner",
+      }),
+    );
+
+    manager.recordAutoResumeAttempts(runId, 3);
+
+    const current = persistence.load(runId);
+    assert.equal(current?.status, "running", "foreign lifecycle state must not be overwritten");
+    assert.deepEqual(current?.agents, [
+      {
+        id: "foreign-agent",
+        callId: "foreign-call",
+        label: "foreign",
+        status: "running",
+        tokens: 17,
+      },
+    ]);
+    assert.equal(current?.autoResumeAttempts, undefined, "contended merge must not write the counter either");
+  }),
+);
+
+test(
+  "recordAutoResumeAttempts rejects corrupt counter values (#207)",
+  withTempCwd(async (cwd) => {
+    let markStarted: () => void = () => {};
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(_prompt, options) {
+          markStarted();
+          await new Promise<void>((_resolve, reject) => {
+            options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+          });
+          return "unreachable";
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    promise.catch(() => {});
+    await started;
+    assert.equal(manager.pause(runId), true);
+
+    for (const corrupt of [Number.NaN, -1, 0.5, Number.POSITIVE_INFINITY]) {
+      manager.recordAutoResumeAttempts(runId, corrupt);
+      assert.equal(
+        manager.getPersistence().load(runId)?.autoResumeAttempts,
+        undefined,
+        `corrupt value ${corrupt} never reaches the record`,
+      );
+    }
+    manager.recordAutoResumeAttempts(runId, 2);
+    assert.equal(manager.getPersistence().load(runId)?.autoResumeAttempts, 2, "valid values still record");
+  }),
+);
+
+test(
+  "a human resume resets the persisted auto-resume counter through the real manager+scheduler (#207)",
+  withTempCwd(async (cwd) => {
+    let attempts = 0;
+    let markStarted: () => void = () => {};
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(_prompt, options) {
+          attempts++;
+          if (attempts === 1) {
+            markStarted();
+            await new Promise<void>((_resolve, reject) => {
+              options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+            });
+          }
+          return "ok";
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const scheduler = new UsageLimitScheduler(manager);
+    try {
+      const { runId, promise } = manager.startInBackground(oneAgentScript);
+      promise.catch(() => {});
+      await started;
+      manager.emit("paused", { runId, reason: "usage_limit", resetHint: "resets soon" });
+      assert.equal(manager.pause(runId), true);
+      await promise.catch(() => {});
+      assert.equal(manager.getPersistence().load(runId)?.autoResumeAttempts, 1, "scheduler recorded attempt 1");
+
+      assert.equal(await manager.resume(runId), true);
+      for (let i = 0; i < 2000 && manager.getRun(runId)?.status === "running"; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+      assert.equal(manager.getPersistence().load(runId)?.status, "completed");
+      assert.equal(
+        manager.getPersistence().load(runId)?.autoResumeAttempts,
+        0,
+        "the human resume reset the counter — 0 must survive the sanitizer",
+      );
+    } finally {
+      scheduler.dispose();
+    }
   }),
 );
 

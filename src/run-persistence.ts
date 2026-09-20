@@ -60,6 +60,16 @@ export interface PersistedJournalEntry {
   model?: string;
 }
 
+/**
+ * Sanitize a persisted/incoming auto-resume attempt counter: corrupt or
+ * foreign values (non-number, NaN, Infinity, negative, non-integer) become
+ * undefined — a NaN/negative counter would defeat the scheduler's give-up
+ * cap and produce NaN timer delays (#207).
+ */
+export function sanitizeAutoResumeAttempts(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
+}
+
 export interface PersistedRunState {
   runId: string;
   workflowName: string;
@@ -164,9 +174,10 @@ export interface PersistedRunState {
    */
   agentRetries?: number;
   /**
-   * Auto-resume attempt counter for the current usage_limit pause-cycle, owned
-   * and persisted by UsageLimitScheduler (best-effort). Absent/0 means no
-   * auto-resume attempt has been recorded yet.
+   * Auto-resume attempt counter for the current usage_limit pause-cycle.
+   * Owned by WorkflowManager (written on every persistRun; the scheduler
+   * records through recordAutoResumeAttempts, never a raw save — #207).
+   * Absent/0 means no auto-resume attempt has been recorded yet.
    */
   autoResumeAttempts?: number;
   /**
