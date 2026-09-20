@@ -253,6 +253,31 @@ export const TERMINAL_RUN_STATUSES: ReadonlySet<RunStatus> = new Set(["completed
 
 const NON_TERMINAL_AGENT_STATUSES = new Set(["queued", "running"]);
 
+const PERSISTED_AGENT_STATUSES = [
+  "queued",
+  "running",
+  "done",
+  "error",
+  "skipped",
+] as const satisfies readonly PersistedAgentState["status"][];
+
+// Exhaustiveness: adding a member to PersistedAgentState["status"] without
+// listing it above fails to compile HERE (Exclude yields a non-never).
+type AssertNever<T extends never> = T;
+export type _PersistedAgentStatusExhaustiveCheck = AssertNever<
+  Exclude<PersistedAgentState["status"], (typeof PERSISTED_AGENT_STATUSES)[number]>
+>;
+
+/** Every status a persisted agent row may validly carry — exhaustively
+ * checked against PersistedAgentState["status"] by the assertion above.
+ * Forward-compat note: resume seeding DROPS rows with out-of-union statuses
+ * (e.g. written by a newer release) — deliberate garbage-vs-unknown tradeoff:
+ * an unknown status cannot be ghost-settled or displayed safely, so the row
+ * is treated as corrupt rather than re-persisted as a lie. */
+export const VALID_PERSISTED_AGENT_STATUSES: ReadonlySet<PersistedAgentState["status"]> = new Set(
+  PERSISTED_AGENT_STATUSES,
+);
+
 /** Cause stamped onto leftover agents when a live execution is gone but the run is still paused. */
 export const INTERRUPTED_AGENT_CAUSE: { error: string; errorCode: WorkflowErrorCode } = {
   error: "interrupted",

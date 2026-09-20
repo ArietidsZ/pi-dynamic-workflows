@@ -31,6 +31,7 @@ import {
   settleInterruptedPersistedAgents,
   settleNonTerminalPersistedAgents,
   terminalRunInterruptCause,
+  VALID_PERSISTED_AGENT_STATUSES,
 } from "./run-persistence.js";
 import {
   cloneDurableJsonValue,
@@ -165,9 +166,11 @@ export interface ManagedRun {
    */
   toolset?: string;
   /**
-   * Real per-agent start/end timestamps, captured at onAgentStart/onAgentEnd
-   * (never fabricated), keyed by the agent's snapshot id. A running agent has
-   * an entry with no endedAt; persistRun() reads from here instead of stamping
+   * Per-agent start/end timestamps keyed by the agent's snapshot id. Live rows
+   * carry real onAgentStart/onAgentEnd captures; resume seeding (#206) carries
+   * persisted values, and a ghost without a persisted startedAt gets the
+   * settle wall-clock (documented fabrication, clamped to >= the record's
+   * last write). A running agent has an entry with no endedAt; persistRun() reads from here instead of stamping
    * every agent with the run's startedAt / "now".
    */
   agentTimestamps: Map<number, { startedAt: string; endedAt?: string }>;
@@ -190,6 +193,11 @@ export interface ManagedRun {
   replayedAgentStatesByCallId: Map<string, PersistedAgentState>;
   /** Timestamps carried into replayed snapshot entries. */
   agentTimestampsByCallId: Map<string, { startedAt: string; endedAt?: string }>;
+  /** Rows seeded from the persisted record at resume (#206): snapshot ids
+   * 1..seededAgentCount are history; anything above ran (or was appended) in
+   * this execution. Used to scope completion diagnostics to the current
+   * execution rather than preserved history. */
+  seededAgentCount?: number;
   /** Calls whose onAgentStart/onAgentEnd pair was journal replay, not a launch. */
   replayedAgentCalls: Set<string>;
   /**
@@ -953,23 +961,53 @@ export class WorkflowManager extends EventEmitter {
           progress();
         },
         onAgentStart: (event) => {
-          const id = managed.snapshot.agents.length + 1;
-          const prior = event.replayed ? managed.replayedAgentStatesByCallId.get(event.id) : undefined;
-          const priorSession = event.replayed ? managed.agentSessionsByCallId.get(event.id) : undefined;
-          const agentSnapshot: WorkflowAgentSnapshot = {
-            id,
-            callId: event.id,
-            label: event.label,
-            phase: event.phase,
-            prompt: event.prompt,
-            status: "running",
-            model: event.model ?? prior?.model,
-            sessionId: priorSession?.sessionId,
-            sessionFile: priorSession?.sessionFile,
-            tokens: prior?.tokens,
-            tokenUsage: prior?.tokenUsage,
-          };
-          managed.snapshot.agents.push(agentSnapshot);
+          // A replayed journaled call whose entry was seeded from the persisted
+          // snapshot (see resume(), #206) updates THAT entry in place — pushing
+          // a fresh one would duplicate every pre-pause agent in the record.
+          // Match the LAST seeded row with this callId: callIds are positional
+          // (`${runId}:${callIndex}`) and reused (ghost + live retry, edited
+          // scripts shifting indices), and the latest row is the most recent
+          // execution of that call.
+          let seeded: WorkflowAgentSnapshot | undefined;
+          if (event.replayed) {
+            for (let i = managed.snapshot.agents.length - 1; i >= 0; i--) {
+              const candidate = managed.snapshot.agents[i];
+              if (candidate.callId === event.id) {
+                seeded = candidate;
+                break;
+              }
+            }
+          }
+          let agentSnapshot: WorkflowAgentSnapshot;
+          if (seeded) {
+            // Keep the row's identity/history, refresh presentation fields from
+            // the replayed call — label is not part of the call hash, so a
+            // label-only script edit still replays and must not leave a stale
+            // label (or model) behind.
+            seeded.label = event.label;
+            seeded.phase = event.phase;
+            seeded.prompt = event.prompt;
+            if (event.model) seeded.model = event.model;
+            agentSnapshot = seeded;
+          } else {
+            const prior = event.replayed ? managed.replayedAgentStatesByCallId.get(event.id) : undefined;
+            const priorSession = event.replayed ? managed.agentSessionsByCallId.get(event.id) : undefined;
+            agentSnapshot = {
+              id: managed.snapshot.agents.length + 1,
+              callId: event.id,
+              label: event.label,
+              phase: event.phase,
+              prompt: event.prompt,
+              status: "running",
+              model: event.model ?? prior?.model,
+              sessionId: priorSession?.sessionId,
+              sessionFile: priorSession?.sessionFile,
+              tokens: prior?.tokens,
+              tokenUsage: prior?.tokenUsage,
+            };
+            managed.snapshot.agents.push(agentSnapshot);
+          }
+          const id = agentSnapshot.id;
           // Index by the call's unique id (never label — see agentsById's doc
           // comment) so onAgentEnd/onAgentHistory/onAgentUsage can resolve back
           // to exactly THIS entry even when a concurrent sibling shares its
@@ -980,7 +1018,10 @@ export class WorkflowManager extends EventEmitter {
           const priorTimestamp = event.replayed ? managed.agentTimestampsByCallId.get(event.id) : undefined;
           const timestamp = priorTimestamp ?? { startedAt: new Date().toISOString() };
           managed.agentTimestamps.set(id, { ...timestamp });
-          if (event.replayed && priorTimestamp) managed.replayedAgentCalls.add(event.id);
+          // A replayed event is ALWAYS a replay (journal hit) — arm it even
+          // when the call left no persisted timestamp, so onAgentEnd never
+          // treats it as live and erases seeded endedAt/tokens.
+          if (event.replayed) managed.replayedAgentCalls.add(event.id);
           managed.agentTimestampsByCallId.set(event.id, { ...timestamp });
           this.emitLive(managed, "agentStart", { runId: managed.runId, ...event });
           progress();
@@ -1098,7 +1139,16 @@ export class WorkflowManager extends EventEmitter {
       // completed branch. Surface it loudly so an all-null result can't
       // masquerade as a successful fleet (the single per-agent log line is easy
       // to miss under concurrency). Emitted before the "complete" event.
-      const fleet = emptyFleetSummary(managed.snapshot.agents);
+      // Scope to THIS execution: rows seeded from the persisted record at
+      // resume are history (#206) — a stale done row must not suppress the
+      // all-empty warning when every live/replayed call returned null.
+      const fleet = emptyFleetSummary(
+        managed.snapshot.agents.filter(
+          (agent) =>
+            agent.id > (managed.seededAgentCount ?? 0) ||
+            (agent.callId !== undefined && managed.replayedAgentCalls.has(agent.callId)),
+        ),
+      );
       if (fleet.allEmpty) {
         const labels = fleet.emptyLabels.join(", ");
         const overflow =
@@ -1678,6 +1728,21 @@ export class WorkflowManager extends EventEmitter {
     if (!persisted?.script || persisted.status === "completed" || persisted.status === "aborted") return false;
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) return false;
+    // The pre-lease read is stale the moment it returns: another process could
+    // have stopped/deleted or otherwise updated the run in the window. Re-load
+    // under the lease and fail closed on ANY change: resuming from the stale
+    // snapshot could overwrite newer journal, agent, or checkpoint metadata.
+    let fresh: PersistedRunState | null;
+    try {
+      fresh = this.persistence.load(runId);
+    } catch (error) {
+      this.persistence.releaseRunLease(lease);
+      throw error;
+    }
+    if (!isDeepStrictEqual(fresh, persisted)) {
+      this.persistence.releaseRunLease(lease);
+      return false;
+    }
     const script = opts?.script ?? persisted.script;
     const args = opts?.args !== undefined ? opts.args : persisted.args;
     const persistedAgents = Array.isArray(persisted.agents) ? persisted.agents : [];
@@ -1715,14 +1780,103 @@ export class WorkflowManager extends EventEmitter {
     }
 
     const controller = new AbortController();
+    // Seed the live snapshot from the persisted agents so the record never
+    // regresses to an empty fleet across resume (#206): the persistRun below
+    // would otherwise rewrite the run file with agents: [], and /workflows +
+    // the task panel would lose every prior agent (permanently, for calls an
+    // edited script never replays). Ghost entries (still queued/running when
+    // the owning execution died) settle to "skipped" with the interrupt cause
+    // and a wall-clock endedAt, mirroring settleManagedInterruptedAgents.
+    // Replayed journaled calls update their seeded entry in place (see
+    // onAgentStart) instead of pushing duplicates. Non-object entries (corrupt
+    // or legacy records, #110-hardened everywhere else) are skipped.
+    // Shape-guard the persisted journal, container AND elements: a corrupt
+    // entry (null, non-object, index-less) must not throw AFTER the run lease
+    // is acquired and the managed run registered (lease leak + phantom run).
+    const persistedJournal = (Array.isArray(persisted.journal) ? persisted.journal : []).filter(
+      (entry) => entry && typeof entry === "object" && typeof entry.index === "number",
+    );
+    const seededAgentTimestamps = new Map<number, { startedAt: string; endedAt?: string }>();
+    // Settle ghosts at wall-clock, but never BEFORE the record's last write:
+    // a backwards clock jump must not produce endedAt < updatedAt.
+    const settledAt = new Date(Math.max(Date.now(), Date.parse(persisted.updatedAt) || 0)).toISOString();
+    const seededAgents: WorkflowAgentSnapshot[] = [];
+    // callId -> timestamp index, built alongside the rows (M3): ghosts carry
+    // their SETTLE time here too, so a replayed journaled call on a ghost row
+    // keeps those timestamps (recognition itself is the unconditional
+    // replayedAgentCalls.add in onAgentStart; this map picks WHICH timestamps
+    // survive the replay).
+    const seededTimestampsByCallId = new Map<string, { startedAt: string; endedAt?: string }>();
+    for (const agent of persistedAgents) {
+      // Corrupt/legacy-entry guard (M1): only well-shaped rows seed — a plain
+      // object with a valid status union member and string label/prompt.
+      // Anything else (null, arrays, fieldless objects, unknown statuses) is
+      // dropped instead of being seeded as a garbage row and re-persisted.
+      if (
+        !agent ||
+        typeof agent !== "object" ||
+        Array.isArray(agent) ||
+        !VALID_PERSISTED_AGENT_STATUSES.has(agent.status as PersistedAgentState["status"]) ||
+        typeof agent.label !== "string" ||
+        typeof agent.prompt !== "string"
+      ) {
+        continue;
+      }
+      const id = seededAgents.length + 1;
+      const { startedAt: rawStartedAt, endedAt: rawEndedAt, callId: rawCallId, ...snapshotFields } = agent;
+      // Per-field type hygiene (corrupt records): non-string timestamps/callIds
+      // are dropped from the seeded row rather than re-persisted as garbage.
+      const startedAt = typeof rawStartedAt === "string" ? rawStartedAt : undefined;
+      const endedAt = typeof rawEndedAt === "string" ? rawEndedAt : undefined;
+      const callId = typeof rawCallId === "string" ? rawCallId : undefined;
+      const ghost = agentHasNonTerminalStatus(agent.status);
+      const rowTimestamps = startedAt
+        ? { startedAt, endedAt: endedAt ?? (ghost ? settledAt : undefined) }
+        : ghost
+          ? { startedAt: settledAt, endedAt: settledAt }
+          : // Terminal row with only an endedAt (the codebase's own settle paths
+            // produce these): keep it, anchored as both ends, rather than
+            // dropping the only timing provenance the record has.
+            endedAt
+            ? { startedAt: endedAt, endedAt }
+            : undefined;
+      if (callId !== undefined) {
+        // Duplicate callIds: the LAST row wins, matching the onAgentStart
+        // reverse-scan "latest row is the most recent execution" rule — even
+        // when that last row has no usable timestamps (delete the stale entry:
+        // the replay must not borrow a DIFFERENT execution's timestamps).
+        if (rowTimestamps) seededTimestampsByCallId.set(callId, rowTimestamps);
+        else seededTimestampsByCallId.delete(callId);
+      }
+      if (rowTimestamps) {
+        seededAgentTimestamps.set(id, rowTimestamps);
+      }
+      seededAgents.push(
+        ghost
+          ? {
+              ...snapshotFields,
+              id,
+              callId,
+              // Align with settleInterruptedPersistedAgents: the interrupt cause
+              // overwrites unconditionally — a ghost's stale error field is not
+              // meaningful provenance.
+              status: "skipped",
+              error: INTERRUPTED_AGENT_CAUSE.error,
+              errorCode: INTERRUPTED_AGENT_CAUSE.errorCode,
+              recoverable: false,
+            }
+          : { ...snapshotFields, id, callId },
+      );
+    }
     const managed: ManagedRun = {
       runId,
       status: "running",
-      snapshot: {
+      snapshot: recomputeWorkflowSnapshot({
         name: persisted.workflowName,
-        phases: persisted.phases ?? [],
-        logs: persisted.logs ?? [],
-        agents: [],
+        phases: Array.isArray(persisted.phases) ? persisted.phases : [],
+        currentPhase: persisted.currentPhase,
+        logs: Array.isArray(persisted.logs) ? persisted.logs : [],
+        agents: seededAgents,
         agentCount: 0,
         runningCount: 0,
         doneCount: 0,
@@ -1732,14 +1886,14 @@ export class WorkflowManager extends EventEmitter {
         // completes doesn't lose the prior spend — committed onAgentUsage
         // deltas accumulate on top of this rather than starting from scratch.
         tokenUsage: priorTokenUsage,
-      },
+      }),
       controller,
       startedAt: new Date(),
       // The (possibly edited) script + args become the run's own — persistRun()
       // writes them below, so a later resume of this run sees the edited script.
       script,
       args,
-      journal: persisted.journal ?? [],
+      journal: persistedJournal,
       checkpoint: resumeCheckpoint,
       background: true,
       // Prefer the frozen owner on disk; fall back to the manager's current
@@ -1790,10 +1944,10 @@ export class WorkflowManager extends EventEmitter {
       // resolved unset concurrency/agentRetries before this fix ever existed.
       concurrency: persisted.concurrency !== undefined ? persisted.concurrency : this.concurrency,
       agentRetries: persisted.agentRetries !== undefined ? persisted.agentRetries : this.defaultAgentRetries,
-      // Fresh per-resume: agents are rebuilt live as onAgentStart/onAgentEnd
-      // fire again for this attempt. Replayed calls do not recreate a child
-      // session, so carry their prior identities into the new snapshot.
-      agentTimestamps: new Map(),
+      // Seeded above from persisted agents: replayed journaled calls update
+      // their seeded snapshot entry in place; live calls append. Replayed
+      // calls do not recreate a child session, so carry their prior identities into the new snapshot.
+      agentTimestamps: seededAgentTimestamps,
       agentsById: new Map(),
       agentSessionsByCallId: new Map(
         persistedAgents
@@ -1810,14 +1964,8 @@ export class WorkflowManager extends EventEmitter {
           .filter((agent) => agent && typeof agent === "object" && agent.callId)
           .map((agent) => [agent.callId as string, agent] as const),
       ),
-      agentTimestampsByCallId: new Map(
-        persistedAgents
-          .filter((agent) => agent && typeof agent === "object" && agent.callId && agent.startedAt)
-          .map(
-            (agent) =>
-              [agent.callId as string, { startedAt: agent.startedAt as string, endedAt: agent.endedAt }] as const,
-          ),
-      ),
+      agentTimestampsByCallId: seededTimestampsByCallId,
+      seededAgentCount: seededAgents.length,
       replayedAgentCalls: new Set(),
     };
     this.runs.set(runId, managed);
@@ -1831,7 +1979,7 @@ export class WorkflowManager extends EventEmitter {
     // that existed before nested workflow() journaling was namespaced), so it
     // still resume-hits for a top-level call and safely cache-misses (re-runs
     // live, does not misapply) for what was actually a nested-run entry.
-    const resumeJournal = new Map((persisted.journal ?? []).map((e) => [`${e.runId ?? runId}:${e.index}`, e] as const));
+    const resumeJournal = new Map(persistedJournal.map((e) => [`${e.runId ?? runId}:${e.index}`, e] as const));
     this.emit("resumed", { runId });
     // Run in the background; executeRun records status/errors on the managed run.
     // initialTokenUsage seeds the resumed execution's fresh SharedRuntime.spent
