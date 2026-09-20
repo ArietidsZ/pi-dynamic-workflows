@@ -228,6 +228,14 @@ export interface ManagedRun {
    * tokenBudget.
    */
   agentRetries?: number;
+  /**
+   * Per-phase sub-budgets declared so far in this run's lifetime, keyed by
+   * `${frameRunId}:${phaseTitle}` — persisted so resume() can adopt the
+   * original baselines instead of re-basing (audit2 #4). Written by the
+   * onPhaseBudgets callback (merged — nested frames share the table); read
+   * into initialPhaseBudgets at resume.
+   */
+  phaseBudgets?: Record<string, { budget: number; startSpent: number; warned?: boolean }>;
 }
 
 /** Per-execution options shared by sync, background, and resume runs. */
@@ -285,6 +293,8 @@ export interface ExecOptions {
    * total instead of zero (see A2 in workflow-manager's resume()).
    */
   initialTokenUsage?: AgentUsage;
+  /** resume() only: persisted per-phase sub-budgets adopted by the resumed execution (audit2 #4). */
+  initialPhaseBudgets?: Record<string, { budget: number; startSpent: number; warned?: boolean }>;
 }
 
 export interface WorkflowResumeOptions {
@@ -830,7 +840,11 @@ export class WorkflowManager extends EventEmitter {
       confirm,
       tools,
       initialTokenUsage,
+      initialPhaseBudgets,
     } = exec;
+    // Adopted baselines belong on the managed record even if no NEW phase
+    // declares in this execution — otherwise the next persist would drop them.
+    managed.phaseBudgets ??= initialPhaseBudgets;
     // maxAgents/agentTimeoutMs/concurrency/agentRetries were resolved (per-run
     // value, else the manager default at the time) and frozen on the managed
     // run at start/resume (see ManagedRun doc comments) — read them from there
@@ -933,6 +947,14 @@ export class WorkflowManager extends EventEmitter {
         // runWorkflow only applies this on the fresh-SharedRuntime branch, never
         // overriding an inherited options.sharedRuntime from a nested workflow()).
         initialTokenUsage,
+        initialPhaseBudgets: initialPhaseBudgets ?? managed.phaseBudgets,
+        onPhaseBudgets: (budgets) => {
+          // Merge, don't replace: nested workflow() frames share this flat
+          // table, and a child's first declaration carries only ITS entries —
+          // replacing would drop the parent's (re-introducing the per-resume
+          // re-base audit2 #4 fixes).
+          managed.phaseBudgets = { ...managed.phaseBudgets, ...budgets };
+        },
         onAgentJournal: (entry) => {
           // Append (crash-safe-ish): keep the latest entry per (runId, index)
           // pair, then persist. Matching on index ALONE would let a nested
@@ -1593,6 +1615,7 @@ export class WorkflowManager extends EventEmitter {
           managed.status === "paused" && managed.usageLimitPause ? managed.usageLimitPause.resetHint : undefined,
         phases: managed.snapshot.phases,
         currentPhase: managed.snapshot.currentPhase,
+        phaseBudgets: managed.phaseBudgets,
         // Real per-agent timestamps only (see agentTimestamps) — never the run's
         // own startedAt or "now" stamped onto every agent on every write. A
         // still-running agent on a live/paused run is persisted with no endedAt;
@@ -2035,6 +2058,10 @@ export class WorkflowManager extends EventEmitter {
       agentTimestampsByCallId: seededTimestampsByCallId,
       seededAgentCount: seededAgents.length,
       replayedAgentCalls: new Set(),
+      // Carry the persisted budgets into the managed record immediately —
+      // otherwise the persistRun below would write the field as undefined
+      // (a crash/load in that window loses the table).
+      phaseBudgets: persisted.phaseBudgets,
     };
     this.runs.set(runId, managed);
     // Persist before notifying renderers: listRuns() is their source of truth for
@@ -2066,6 +2093,9 @@ export class WorkflowManager extends EventEmitter {
       resumeJournal,
       resumeCheckpoint: resumeCheckpoint?.status === "resuming" ? resumeCheckpoint : undefined,
       initialTokenUsage: priorTokenUsage,
+      // Adopt the persisted phase sub-budget baselines so a phase ceiling
+      // holds cumulatively across this resume (audit2 #4).
+      initialPhaseBudgets: persisted?.phaseBudgets,
     });
     this.executions.set(managed, execution);
     void execution.catch(() => {});
