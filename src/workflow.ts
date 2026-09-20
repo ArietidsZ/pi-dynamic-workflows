@@ -107,6 +107,10 @@ export interface SharedRuntime {
   agentCount: number;
   spent: number;
   tokenUsage: AgentUsage;
+  /** Set after the top-level drain seals abandoned agent callbacks. */
+  agentCallbacksClosed?: boolean;
+  /** Active attempts whose usage must be finalized when an abort drain abandons them. */
+  pendingUsageFinalizers?: Set<() => void>;
   /** @deprecated Nesting depth is async-context scoped; retained for injected runtime compatibility. */
   depth: number;
   /**
@@ -214,6 +218,23 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   maxAgents?: number;
   /** Timeout per agent in milliseconds. null/omitted means no hard timeout. */
   agentTimeoutMs?: number | null;
+  /**
+   * Grace period (ms) for the terminal drain once this run is ABORT-SIGNALED
+   * (external abort or the run-fatal seal). A durable checkpoint suspension
+   * alone does not abort its paid siblings. Agents are signaled at abort,
+   * but the signal is cooperative — a signal-ignoring runner would otherwise
+   * wedge the drain, and with it the run's terminal transition, forever
+   * (audit2 #3). After the grace expires the drain stops waiting: the store is
+   * disposed below (late writes re-populate a store nobody reads), no journal
+   * can follow (the completion path's abort check precedes journaling), and
+   * the manager's persist/emit paths are staleness-gated.
+   *
+   * Does NOT apply to the SUCCESS drain, which waits unbounded — those results
+   * are still wanted. Default 10_000; Infinity restores unbounded waiting for
+   * aborted runs too. Finite values in [1, 2^31-1] are rounded down; invalid
+   * values (including NaN, 0, negatives, and overflow) use the default.
+   */
+  drainAbortGraceMs?: number;
   /** Whether to persist logs to disk. Default: true */
   persistLogs?: boolean;
   /** Run ID for persistence. Auto-generated if not provided. */
@@ -586,6 +607,11 @@ export async function runWorkflow<T = unknown>(
     activeThreads: new Set<string>(),
     resumeBarrierReached: false,
   };
+  if (!shared.pendingUsageFinalizers) {
+    shared.pendingUsageFinalizers = new Set<() => void>();
+  }
+  const pendingUsageFinalizers = shared.pendingUsageFinalizers;
+  shared.agentCallbacksClosed ??= false;
   const limiter = shared.limiter;
   // This frame created `shared` fresh (rather than inheriting a parent
   // workflow()'s) — i.e. it's the true top-level run, the only frame allowed
@@ -915,6 +941,12 @@ export async function runWorkflow<T = unknown>(
     }
 
     return limiter(async () => {
+      // A queued call can obtain its slot after the top-level abort drain has
+      // already abandoned it. Do not create a worktree or announce a new agent
+      // for an execution whose callbacks have been closed.
+      if (shared.agentCallbacksClosed) {
+        throw new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true });
+      }
       const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
       const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
       const maxAttempts = retryAttempts + 1;
@@ -938,6 +970,7 @@ export async function runWorkflow<T = unknown>(
       // The tracker keeps provisional estimates separate from committed usage,
       // accumulates retries, and rejects callbacks from attempts that already settled.
       const usageTracker = createAgentCallUsageTracker((update) => {
+        if (shared.agentCallbacksClosed) return;
         if (update.committedUsage) {
           shared.tokenUsage = sumAgentUsage(shared.tokenUsage, update.committedUsage);
           shared.spent += update.committedUsage.total;
@@ -946,9 +979,16 @@ export async function runWorkflow<T = unknown>(
       });
 
       try {
+        // Worktree creation above is asynchronous; abandonment may have
+        // occurred while it was pending, before this first observer event.
+        if (shared.agentCallbacksClosed) {
+          throw new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true });
+        }
         options.onAgentStart?.({ id: deltaKey, label, phase: assignedPhase, prompt, model: displayModel });
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
           const attemptUsage = usageTracker.startAttempt();
+          const finalizeAttemptUsage = () => attemptUsage.commitTerminalUsage();
+          pendingUsageFinalizers.add(finalizeAttemptUsage);
           const externalSignal = options.signal;
           let onExternalAbort: (() => void) | undefined;
           let onRunFatal: (() => void) | undefined;
@@ -1012,6 +1052,7 @@ export async function runWorkflow<T = unknown>(
               systemTools: createAgentStoreTools(store, deltaKey),
               cwd: runCwd,
               onModelResolved: (id: string) => {
+                if (shared.agentCallbacksClosed) return;
                 displayModel = id;
                 // Correct what /workflows shows for an agent that is STILL RUNNING.
                 // onAgentEnd keeps carrying the same value so late subscribers and
@@ -1019,6 +1060,7 @@ export async function runWorkflow<T = unknown>(
                 options.onAgentModel?.({ id: deltaKey, label, phase: assignedPhase, model: id });
               },
               onModelFallback: ({ tier, requestedSpec }: { tier: string; requestedSpec: string }) => {
+                if (shared.agentCallbacksClosed) return;
                 // Untagged agents' implicit default tier degrading to the session
                 // default must stay visible in the run's own log/event stream, not
                 // just a console.warn (#131) — an explicit model/tier pin instead
@@ -1028,9 +1070,11 @@ export async function runWorkflow<T = unknown>(
               onUsageProgress: attemptUsage.reportProgress,
               onUsage: attemptUsage.reportTerminal,
               onSessionCreated: ({ sessionId, sessionFile }: { sessionId: string; sessionFile?: string }) => {
+                if (shared.agentCallbacksClosed) return;
                 options.onAgentSession?.({ callId: deltaKey, sessionId, sessionFile });
               },
               onHistory: (history: AgentHistoryEntry[]) => {
+                if (shared.agentCallbacksClosed) return;
                 options.onAgentHistory?.({ id: deltaKey, label, phase: assignedPhase, history });
               },
               thread: agentOptions.thread,
@@ -1144,6 +1188,7 @@ export async function runWorkflow<T = unknown>(
             }
             throw workflowError;
           } finally {
+            pendingUsageFinalizers.delete(finalizeAttemptUsage);
             // Drop this attempt's abort listeners so they don't accrue one entry
             // per attempt on the run's signal / runFatalController for the whole
             // run (#109 hygiene).
@@ -1746,21 +1791,95 @@ export async function runWorkflow<T = unknown>(
       // (not a single Promise.allSettled) because draining can itself let a
       // still-running call schedule further work that adds to the set.
       //
-      // Caveat: this can block indefinitely. A run-fatal abort (see the catch
+      // Caveat: without an abort the SUCCESS drain still blocks indefinitely —
+      // those results are wanted, including paid siblings at a checkpoint.
+      // Once the run's abort has fired the wait is bounded by
+      // drainAbortGraceMs (default 10s): a run-fatal abort (see the catch
       // above) aborts the AbortSignal passed to each in-flight agent, but that
       // is cooperative — an agent runner that ignores its signal (or one still
       // waiting out a real subagent process that won't die) never settles on
       // its own. Combined with agentTimeoutMs: null (no hard timeout, the
-      // default), a single hung, signal-ignoring, un-awaited agent() call can
-      // wedge this drain — and therefore the whole run's completion — forever.
-      // Configure a finite agentTimeoutMs (run- or per-agent-level) for any
-      // workflow where this is a real risk; there is no drain-side timeout.
+      // default), a single hung, signal-ignoring, un-awaited agent() call would
+      // otherwise wedge this drain — and therefore the whole run's completion —
+      // forever (audit2 #3).
       if (shared.inFlight.size > 0) {
         log(`waiting for ${shared.inFlight.size} outstanding agent() call(s) to settle before this run completes`);
       }
-      while (shared.inFlight.size > 0) {
-        await Promise.allSettled(Array.from(shared.inFlight));
+      const graceOption = options.drainAbortGraceMs;
+      const drainAbortGraceMs =
+        graceOption === undefined
+          ? 10_000
+          : graceOption === Number.POSITIVE_INFINITY
+            ? Number.POSITIVE_INFINITY
+            : typeof graceOption === "number" && graceOption >= 1 && graceOption <= 2_147_483_647
+              ? Math.floor(graceOption)
+              : 10_000; // NaN/0/negative/overflow → default
+      // Wakes the drain loop the moment the run aborts (either source), so a
+      // drain that started un-aborted re-enters promptly and the grace clock
+      // starts instead of blocking on allSettled forever.
+      let wakeAbort: () => void = () => {};
+      const abortWake = new Promise<void>((resolve) => {
+        wakeAbort = resolve;
+      });
+      const externalWake = () => wakeAbort();
+      const fatalWake = () => wakeAbort();
+      options.signal?.addEventListener("abort", externalWake, { once: true });
+      shared.runFatalController.signal.addEventListener("abort", fatalWake, { once: true });
+      try {
+        while (shared.inFlight.size > 0) {
+          const pending = Array.from(shared.inFlight);
+          if (!isAborted() || drainAbortGraceMs === Number.POSITIVE_INFINITY) {
+            // Not aborted: wait, but wake promptly if the abort fires
+            // mid-wait. Already-aborted with an unbounded grace: plain wait —
+            // racing the (already-resolved) abortWake here would busy-spin
+            // the microtask queue and starve the event loop (r1 B1).
+            if (isAborted()) {
+              await Promise.allSettled(pending);
+            } else {
+              await Promise.race([Promise.allSettled(pending), abortWake]);
+            }
+            continue;
+          }
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const grace = new Promise<"timeout">((resolve) => {
+            // Deliberately ref'd (no unref): this timer is load-bearing for
+            // the run's terminal transition — an unref'd one would let the
+            // process exit before the run settles when nothing else holds the
+            // loop open.
+            timer = setTimeout(() => resolve("timeout"), drainAbortGraceMs);
+          });
+          const winner = await Promise.race([Promise.allSettled(pending).then(() => "settled" as const), grace]);
+          if (timer) clearTimeout(timer);
+          if (winner === "timeout") {
+            // Leave the calls behind. No rejection-swallowing needed here:
+            // every inFlight promise already carries a noop catch from its
+            // creation site (:712), so a late rejection is handled. The store
+            // disposes below; no journal can follow (the completion path's
+            // abort check precedes journaling); manager persists are
+            // staleness-gated.
+            log(
+              `abandoning ${pending.length} outstanding agent() call(s) that did not settle within ${drainAbortGraceMs}ms of the drain's abort grace`,
+            );
+            break;
+          }
+        }
+      } finally {
+        options.signal?.removeEventListener("abort", externalWake);
+        shared.runFatalController.signal.removeEventListener("abort", fatalWake);
       }
+      // A bounded abort drain can intentionally leave a signal-ignoring runner
+      // in flight. Reconcile the latest terminal/provisional usage while the
+      // manager is still live, then seal every callback retained by that runner.
+      for (const finalizeUsage of pendingUsageFinalizers) {
+        try {
+          finalizeUsage();
+        } catch {
+          // A finalizer is best-effort; one broken callback cannot leave later
+          // attempts open or prevent the terminal drain from completing.
+        }
+      }
+      pendingUsageFinalizers.clear();
+      shared.agentCallbacksClosed = true;
       // Final token-usage flush, deliberately AFTER the drain: agents that
       // settle during the drain commit their usage last, and a pre-drain flush
       // would silently drop them from the run's final accounting (audit2 #5).

@@ -5050,6 +5050,214 @@ test(
 );
 
 test(
+  "abandoned drain callbacks cannot mutate a paused run or notify observers",
+  withTempCwd(async (cwd) => {
+    let captured:
+      | {
+          onUsageProgress?: (usage: AgentUsage) => void;
+          onUsage?: (usage: AgentUsage) => void;
+          onHistory?: (history: []) => void;
+          onModelResolved?: (model: string) => void;
+          onSessionCreated?: (session: { sessionId: string; sessionFile?: string }) => void;
+        }
+      | undefined;
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(_prompt, options) {
+          captured = options;
+          options?.onUsageProgress?.({ input: 20, output: 80, total: 100, cost: 0.01, cacheRead: 0, cacheWrite: 0 });
+          markStarted();
+          return new Promise(() => {}); // deliberately ignores options.signal
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'late_callbacks', description: 'late callbacks' }
+agent('ignore abort', { label: 'ignored' })
+return 'script returned'`;
+    const { runId, promise } = manager.startInBackground(script, undefined, { drainAbortGraceMs: 5 });
+    await started;
+
+    // The script has returned, so only the terminal drain remains before its
+    // grace-bound abandonment. Pause specifically while that drain is active.
+    for (let i = 0; i < 2_000; i++) {
+      const logs = manager.getRun(runId)?.snapshot.logs ?? [];
+      if (logs.some((line) => line.includes("outstanding agent()"))) break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.ok(
+      manager.getRun(runId)?.snapshot.logs.some((line) => line.includes("outstanding agent()")),
+      "the script must have returned and entered its terminal drain",
+    );
+    assert.equal(manager.getRun(runId)?.snapshot.agents[0]?.tokens, 100, "the drain must begin with provisional usage");
+    assert.equal(manager.pause(runId), true);
+    await promise;
+
+    const abandoned = manager.getRun(runId);
+    assert.equal(abandoned?.snapshot.agents[0]?.tokens, 0, "abandonment must roll back provisional usage");
+    assert.equal(abandoned?.snapshot.agents[0]?.tokenUsage?.total, 0);
+    assert.equal(abandoned?.snapshot.tokenUsage?.total, 0);
+
+    const lease = manager.getPersistence().acquireRunLease(runId);
+    assert.ok(lease, "the abandoned run must release its lease after settling");
+    if (lease) manager.getPersistence().releaseRunLease(lease);
+
+    const managedBefore = structuredClone(manager.getRun(runId)?.snapshot);
+    const persistedBefore = manager.getPersistence().load(runId);
+    const observerEvents: string[] = [];
+    for (const event of ["agentUsage", "tokenUsage", "agentHistory", "agentModel"]) {
+      manager.on(event, () => observerEvents.push(event));
+    }
+
+    const lateUsage: AgentUsage = { input: 20, output: 5, total: 25, cost: 0.1, cacheRead: 0, cacheWrite: 0 };
+    assert.ok(captured, "the signal-ignoring runner must retain the runtime callbacks");
+    captured.onUsageProgress?.(lateUsage);
+    captured.onUsage?.(lateUsage);
+    captured.onHistory?.([]);
+    captured.onModelResolved?.("late/model");
+    captured.onSessionCreated?.({ sessionId: "late-session", sessionFile: "late-session.jsonl" });
+
+    assert.deepEqual(
+      manager.getRun(runId)?.snapshot,
+      managedBefore,
+      "late callbacks after abandonment must not mutate managed state or usage",
+    );
+    assert.deepEqual(
+      manager.getPersistence().load(runId),
+      persistedBefore,
+      "late callbacks after abandonment must not persist a changed run",
+    );
+    assert.deepEqual(observerEvents, [], "late callbacks after abandonment must not emit live observer events");
+  }),
+);
+
+test(
+  "abandoned drain does not start a queued agent after callbacks close",
+  withTempCwd(async (cwd) => {
+    let releaseHung!: () => void;
+    const hungGate = new Promise<void>((resolve) => {
+      releaseHung = resolve;
+    });
+    let markHungStarted!: () => void;
+    const hungStarted = new Promise<void>((resolve) => {
+      markHungStarted = resolve;
+    });
+    let queuedRunnerCalls = 0;
+    const manager = new WorkflowManager({
+      cwd,
+      concurrency: 1,
+      agent: {
+        async run(prompt: string) {
+          if (prompt === "hung") {
+            markHungStarted();
+            await hungGate; // deliberately ignores the manager's abort signal
+            return "hung-done";
+          }
+          queuedRunnerCalls++;
+          return "queued-done";
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'queued_after_abandon', description: 'queued drain abandonment' }
+void agent('hung', { label: 'hung' })
+void agent('queued', { label: 'queued' })
+return 'script-done'`;
+    const { runId, promise } = manager.startInBackground(script, undefined, {
+      concurrency: 1,
+      drainAbortGraceMs: 5,
+    });
+    await hungStarted;
+
+    for (let i = 0; i < 2_000; i++) {
+      const logs = manager.getRun(runId)?.snapshot.logs ?? [];
+      if (logs.some((line) => line.includes("outstanding agent()"))) break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.ok(
+      manager.getRun(runId)?.snapshot.logs.some((line) => line.includes("outstanding agent()")),
+      "the second call must be queued while the hung first call occupies the only limiter slot",
+    );
+
+    assert.equal(manager.pause(runId), true);
+    await promise;
+
+    const snapshotBeforeRelease = structuredClone(manager.getRun(runId)?.snapshot);
+    const persistedBeforeRelease = manager.getPersistence().load(runId);
+    let lateAgentStarts = 0;
+    manager.on("agentStart", () => lateAgentStarts++);
+
+    // Once the abandoned runner finally releases the sole limiter slot, the
+    // queued call must be rejected before worktree setup or onAgentStart.
+    releaseHung();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(queuedRunnerCalls, 0, "a queued agent must never reach the runner after abandonment");
+    assert.equal(lateAgentStarts, 0, "a queued agent must not announce agentStart after callbacks close");
+    assert.deepEqual(
+      manager.getRun(runId)?.snapshot,
+      snapshotBeforeRelease,
+      "releasing the abandoned runner must not mutate the terminal managed snapshot",
+    );
+    assert.deepEqual(
+      manager.getPersistence().load(runId),
+      persistedBeforeRelease,
+      "releasing the abandoned runner must not change the terminal persisted record",
+    );
+  }),
+);
+
+test(
+  "pause() during the terminal drain keeps the run paused (not overwritten to completed) (audit2 r1 m7)",
+  withTempCwd(async (cwd) => {
+    let releaseSibling!: () => void;
+    const siblingGate = new Promise<void>((resolve) => (releaseSibling = resolve));
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          if (prompt === "slow") {
+            setTimeout(releaseSibling, 60);
+            await siblingGate;
+          }
+          return "done";
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'pause_drain', description: 'pause during drain' }
+const stray = agent('slow')
+return 'script-done'`;
+    const { runId, promise } = manager.startInBackground(script);
+
+    // Wait for the drain to start, then pause mid-drain.
+    for (let i = 0; i < 2000; i++) {
+      const logs = manager.getRun(runId)?.snapshot.logs ?? [];
+      if (logs.some((l) => l.includes("outstanding agent()"))) break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(manager.pause(runId), true);
+    releaseSibling();
+    await promise.catch(() => {});
+
+    const persisted = manager.getPersistence().load(runId);
+    assert.equal(persisted?.status, "paused", "pause owns the lifecycle — no paused→completed flip");
+    assert.equal(persisted?.result, "script-done", "the result is retained on the paused record");
+    assert.equal(
+      persisted?.agents[0]?.status,
+      "skipped",
+      "the never-settled sibling is settled fail-closed, not left at running forever",
+    );
+  }),
+);
+
+test(
   "a durable checkpoint suspension waits out in-flight siblings instead of aborting them (audit2 #2)",
   withTempCwd(async (cwd) => {
     let slowReleased: () => void = () => {};
