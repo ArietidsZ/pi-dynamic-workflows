@@ -60,6 +60,16 @@ export interface PersistedJournalEntry {
   model?: string;
 }
 
+/**
+ * Sanitize a persisted/incoming auto-resume attempt counter: corrupt or
+ * foreign values (non-number, NaN, Infinity, negative, non-integer) become
+ * undefined — a NaN/negative counter would defeat the scheduler's give-up
+ * cap and produce NaN timer delays (#207).
+ */
+export function sanitizeAutoResumeAttempts(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
+}
+
 export interface PersistedRunState {
   runId: string;
   workflowName: string;
@@ -172,9 +182,10 @@ export interface PersistedRunState {
    */
   agentRetries?: number;
   /**
-   * Auto-resume attempt counter for the current usage_limit pause-cycle, owned
-   * and persisted by UsageLimitScheduler (best-effort). Absent/0 means no
-   * auto-resume attempt has been recorded yet.
+   * Auto-resume attempt counter for the current usage_limit pause-cycle.
+   * Owned by WorkflowManager (written on every persistRun; the scheduler
+   * records through recordAutoResumeAttempts, never a raw save — #207).
+   * Absent/0 means no auto-resume attempt has been recorded yet.
    */
   autoResumeAttempts?: number;
   /**
@@ -249,6 +260,31 @@ export const DEFAULT_MAX_TERMINAL_RUNS_ON_DISK = 300;
 export const TERMINAL_RUN_STATUSES: ReadonlySet<RunStatus> = new Set(["completed", "failed", "aborted"]);
 
 const NON_TERMINAL_AGENT_STATUSES = new Set(["queued", "running"]);
+
+const PERSISTED_AGENT_STATUSES = [
+  "queued",
+  "running",
+  "done",
+  "error",
+  "skipped",
+] as const satisfies readonly PersistedAgentState["status"][];
+
+// Exhaustiveness: adding a member to PersistedAgentState["status"] without
+// listing it above fails to compile HERE (Exclude yields a non-never).
+type AssertNever<T extends never> = T;
+export type _PersistedAgentStatusExhaustiveCheck = AssertNever<
+  Exclude<PersistedAgentState["status"], (typeof PERSISTED_AGENT_STATUSES)[number]>
+>;
+
+/** Every status a persisted agent row may validly carry — exhaustively
+ * checked against PersistedAgentState["status"] by the assertion above.
+ * Forward-compat note: resume seeding DROPS rows with out-of-union statuses
+ * (e.g. written by a newer release) — deliberate garbage-vs-unknown tradeoff:
+ * an unknown status cannot be ghost-settled or displayed safely, so the row
+ * is treated as corrupt rather than re-persisted as a lie. */
+export const VALID_PERSISTED_AGENT_STATUSES: ReadonlySet<PersistedAgentState["status"]> = new Set(
+  PERSISTED_AGENT_STATUSES,
+);
 
 /** Cause stamped onto leftover agents when a live execution is gone but the run is still paused. */
 export const INTERRUPTED_AGENT_CAUSE: { error: string; errorCode: WorkflowErrorCode } = {
