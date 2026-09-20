@@ -107,6 +107,10 @@ export interface SharedRuntime {
   agentCount: number;
   spent: number;
   tokenUsage: AgentUsage;
+  /** Set after the top-level drain seals abandoned agent callbacks. */
+  agentCallbacksClosed?: boolean;
+  /** Active attempts whose usage must be finalized when an abort drain abandons them. */
+  pendingUsageFinalizers?: Set<() => void>;
   /** @deprecated Nesting depth is async-context scoped; retained for injected runtime compatibility. */
   depth: number;
   /**
@@ -576,6 +580,11 @@ export async function runWorkflow<T = unknown>(
     activeThreads: new Set<string>(),
     resumeBarrierReached: false,
   };
+  if (!shared.pendingUsageFinalizers) {
+    shared.pendingUsageFinalizers = new Set<() => void>();
+  }
+  const pendingUsageFinalizers = shared.pendingUsageFinalizers;
+  shared.agentCallbacksClosed ??= false;
   const limiter = shared.limiter;
   // This frame created `shared` fresh (rather than inheriting a parent
   // workflow()'s) — i.e. it's the true top-level run, the only frame allowed
@@ -909,6 +918,7 @@ export async function runWorkflow<T = unknown>(
       // The tracker keeps provisional estimates separate from committed usage,
       // accumulates retries, and rejects callbacks from attempts that already settled.
       const usageTracker = createAgentCallUsageTracker((update) => {
+        if (shared.agentCallbacksClosed) return;
         if (update.committedUsage) {
           shared.tokenUsage = sumAgentUsage(shared.tokenUsage, update.committedUsage);
           shared.spent += update.committedUsage.total;
@@ -920,6 +930,8 @@ export async function runWorkflow<T = unknown>(
         options.onAgentStart?.({ id: deltaKey, label, phase: assignedPhase, prompt, model: displayModel });
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
           const attemptUsage = usageTracker.startAttempt();
+          const finalizeAttemptUsage = () => attemptUsage.commitTerminalUsage();
+          pendingUsageFinalizers.add(finalizeAttemptUsage);
           const externalSignal = options.signal;
           let onExternalAbort: (() => void) | undefined;
           let onRunFatal: (() => void) | undefined;
@@ -983,6 +995,7 @@ export async function runWorkflow<T = unknown>(
               systemTools: createAgentStoreTools(store, deltaKey),
               cwd: runCwd,
               onModelResolved: (id: string) => {
+                if (shared.agentCallbacksClosed) return;
                 displayModel = id;
                 // Correct what /workflows shows for an agent that is STILL RUNNING.
                 // onAgentEnd keeps carrying the same value so late subscribers and
@@ -990,6 +1003,7 @@ export async function runWorkflow<T = unknown>(
                 options.onAgentModel?.({ id: deltaKey, label, phase: assignedPhase, model: id });
               },
               onModelFallback: ({ tier, requestedSpec }: { tier: string; requestedSpec: string }) => {
+                if (shared.agentCallbacksClosed) return;
                 // Untagged agents' implicit default tier degrading to the session
                 // default must stay visible in the run's own log/event stream, not
                 // just a console.warn (#131) — an explicit model/tier pin instead
@@ -999,9 +1013,11 @@ export async function runWorkflow<T = unknown>(
               onUsageProgress: attemptUsage.reportProgress,
               onUsage: attemptUsage.reportTerminal,
               onSessionCreated: ({ sessionId, sessionFile }: { sessionId: string; sessionFile?: string }) => {
+                if (shared.agentCallbacksClosed) return;
                 options.onAgentSession?.({ callId: deltaKey, sessionId, sessionFile });
               },
               onHistory: (history: AgentHistoryEntry[]) => {
+                if (shared.agentCallbacksClosed) return;
                 options.onAgentHistory?.({ id: deltaKey, label, phase: assignedPhase, history });
               },
               thread: agentOptions.thread,
@@ -1109,6 +1125,7 @@ export async function runWorkflow<T = unknown>(
             }
             throw workflowError;
           } finally {
+            pendingUsageFinalizers.delete(finalizeAttemptUsage);
             // Drop this attempt's abort listeners so they don't accrue one entry
             // per attempt on the run's signal / runFatalController for the whole
             // run (#109 hygiene).
@@ -1777,6 +1794,19 @@ export async function runWorkflow<T = unknown>(
         options.signal?.removeEventListener("abort", externalWake);
         shared.runFatalController.signal.removeEventListener("abort", fatalWake);
       }
+      // A bounded abort drain can intentionally leave a signal-ignoring runner
+      // in flight. Reconcile the latest terminal/provisional usage while the
+      // manager is still live, then seal every callback retained by that runner.
+      for (const finalizeUsage of pendingUsageFinalizers) {
+        try {
+          finalizeUsage();
+        } catch {
+          // A finalizer is best-effort; one broken callback cannot leave later
+          // attempts open or prevent the terminal drain from completing.
+        }
+      }
+      pendingUsageFinalizers.clear();
+      shared.agentCallbacksClosed = true;
       store.dispose();
     }
   }

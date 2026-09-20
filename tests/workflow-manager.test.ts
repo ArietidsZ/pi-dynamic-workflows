@@ -4723,6 +4723,93 @@ test(
 );
 
 test(
+  "abandoned drain callbacks cannot mutate a paused run or notify observers",
+  withTempCwd(async (cwd) => {
+    let captured:
+      | {
+          onUsageProgress?: (usage: AgentUsage) => void;
+          onUsage?: (usage: AgentUsage) => void;
+          onHistory?: (history: []) => void;
+          onModelResolved?: (model: string) => void;
+          onSessionCreated?: (session: { sessionId: string; sessionFile?: string }) => void;
+        }
+      | undefined;
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(_prompt, options) {
+          captured = options;
+          options?.onUsageProgress?.({ input: 20, output: 80, total: 100, cost: 0.01, cacheRead: 0, cacheWrite: 0 });
+          markStarted();
+          return new Promise(() => {}); // deliberately ignores options.signal
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'late_callbacks', description: 'late callbacks' }
+agent('ignore abort', { label: 'ignored' })
+return 'script returned'`;
+    const { runId, promise } = manager.startInBackground(script, undefined, { drainAbortGraceMs: 5 });
+    await started;
+
+    // The script has returned, so only the terminal drain remains before its
+    // grace-bound abandonment. Pause specifically while that drain is active.
+    for (let i = 0; i < 2_000; i++) {
+      const logs = manager.getRun(runId)?.snapshot.logs ?? [];
+      if (logs.some((line) => line.includes("outstanding agent()"))) break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.ok(
+      manager.getRun(runId)?.snapshot.logs.some((line) => line.includes("outstanding agent()")),
+      "the script must have returned and entered its terminal drain",
+    );
+    assert.equal(manager.getRun(runId)?.snapshot.agents[0]?.tokens, 100, "the drain must begin with provisional usage");
+    assert.equal(manager.pause(runId), true);
+    await promise;
+
+    const abandoned = manager.getRun(runId);
+    assert.equal(abandoned?.snapshot.agents[0]?.tokens, 0, "abandonment must roll back provisional usage");
+    assert.equal(abandoned?.snapshot.agents[0]?.tokenUsage?.total, 0);
+    assert.equal(abandoned?.snapshot.tokenUsage?.total, 0);
+
+    const lease = manager.getPersistence().acquireRunLease(runId);
+    assert.ok(lease, "the abandoned run must release its lease after settling");
+    if (lease) manager.getPersistence().releaseRunLease(lease);
+
+    const managedBefore = structuredClone(manager.getRun(runId)?.snapshot);
+    const persistedBefore = manager.getPersistence().load(runId);
+    const observerEvents: string[] = [];
+    for (const event of ["agentUsage", "tokenUsage", "agentHistory", "agentModel"]) {
+      manager.on(event, () => observerEvents.push(event));
+    }
+
+    const lateUsage: AgentUsage = { input: 20, output: 5, total: 25, cost: 0.1, cacheRead: 0, cacheWrite: 0 };
+    assert.ok(captured, "the signal-ignoring runner must retain the runtime callbacks");
+    captured.onUsageProgress?.(lateUsage);
+    captured.onUsage?.(lateUsage);
+    captured.onHistory?.([]);
+    captured.onModelResolved?.("late/model");
+    captured.onSessionCreated?.({ sessionId: "late-session", sessionFile: "late-session.jsonl" });
+
+    assert.deepEqual(
+      manager.getRun(runId)?.snapshot,
+      managedBefore,
+      "late callbacks after abandonment must not mutate managed state or usage",
+    );
+    assert.deepEqual(
+      manager.getPersistence().load(runId),
+      persistedBefore,
+      "late callbacks after abandonment must not persist a changed run",
+    );
+    assert.deepEqual(observerEvents, [], "late callbacks after abandonment must not emit live observer events");
+  }),
+);
+
+test(
   "pause() during the terminal drain keeps the run paused (not overwritten to completed) (audit2 r1 m7)",
   withTempCwd(async (cwd) => {
     let releaseSibling!: () => void;
