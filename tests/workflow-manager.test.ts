@@ -4841,6 +4841,81 @@ test(
 );
 
 test(
+  "recordAutoResumeAttempts never writes a stale managed snapshot after it released its lease (#207)",
+  withTempCwd(async (cwd) => {
+    let markStarted: () => void = () => {};
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(_prompt, options) {
+          markStarted();
+          await new Promise<void>((_resolve, reject) => {
+            options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+          });
+          return "unreachable";
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    promise.catch(() => {});
+    await started;
+    assert.equal(manager.pause(runId), true);
+    await promise.catch(() => {});
+
+    // The paused object remains in this manager's cache but no longer owns a
+    // lease. Model a newer foreign owner with deliberately distinct lifecycle
+    // and agent data; writing the old managed object would regress both fields.
+    const persistence = manager.getPersistence();
+    const stale = persistence.load(runId);
+    assert.equal(stale?.status, "paused");
+    assert.ok(stale);
+    persistence.save({
+      ...stale,
+      status: "running",
+      agents: [
+        {
+          id: "foreign-agent",
+          callId: "foreign-call",
+          label: "foreign",
+          status: "running",
+          tokens: 17,
+        },
+      ],
+    });
+    const runsDir = persistence.getRunsDir();
+    writeFileSync(
+      join(runsDir, `${runId}.lock`),
+      JSON.stringify({
+        runId,
+        runPath: join(runsDir, `${runId}.json`),
+        pid: process.pid,
+        startedAt: new Date().toISOString(),
+        token: "foreign-owner",
+      }),
+    );
+
+    manager.recordAutoResumeAttempts(runId, 3);
+
+    const current = persistence.load(runId);
+    assert.equal(current?.status, "running", "foreign lifecycle state must not be overwritten");
+    assert.deepEqual(current?.agents, [
+      {
+        id: "foreign-agent",
+        callId: "foreign-call",
+        label: "foreign",
+        status: "running",
+        tokens: 17,
+      },
+    ]);
+    assert.equal(current?.autoResumeAttempts, undefined, "contended merge must not write the counter either");
+  }),
+);
+
+test(
   "recordAutoResumeAttempts rejects corrupt counter values (#207)",
   withTempCwd(async (cwd) => {
     let markStarted: () => void = () => {};

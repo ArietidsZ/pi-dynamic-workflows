@@ -2006,18 +2006,23 @@ export class WorkflowManager extends EventEmitter {
 
   /**
    * Record the usage-limit scheduler's auto-resume backoff counter for a run.
-   * Live runs go through the managed state (so the next persistRun carries it);
-   * non-live runs (paused on disk from a prior process) merge into the
-   * persisted record under a run lease — skipped on contention, since the
-   * owning process then persists authoritatively. Never write this field via
-   * a raw persistence.save side-channel — writeRunToDisk would erase it (#207).
+   * Only a live run that still holds its lease goes through managed state (so
+   * the next persistRun carries it). Disk-only rows and stale in-memory rows
+   * whose execution released its lease merge the current persisted record under
+   * a fresh lease — skipped on contention, since the owner persists
+   * authoritatively. Never write this field via a raw persistence.save
+   * side-channel — writeRunToDisk would erase it (#207).
    */
   recordAutoResumeAttempts(runId: string, attempts: number): void {
     // A corrupt/foreign value must never reach the record: NaN/negative would
     // defeat the scheduler's give-up cap and produce NaN timer delays.
     if (sanitizeAutoResumeAttempts(attempts) === undefined) return;
     const managed = this.runs.get(runId);
-    if (managed) {
+    // Only an actively leased ManagedRun is authoritative. Paused and terminal
+    // entries remain in `runs` after their execution releases its lease; another
+    // process may then have resumed and rewritten the disk record. Persisting a
+    // whole stale ManagedRun from here would clobber that newer status/journal.
+    if (managed?.lease) {
       managed.autoResumeAttempts = attempts;
       this.persistRun(managed);
       return;
@@ -2028,6 +2033,10 @@ export class WorkflowManager extends EventEmitter {
       const current = this.persistence.load(runId);
       if (!current) return;
       this.persistence.save({ ...current, autoResumeAttempts: attempts });
+      // A local entry without a lease is only a cache. Once the lease-guarded
+      // merge succeeds, bring that cache up to date without making it an
+      // authority for any other persisted field.
+      if (managed) managed.autoResumeAttempts = attempts;
     } finally {
       this.persistence.releaseRunLease(lease);
     }
