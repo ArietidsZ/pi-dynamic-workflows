@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { isDeepStrictEqual } from "node:util";
 import type { AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import type { PersistedAgentState, PersistedRunState } from "../src/run-persistence.js";
@@ -5049,104 +5050,305 @@ test(
 );
 
 test(
-  "phase sub-budgets persist and hold cumulatively across a checkpoint pause/resume (audit2 #4)",
+  "a durable checkpoint suspension waits out in-flight siblings instead of aborting them (audit2 #2)",
   withTempCwd(async (cwd) => {
-    const manager = new WorkflowManager({ cwd, agent: fakeAgent({ total: 60 }) });
+    let slowReleased: () => void = () => {};
+    const slowCanFinish = new Promise<void>((resolve) => {
+      slowReleased = resolve;
+    });
+    let slowStarted: () => void = () => {};
+    const slowRunning = new Promise<void>((resolve) => {
+      slowStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          if (prompt === "slow-sibling") {
+            slowStarted();
+            await slowCanFinish; // still in flight when the checkpoint fires
+            return "slow-done";
+          }
+          return "ok";
+        },
+      },
+    });
     manager.on("error", () => {});
-    const script = `export const meta = { name: 'phase_resume', description: 'phase resume' }
-phase('p', { budget: 60 })
-const a = await agent('a')
-await checkpoint({ kind: 'hold', checkpointId: 'h-1', payload: {} })
-let blocked = false
-try { await agent('b') } catch (e) { blocked = (e && e.code) === 'TOKEN_BUDGET_EXHAUSTED' }
-return { a, blocked }`;
+    const persistence = manager.getPersistence();
+    const save = persistence.save.bind(persistence);
+    let runId = "";
+    let executionSettled = false;
+    const responsePersists: Array<{ hasLease: boolean; afterExecutionSettled: boolean }> = [];
+    persistence.save = (state) => {
+      if (
+        state.runId === runId &&
+        state.checkpoint?.status === "resuming" &&
+        isDeepStrictEqual(state.checkpoint.response, { approved: true })
+      ) {
+        responsePersists.push({
+          hasLease: manager.getRun(runId)?.lease !== undefined,
+          afterExecutionSettled: executionSettled,
+        });
+      }
+      save(state);
+    };
+    const script = `export const meta = { name: 'cp_sibling', description: 'checkpoint with sibling' }
+const sibling = agent('slow-sibling', { label: 'slow' })
+await checkpoint({ kind: 'hold', checkpointId: 'hold-1', payload: {} })
+return await sibling`;
+    const started = manager.startInBackground(script);
+    runId = started.runId;
+    const { promise } = started;
+    promise.catch(() => {});
+    void promise.then(
+      () => (executionSettled = true),
+      () => (executionSettled = true),
+    );
+    await slowRunning;
+    // Wait for the checkpoint suspension to pause the run while the sibling is mid-flight.
+    for (let i = 0; i < 2000; i++) {
+      if (manager.getRun(runId)?.status === "paused") break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    // The sibling must NOT have been aborted by the suspension. Release it only
+    // after the top-level drain begins (its "waiting for N outstanding" log) —
+    // the run-fatal seal (if wrongly fired) happens strictly before the drain,
+    // so this ordering makes the seal's effect deterministic.
+    for (let i = 0; i < 2000; i++) {
+      const logs = manager.getRun(runId)?.snapshot.logs ?? [];
+      if (logs.some((l) => l.includes("outstanding agent()"))) break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    // The documented host flow (attach response, then resume on the "paused"
+    // event) must work while the drain is still running — the 1s settle guard
+    // would otherwise block attach for the slowest sibling's entire runtime.
+    // Resolves without throwing — previously this threw "still settling" after
+    // a 1s wait whenever the drain outlasted the settle guard.
+    await manager.attachCheckpointResponse(runId, "hold-1", { approved: true });
+    // A conflicting second attach DURING the drain (live path) is rejected…
+    await assert.rejects(
+      manager.attachCheckpointResponse(runId, "hold-1", { approved: false }),
+      /conflicting/,
+      "conflicting live attach rejected",
+    );
+    // …and the identical response is idempotent.
+    await manager.attachCheckpointResponse(runId, "hold-1", { approved: true });
+
+    slowReleased();
+    await promise.catch(() => {});
+    let persisted = manager.getPersistence().load(runId);
+    for (let i = 0; i < 2000 && !persisted?.journal?.some((entry) => entry.result === "slow-done"); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      persisted = manager.getPersistence().load(runId);
+    }
+    assert.equal(
+      persisted?.checkpoint?.status,
+      "resuming",
+      "the response attached during the drain lands on disk (carried by the final persist)",
+    );
+    assert.deepEqual(persisted?.checkpoint?.response, { approved: true });
+    assert.equal(
+      persisted?.pauseReason,
+      "workflow_checkpoint",
+      "a live attach must not flip pauseReason to undefined (the run is still checkpoint-paused)",
+    );
+
+    assert.equal(persisted?.status, "paused", "run pauses at the durable checkpoint");
+    assert.equal(persisted?.checkpoint?.checkpointId, "hold-1");
+    assert.ok(
+      persisted?.journal?.some((entry) => entry.result === "slow-done"),
+      "the in-flight sibling completed and journaled — not aborted by the suspension",
+    );
+    assert.ok(responsePersists.length >= 2, "the attach and final checkpoint pause persist the attached response");
+    assert.ok(
+      responsePersists.every((write) => write.hasLease),
+      "every live response persist owns the run lease",
+    );
+    assert.ok(
+      responsePersists.every((write) => !write.afterExecutionSettled),
+      "execution settlement does not schedule a later response persist after its lease is released",
+    );
+  }),
+);
+
+test(
+  "an unleased active checkpoint drain falls back to the leased persistence attach path",
+  withTempCwd(async (cwd) => {
+    let releaseSlow: () => void = () => {};
+    const slowCanFinish = new Promise<void>((resolve) => {
+      releaseSlow = resolve;
+    });
+    let slowStarted: () => void = () => {};
+    const slowRunning = new Promise<void>((resolve) => {
+      slowStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          if (prompt === "slow-sibling") {
+            slowStarted();
+            await slowCanFinish;
+            return "slow-done";
+          }
+          return "ok";
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'unleased_attach', description: 'unleased checkpoint attach' }
+void agent('slow-sibling')
+await checkpoint({ kind: 'hold', checkpointId: 'hold-1', payload: {} })`;
+    const { runId, promise } = manager.startInBackground(script);
+    promise.catch(() => {});
+    await slowRunning;
+    for (let i = 0; i < 2000; i++) {
+      const logs = manager.getRun(runId)?.snapshot.logs ?? [];
+      if (logs.some((line) => line.includes("outstanding agent()"))) break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+
+    const active = manager.getRun(runId);
+    assert.ok(active?.lease, "the draining run starts with its execution lease");
+    manager.getPersistence().releaseRunLease(active.lease);
+    active.lease = undefined;
+
+    const persistence = manager.getPersistence();
+    const acquire = persistence.acquireRunLease.bind(persistence);
+    const save = persistence.save.bind(persistence);
+    let attachmentLeaseAcquisitions = 0;
+    let responsePersistedBeforeAttachmentLease = false;
+    persistence.acquireRunLease = (id) => {
+      attachmentLeaseAcquisitions++;
+      return acquire(id);
+    };
+    persistence.save = (state) => {
+      if (
+        state.runId === runId &&
+        state.checkpoint?.status === "resuming" &&
+        isDeepStrictEqual(state.checkpoint.response, { approved: true }) &&
+        attachmentLeaseAcquisitions === 0
+      ) {
+        responsePersistedBeforeAttachmentLease = true;
+      }
+      save(state);
+    };
+
+    const attaching = manager.attachCheckpointResponse(runId, "hold-1", { approved: true });
+    await Promise.resolve();
+    releaseSlow();
+    await promise.catch(() => {});
+    await attaching;
+
+    assert.ok(attachmentLeaseAcquisitions >= 1, "the unleased live record is not persisted through the drain path");
+    assert.equal(responsePersistedBeforeAttachmentLease, false, "no unleased live full-record response write occurs");
+    assert.deepEqual(persistence.load(runId)?.checkpoint, {
+      ...persistence.load(runId)?.checkpoint,
+      status: "resuming",
+      response: { approved: true },
+    });
+  }),
+);
+
+test(
+  "a usage-limit pause AFTER a consumed checkpoint persists pauseReason usage_limit (r3 MAJOR)",
+  withTempCwd(async (cwd) => {
+    const limitActive = true;
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          if (prompt.includes("second") && limitActive) {
+            throw new WorkflowError(
+              "Codex usage limit reached. Resets in ~3h.",
+              WorkflowErrorCode.PROVIDER_USAGE_LIMIT,
+              {
+                recoverable: false,
+                resetHint: "Resets in ~3h",
+              },
+            );
+          }
+          return "ok";
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'cp_then_quota', description: 'checkpoint then quota' }
+const a = await agent('first')
+await checkpoint({ kind: 'hold', checkpointId: 'g-1', payload: {} })
+const b = await agent('second')
+return { a, b }`;
 
     const started = manager.startInBackground(script);
     await assert.rejects(started.promise, /checkpoint/i);
+    await manager.attachCheckpointResponse(started.runId, "g-1", {});
+    const paused = once(manager, "paused");
+    assert.equal(await manager.resume(started.runId, { checkpointId: "g-1" }), true);
+    await paused;
 
-    // The declared phase budget must be on the persisted record (frame-namespaced).
-    const pausedRecord = manager.getPersistence().load(started.runId);
-    assert.deepEqual(pausedRecord?.phaseBudgets?.[`${started.runId}:p`], { budget: 60, startSpent: 0, warned: false });
-
-    await manager.attachCheckpointResponse(started.runId, "h-1", {});
-    const completed = once(manager, "complete");
-    assert.equal(await manager.resume(started.runId, { checkpointId: "h-1" }), true);
-    await completed;
-
-    const final = manager.getPersistence().load(started.runId);
+    const persisted = manager.listRuns().find((r) => r.runId === started.runId);
+    assert.equal(persisted?.status, "paused");
     assert.equal(
-      final?.result && (final.result as { blocked?: boolean }).blocked,
-      true,
-      "after resume, 'b' must be blocked: the phase ceiling (60) holds against the CUMULATIVE spend (60 pre-pause) instead of re-basing",
+      persisted?.pauseReason,
+      "usage_limit",
+      "a consumed checkpoint must not mask the usage-limit pause cause (cold-start auto-resume filters on this)",
     );
-    assert.deepEqual(
-      final?.agents.map((a) => a.prompt),
-      ["a"],
-      "'a' replayed in place from the journal and 'b' never ran (no 'b' row)",
-    );
+    assert.equal(persisted?.checkpoint?.status, "consumed");
   }),
 );
 
 test(
-  "a run paused with its token budget exhausted still RESUMES: journaled replays are free (audit2 #1)",
+  "a usage-limit pause while a checkpoint is still RESUMING persists pauseReason usage_limit (r4 MAJOR)",
   withTempCwd(async (cwd) => {
-    const manager = new WorkflowManager({ cwd, agent: fakeAgent({ total: 60 }) });
-    manager.on("error", () => {});
-    const script = `export const meta = { name: 'budget_resume', description: 'budget resume' }
-const a = await agent('a')
-await checkpoint({ kind: 'hold', checkpointId: 'h-1', payload: {} })
-let blocked = false
-try { await agent('b') } catch (e) { blocked = (e && e.code) === 'TOKEN_BUDGET_EXHAUSTED' }
-return { a, blocked }`;
-
-    const started = manager.startInBackground(script, undefined, { tokenBudget: 60 });
-    await assert.rejects(started.promise, /checkpoint/i);
-
-    await manager.attachCheckpointResponse(started.runId, "h-1", {});
-    const completed = once(manager, "complete");
-    assert.equal(await manager.resume(started.runId, { checkpointId: "h-1" }), true);
-    await completed;
-
-    const final = manager.getPersistence().load(started.runId);
-    assert.equal(final?.status, "completed", "the run must resume past the exhausted budget via free replays");
-    assert.equal(
-      final?.result && (final.result as { blocked?: boolean }).blocked,
-      true,
-      "the gate still fires at the first LIVE (paid) call",
-    );
-    assert.deepEqual(
-      final?.agents.map((a) => a.prompt),
-      ["a"],
-      "'a' replayed in place (budget gate must not strand the replay)",
-    );
-  }),
-);
-
-test(
-  "nested frames MERGE into the persisted phase-budget table (parent entries survive a child declaration)",
-  withTempCwd(async (cwd) => {
-    const child = `export const meta = { name: 'childwf', description: 'c' }
-phase('childphase', { budget: 50 })
-const r = await agent('child task')
-return { child: r }`;
-    const parent = `export const meta = { name: 'parentwf', description: 'p' }
-phase('parentphase', { budget: 100 })
-const a = await agent('parent task')
-const nested = await workflow('childwf')
-return { a, nested }`;
+    let limitActive = false;
     const manager = new WorkflowManager({
       cwd,
-      agent: fakeAgent({ total: 10 }),
-      loadSavedWorkflow: (name: string) => (name === "childwf" ? child : undefined),
+      agent: {
+        async run(_prompt: string) {
+          if (limitActive) {
+            throw new WorkflowError(
+              "Codex usage limit reached. Resets in ~3h.",
+              WorkflowErrorCode.PROVIDER_USAGE_LIMIT,
+              {
+                recoverable: false,
+                resetHint: "Resets in ~3h",
+              },
+            );
+          }
+          return "ok";
+        },
+      },
     });
     manager.on("error", () => {});
-    const { runId, promise } = manager.startInBackground(parent);
-    await promise;
-    const persisted = manager.getPersistence().load(runId);
-    assert.ok(persisted?.phaseBudgets?.[`${runId}:parentphase`], "parent entry survives the child's declaration");
-    assert.ok(persisted?.phaseBudgets?.[`${runId}-nested1:childphase`], "child entry recorded under its own frame key");
-    assert.equal(persisted?.phaseBudgets?.[`${runId}:parentphase`]?.budget, 100);
-    assert.equal(persisted?.phaseBudgets?.[`${runId}-nested1:childphase`]?.budget, 50);
+    const script = `export const meta = { name: 'cp_resuming_quota', description: 'resuming checkpoint then quota' }
+const a = await agent('first')
+await checkpoint({ kind: 'hold', checkpointId: 'g-1', payload: {} })
+return { a }`;
+
+    const started = manager.startInBackground(script);
+    await assert.rejects(started.promise, /checkpoint/i);
+    await manager.attachCheckpointResponse(started.runId, "g-1", {});
+
+    // Resume with an EDITED script whose first call hash-misses: the resumed
+    // execution runs live BEFORE reaching checkpoint(), so the checkpoint is
+    // still "resuming" when the provider limit hits.
+    limitActive = true;
+    const edited = `export const meta = { name: 'cp_resuming_quota', description: 'resuming checkpoint then quota' }
+const a = await agent('first-edited')
+await checkpoint({ kind: 'hold', checkpointId: 'g-1', payload: {} })
+return { a }`;
+    const paused = once(manager, "paused");
+    assert.equal(await manager.resume(started.runId, { checkpointId: "g-1", script: edited }), true);
+    await paused;
+
+    const persisted = manager.listRuns().find((r) => r.runId === started.runId);
+    assert.equal(persisted?.status, "paused");
+    assert.equal(persisted?.checkpoint?.status, "resuming", "the checkpoint was never consumed by the resumed run");
+    assert.equal(
+      persisted?.pauseReason,
+      "usage_limit",
+      "usageLimitPause is unambiguous and must win over a still-resuming checkpoint",
+    );
   }),
 );
 
@@ -5814,5 +6016,107 @@ await agent('NEW-B')`;
       logs.some((l) => l.includes("no usable results")),
       "stale seeded history must not suppress the all-empty warning",
     );
+  }),
+);
+
+test(
+  "phase sub-budgets persist and hold cumulatively across a checkpoint pause/resume (audit2 #4)",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent({ total: 60 }) });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'phase_resume', description: 'phase resume' }
+phase('p', { budget: 60 })
+const a = await agent('a')
+await checkpoint({ kind: 'hold', checkpointId: 'h-1', payload: {} })
+let blocked = false
+try { await agent('b') } catch (e) { blocked = (e && e.code) === 'TOKEN_BUDGET_EXHAUSTED' }
+return { a, blocked }`;
+
+    const started = manager.startInBackground(script);
+    await assert.rejects(started.promise, /checkpoint/i);
+
+    // The declared phase budget must be on the persisted record (frame-namespaced).
+    const pausedRecord = manager.getPersistence().load(started.runId);
+    assert.deepEqual(pausedRecord?.phaseBudgets?.[`${started.runId}:p`], { budget: 60, startSpent: 0, warned: false });
+
+    await manager.attachCheckpointResponse(started.runId, "h-1", {});
+    const completed = once(manager, "complete");
+    assert.equal(await manager.resume(started.runId, { checkpointId: "h-1" }), true);
+    await completed;
+
+    const final = manager.getPersistence().load(started.runId);
+    assert.equal(
+      final?.result && (final.result as { blocked?: boolean }).blocked,
+      true,
+      "after resume, 'b' must be blocked: the phase ceiling (60) holds against the CUMULATIVE spend (60 pre-pause) instead of re-basing",
+    );
+    assert.deepEqual(
+      final?.agents.map((a) => a.prompt),
+      ["a"],
+      "'a' replayed in place from the journal and 'b' never ran (no 'b' row)",
+    );
+  }),
+);
+
+test(
+  "a run paused with its token budget exhausted still RESUMES: journaled replays are free (audit2 #1)",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent({ total: 60 }) });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'budget_resume', description: 'budget resume' }
+const a = await agent('a')
+await checkpoint({ kind: 'hold', checkpointId: 'h-1', payload: {} })
+let blocked = false
+try { await agent('b') } catch (e) { blocked = (e && e.code) === 'TOKEN_BUDGET_EXHAUSTED' }
+return { a, blocked }`;
+
+    const started = manager.startInBackground(script, undefined, { tokenBudget: 60 });
+    await assert.rejects(started.promise, /checkpoint/i);
+
+    await manager.attachCheckpointResponse(started.runId, "h-1", {});
+    const completed = once(manager, "complete");
+    assert.equal(await manager.resume(started.runId, { checkpointId: "h-1" }), true);
+    await completed;
+
+    const final = manager.getPersistence().load(started.runId);
+    assert.equal(final?.status, "completed", "the run must resume past the exhausted budget via free replays");
+    assert.equal(
+      final?.result && (final.result as { blocked?: boolean }).blocked,
+      true,
+      "the gate still fires at the first LIVE (paid) call",
+    );
+    assert.deepEqual(
+      final?.agents.map((a) => a.prompt),
+      ["a"],
+      "'a' replayed in place (budget gate must not strand the replay)",
+    );
+  }),
+);
+
+test(
+  "nested frames MERGE into the persisted phase-budget table (parent entries survive a child declaration)",
+  withTempCwd(async (cwd) => {
+    const child = `export const meta = { name: 'childwf', description: 'c' }
+phase('childphase', { budget: 50 })
+const r = await agent('child task')
+return { child: r }`;
+    const parent = `export const meta = { name: 'parentwf', description: 'p' }
+phase('parentphase', { budget: 100 })
+const a = await agent('parent task')
+const nested = await workflow('childwf')
+return { a, nested }`;
+    const manager = new WorkflowManager({
+      cwd,
+      agent: fakeAgent({ total: 10 }),
+      loadSavedWorkflow: (name: string) => (name === "childwf" ? child : undefined),
+    });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(parent);
+    await promise;
+    const persisted = manager.getPersistence().load(runId);
+    assert.ok(persisted?.phaseBudgets?.[`${runId}:parentphase`], "parent entry survives the child's declaration");
+    assert.ok(persisted?.phaseBudgets?.[`${runId}-nested1:childphase`], "child entry recorded under its own frame key");
+    assert.equal(persisted?.phaseBudgets?.[`${runId}:parentphase`]?.budget, 100);
+    assert.equal(persisted?.phaseBudgets?.[`${runId}-nested1:childphase`]?.budget, 50);
   }),
 );

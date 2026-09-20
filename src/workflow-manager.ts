@@ -1601,10 +1601,14 @@ export class WorkflowManager extends EventEmitter {
         agentRetries: managed.agentRetries,
         pauseReason:
           managed.status === "paused"
-            ? managed.checkpoint?.status === "waiting"
-              ? "workflow_checkpoint"
-              : managed.usageLimitPause
-                ? "usage_limit"
+            ? managed.usageLimitPause
+              ? // usageLimitPause is only ever set when the escaping error is
+                // genuinely PROVIDER_USAGE_LIMIT, so it is unambiguous and wins:
+                // a checkpoint in ANY status (waiting/resuming/consumed) must
+                // never mask it — coldStartRearm filters on this value.
+                "usage_limit"
+              : managed.checkpoint
+                ? "workflow_checkpoint"
                 : undefined
             : undefined,
         resetHint:
@@ -1670,6 +1674,104 @@ export class WorkflowManager extends EventEmitter {
   }
 
   /**
+   * Attach a human/controller response to a durable checkpoint that is waiting
+   * (or resuming). Fail-closed: the response is durable on disk before this
+   * resolves, so it survives a process restart.
+   *
+   * While the suspended execution is still draining its in-flight siblings (the
+   * run is deliberately not sealed), the response is written through the LIVE
+   * managed record with a fail-closed persist (the manager owns this run's
+   * lease via the draining execution) — so attach works immediately instead of
+   * blocking on the 1s settle guard. resume() still refuses until the drain
+   * settles; hosts should attach first and resume on the "paused" event (the
+   * documented flow).
+   */
+  async attachCheckpointResponse(runId: string, checkpointId: string, responseValue: unknown): Promise<void> {
+    const response = cloneDurableJsonValue(responseValue, "checkpoint response");
+    const buildResuming = (checkpoint: NonNullable<ManagedRun["checkpoint"]>) => {
+      if (checkpoint.checkpointId !== checkpointId) {
+        throw new Error(
+          `stale checkpoint response: expected ${JSON.stringify(checkpoint.checkpointId)}, received ${JSON.stringify(checkpointId)}`,
+        );
+      }
+      if (checkpoint.status !== "waiting") {
+        if (isDeepStrictEqual(checkpoint.response, response)) return undefined;
+        throw new Error(`conflicting response for checkpoint ${JSON.stringify(checkpointId)}`);
+      }
+      return { ...checkpoint, status: "resuming" as const, response };
+    };
+
+    const active = this.runs.get(runId);
+    const settlingExecution = active ? this.executions.get(active) : undefined;
+    // Settled-execution probe: a .then handler attached to an already-settled
+    // promise runs on the very next microtask, while one attached to a pending
+    // promise does not. (Promise.race can't express this — a wrapped settled
+    // entry still needs two hops.) Post-drain attaches keep the lease+disk path
+    // so resume() sees the response on disk immediately; only a genuinely
+    // draining execution takes the live-write path below.
+    let executionPending = false;
+    if (settlingExecution) {
+      let settled = false;
+      void settlingExecution.then(
+        () => (settled = true),
+        () => (settled = true),
+      );
+      await Promise.resolve();
+      executionPending = !settled;
+    }
+    if (settlingExecution && executionPending) {
+      // The suspension's sibling drain (the run is deliberately not sealed, so
+      // in-flight siblings finish and journal) can take as long as the slowest
+      // agent — far past the 1s settle guard. The draining execution's final
+      // persist happens strictly after the drain, so writing the response onto
+      // the LIVE managed record is durable: that persist carries it to disk.
+      // Attaching here keeps the documented host flow (attach, then resume on
+      // the "paused" event) usable while siblings still settle.
+      if (active?.lease && this.isCurrent(active)) {
+        if (!active.checkpoint) throw new Error("run has no durable checkpoint");
+        const next = buildResuming(active.checkpoint);
+        if (next === undefined) return;
+        const previousCheckpoint = active.checkpoint;
+        active.checkpoint = next;
+        try {
+          // Fail-closed durable write NOW: the manager owns this run's lease via
+          // the draining execution, and the checkpoint contract ("the response
+          // survives process restart") must hold even if the process dies
+          // mid-drain. The draining execution's later final persist reads
+          // managed.checkpoint live, so it carries this same resuming state.
+          this.persistRun(active, true);
+        } catch (error) {
+          // Roll the live record back: the caller is told the attach failed, so
+          // the in-memory state must not keep a response that never reached
+          // disk (a retry with a different response must not conflict, and the
+          // drain's final persist must not silently write it).
+          active.checkpoint = previousCheckpoint;
+          throw error;
+        }
+        return;
+      }
+      if (!(await waitForPausedExecutionSettlement(settlingExecution))) {
+        throw new Error(`workflow run ${JSON.stringify(runId)} is still settling`);
+      }
+    }
+
+    const lease = this.persistence.acquireRunLease(runId);
+    if (!lease) throw new Error(`workflow run ${JSON.stringify(runId)} is busy`);
+    try {
+      const persisted = this.persistence.load(runId);
+      if (!persisted?.checkpoint) throw new Error("run has no durable checkpoint");
+      const next = buildResuming(persisted.checkpoint);
+      if (next === undefined) return;
+      this.persistence.save({ ...persisted, checkpoint: next });
+      if (active && this.isCurrent(active)) {
+        active.checkpoint = next;
+      }
+    } finally {
+      this.persistence.releaseRunLease(lease);
+    }
+  }
+
+  /**
    * Resume an interrupted run: replay journaled results for the unchanged prefix
    * and run the rest live. Returns false if there is nothing resumable.
    *
@@ -1684,40 +1786,6 @@ export class WorkflowManager extends EventEmitter {
    * UsageLimitScheduler) unchanged. `opts.args` overrides the persisted args
    * only when provided; otherwise the persisted args are kept.
    */
-  async attachCheckpointResponse(runId: string, checkpointId: string, responseValue: unknown): Promise<void> {
-    const response = cloneDurableJsonValue(responseValue, "checkpoint response");
-    const active = this.runs.get(runId);
-    const settlingExecution = active ? this.executions.get(active) : undefined;
-    if (settlingExecution && !(await waitForPausedExecutionSettlement(settlingExecution))) {
-      throw new Error(`workflow run ${JSON.stringify(runId)} is still settling`);
-    }
-
-    const lease = this.persistence.acquireRunLease(runId);
-    if (!lease) throw new Error(`workflow run ${JSON.stringify(runId)} is busy`);
-    try {
-      const persisted = this.persistence.load(runId);
-      if (!persisted?.checkpoint) throw new Error("run has no durable checkpoint");
-      if (persisted.checkpoint.checkpointId !== checkpointId) {
-        throw new Error(
-          `stale checkpoint response: expected ${JSON.stringify(persisted.checkpoint.checkpointId)}, received ${JSON.stringify(checkpointId)}`,
-        );
-      }
-      if (persisted.checkpoint.status !== "waiting") {
-        if (isDeepStrictEqual(persisted.checkpoint.response, response)) return;
-        throw new Error(`conflicting response for checkpoint ${JSON.stringify(checkpointId)}`);
-      }
-      this.persistence.save({
-        ...persisted,
-        checkpoint: { ...persisted.checkpoint, status: "resuming", response },
-      });
-      if (active && this.isCurrent(active)) {
-        active.checkpoint = { ...persisted.checkpoint, status: "resuming", response };
-      }
-    } finally {
-      this.persistence.releaseRunLease(lease);
-    }
-  }
-
   async resume(runId: string, opts?: WorkflowResumeOptions): Promise<boolean> {
     const active = this.runs.get(runId);
     if (active?.status === "running" || active?.status === "aborted") return false;
