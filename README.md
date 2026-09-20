@@ -79,7 +79,7 @@ return await agent(
 - **Per-agent model routing** — use `small`, `medium`, or `big` tiers, or choose an exact provider/model and thinking level.
 - **Journaled resume** — replay completed agents after interruption without rerunning them or spending their tokens again. The orchestrator can also resume with an **edited script** (`resumeFromRunId`): unchanged `agent()` calls replay from cache and only edited/new ones re-run — so a single bad prompt no longer means paying to re-run the whole workflow.
 - **Git worktree isolation** — parallel agents edit on separate branches with `isolation: "worktree"`. Kept by default for merge; pass `keepWorktree: false` to delete (tests).
-- **Measured usage** — report real tokens and cost from each subagent session; add run, phase, or agent budgets only when you want them.
+- **Measured usage** — report real tokens and cost from each subagent session; add run, phase, or agent budgets only when you want them. When a provider session ends without reporting usage, the affected totals are heuristic character estimates and UI token surfaces render them with a `~` prefix (e.g. `~640 tok`) — never silently as metered figures. (Script-facing `budget.spent()/remaining()` are raw numbers and cannot carry the marker.)
 - **Visible background runs** — track phases, agents, models, fresh/cache tokens, cost, and live tok/s from the progress panel or `/workflows` navigator.
 - **Quality patterns** — compose `verify()`, `judgePanel()`, `loopUntilDry()`, and `completenessCheck()` instead of rebuilding review loops.
 - **Reusable workflows** — save any run as a command and call saved workflows from other workflows.
@@ -185,7 +185,7 @@ Agent details use a compact summary by default: completed agents show their fina
 | `loopUntilDry` / `completenessCheck` | Repeat discovery until no new findings remain |
 | `workflow(name, args)` | Run a saved workflow inline |
 | `checkpoint(prompt, opts)` | Add a journaled human-approval gate |
-| `budget` | Inspect real tokens spent and remaining |
+| `budget` | Inspect tokens spent and remaining (raw numbers; UI surfaces mark heuristic estimates with `~`) |
 
 | Agent option | Description |
 | --- | --- |
@@ -241,6 +241,8 @@ Set `"defaultEffort": "high"` or `"ultra"` in that settings file to opt a fresh 
 A schema-less agent call that comes back as whitespace-only text is a recoverable `AGENT_EMPTY_OUTPUT` failure and retries like any other. Some models occasionally hit this on an otherwise-fine first attempt; if a fleet is built on one of them, set `agentRetries: 1-2` rather than treating an isolated empty output as a failed run. Because an exhausted recoverable failure resolves to `null` rather than throwing, a run whose **every** agent came back empty still reports `completed`; when that happens the runtime logs a prominent `⚠ Workflow produced no usable results` warning (naming the empty agents and pointing at `agentRetries` and output-token limits) so an all-null fleet can't be mistaken for success.
 
 Pausing and resuming a run keeps the limits it started with — `maxAgents`, `agentTimeoutMs`, `concurrency`, and `agentRetries` carry over instead of falling back to defaults, and `tokenBudget` tracking is cumulative across the pause, so a run can't reset its spend by pausing and resuming.
+
+Programmatic hosts can set `drainAbortGraceMs` on `runWorkflow` or manager execution options to bound the final wait for agents that ignore cancellation. The default is 10,000 ms; `Infinity` waits without a bound. Finite values from 1 through 2,147,483,647 are rounded down; other values use the default. This is a host-only option, not a `workflow` tool input or persisted setting. It does not limit a successful run's final wait or a checkpoint suspension unless the run is also cancelled. After abandonment, already-reported terminal usage is retained, provisional usage is rolled back, and late agent callbacks cannot modify the settled run.
 
 </details>
 
