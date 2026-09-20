@@ -1579,6 +1579,26 @@ test("a failed per-directory resource loader is evicted before the next attempt 
   }
 });
 
+test("the shared resource-loader memo is bounded while loaders are still pending (#109)", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-loader-pending-root-"));
+  const agentDir = mkdtempSync(join(root, "agent-"));
+  try {
+    const agent = new WorkflowAgent({ cwd: root });
+    type Priv = { getSharedResourceLoader(agentDir: string, cwd: string): Promise<unknown> };
+    const privateAgent = agent as unknown as Priv;
+    const promises = Array.from({ length: 12 }, (_, i) => {
+      const cwd = mkdtempSync(join(root, `cwd-${i}-`));
+      return privateAgent.getSharedResourceLoader(agentDir, cwd);
+    });
+    const loaders = (agent as unknown as { resourceLoaders: Map<string, unknown> }).resourceLoaders;
+
+    assert.ok(loaders.size <= 8, `the memo must be bounded before any loader resolves (got ${loaders.size})`);
+    await Promise.all(promises);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════════════
 // finalAssistantText — the unstructured result must come AFTER the last tool
 // result, so stale progress text can't be reported as a completed answer (#111)

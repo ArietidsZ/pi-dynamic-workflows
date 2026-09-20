@@ -794,6 +794,7 @@ export class WorkflowAgent {
       throw err;
     });
     this.resourceLoaders.set(key, pending);
+    this.pruneSharedResourceLoaders();
     return pending;
   }
 
@@ -1318,7 +1319,6 @@ export class WorkflowAgent {
         }
       }
       session.dispose();
-      if (!this.sessionOptions.resourceLoader) this.pruneSharedResourceLoaders();
     }
   }
 

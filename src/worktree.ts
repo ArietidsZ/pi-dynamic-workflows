@@ -104,7 +104,7 @@ async function cleanupFailedWorktreeAdd(repoRoot: string, path: string, branch: 
     // Registered case: removes the tree AND the registration in one step.
     await exec("git", ["-C", repoRoot, "worktree", "remove", "--force", path], quick);
   } catch {
-    // best-effort — unregistered partial tree falls through to rm + prune
+    // best-effort — unregistered partial tree falls through to rm + targeted retry
   }
   try {
     // maxRetries: a SIGTERM'd git can keep writing for a few hundred ms after
@@ -115,8 +115,10 @@ async function cleanupFailedWorktreeAdd(repoRoot: string, path: string, branch: 
     // best-effort
   }
   try {
-    // Drop any stale registration left by the manual rm above.
-    await exec("git", ["-C", repoRoot, "worktree", "prune"], quick);
+    // If manual removal left THIS tree registered, retry its removal now that
+    // the path is gone. Do not run `git worktree prune`: that mutates unrelated
+    // stale registrations elsewhere in the repository.
+    await exec("git", ["-C", repoRoot, "worktree", "remove", "--force", path], quick);
   } catch {
     // best-effort
   }
