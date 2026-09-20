@@ -9,7 +9,7 @@ import type { AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import type { PersistedAgentState, PersistedRunState } from "../src/run-persistence.js";
 import { UsageLimitScheduler } from "../src/usage-limit-scheduler.js";
-import { WorkflowManager } from "../src/workflow-manager.js";
+import { _setPausedExecutionSettleTimeoutForTests, WorkflowManager } from "../src/workflow-manager.js";
 import { NavigatorModel, NavigatorState, renderNavigator } from "../src/workflow-ui.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
@@ -578,65 +578,71 @@ test(
 test(
   "resume refuses to overlap pause teardown that exceeds the settlement grace period",
   withTempCwd(async (cwd) => {
-    let markFirstAttemptStarted: () => void = () => {};
-    const firstAttemptStarted = new Promise<void>((resolve) => {
-      markFirstAttemptStarted = resolve;
-    });
-    let attempts = 0;
-    const manager = new WorkflowManager({
-      cwd,
-      agent: {
-        async run(prompt, options) {
-          void prompt;
-          attempts++;
-          if (attempts === 1) {
-            markFirstAttemptStarted();
-            return new Promise((resolve, reject) => {
-              void resolve;
-              options?.signal?.addEventListener(
-                "abort",
-                () => {
-                  setTimeout(() => {
-                    options.onUsage?.({
-                      input: 20,
-                      output: 5,
-                      total: 25,
-                      cost: 0.1,
-                      cacheRead: 0,
-                      cacheWrite: 0,
-                    });
-                    reject(new Error("first attempt finished slow abort teardown"));
-                  }, 1_100);
-                },
-                { once: true },
-              );
-            });
-          }
-          options?.onUsage?.({ input: 8, output: 2, total: 10, cost: 0.01, cacheRead: 0, cacheWrite: 0 });
-          return "resumed";
+    // Shrink the (10s) settle grace so the 1.1s teardown below exceeds it.
+    _setPausedExecutionSettleTimeoutForTests(1_000);
+    try {
+      let markFirstAttemptStarted: () => void = () => {};
+      const firstAttemptStarted = new Promise<void>((resolve) => {
+        markFirstAttemptStarted = resolve;
+      });
+      let attempts = 0;
+      const manager = new WorkflowManager({
+        cwd,
+        agent: {
+          async run(prompt, options) {
+            void prompt;
+            attempts++;
+            if (attempts === 1) {
+              markFirstAttemptStarted();
+              return new Promise((resolve, reject) => {
+                void resolve;
+                options?.signal?.addEventListener(
+                  "abort",
+                  () => {
+                    setTimeout(() => {
+                      options.onUsage?.({
+                        input: 20,
+                        output: 5,
+                        total: 25,
+                        cost: 0.1,
+                        cacheRead: 0,
+                        cacheWrite: 0,
+                      });
+                      reject(new Error("first attempt finished slow abort teardown"));
+                    }, 1_100);
+                  },
+                  { once: true },
+                );
+              });
+            }
+            options?.onUsage?.({ input: 8, output: 2, total: 10, cost: 0.01, cacheRead: 0, cacheWrite: 0 });
+            return "resumed";
+          },
         },
-      },
-    });
-    manager.on("error", () => {});
+      });
+      manager.on("error", () => {});
 
-    const { runId, promise } = manager.startInBackground(oneAgentScript);
-    await firstAttemptStarted;
-    assert.equal(manager.pause(runId), true);
-    assert.equal(await manager.resume(runId), false, "resume must not overlap an execution still tearing down");
-    assert.equal(attempts, 1, "no replacement agent may start before pause teardown settles");
-    await assert.rejects(promise);
+      const { runId, promise } = manager.startInBackground(oneAgentScript);
+      await firstAttemptStarted;
+      assert.equal(manager.pause(runId), true);
+      assert.equal(await manager.resume(runId), false, "resume must not overlap an execution still tearing down");
+      assert.equal(attempts, 1, "no replacement agent may start before pause teardown settles");
+      await assert.rejects(promise);
 
-    const paused = manager.getPersistence().load(runId);
-    assert.equal(paused?.tokenUsage?.total, 25);
-    assert.equal(await manager.resume(runId), true);
-    for (let i = 0; i < 2000 && manager.getRun(runId)?.status === "running"; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 1));
+      const paused = manager.getPersistence().load(runId);
+      assert.equal(paused?.tokenUsage?.total, 25);
+      assert.equal(await manager.resume(runId), true);
+      for (let i = 0; i < 2000 && manager.getRun(runId)?.status === "running"; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+
+      const completed = manager.getPersistence().load(runId);
+      assert.equal(completed?.status, "completed");
+      assert.equal(completed?.tokenUsage?.total, 35);
+      assert.equal(attempts, 2);
+    } finally {
+      _setPausedExecutionSettleTimeoutForTests(undefined);
     }
-
-    const completed = manager.getPersistence().load(runId);
-    assert.equal(completed?.status, "completed");
-    assert.equal(completed?.tokenUsage?.total, 35);
-    assert.equal(attempts, 2);
   }),
 );
 
@@ -1752,6 +1758,62 @@ test(
     const deleted = manager.deleteRun(runId);
     assert.equal(deleted, true);
     assert.equal(manager.getRun(runId), undefined);
+  }),
+);
+
+test(
+  "deleteRun refuses while another live process holds the run lease (audit2 #16)",
+  withTempCwd(async (cwd) => {
+    const owner = new WorkflowManager({ cwd, agent: fakeAgent() });
+    const deleter = new WorkflowManager({ cwd });
+    const { runId } = owner.startInBackground(oneAgentScript);
+    await new Promise((r) => setTimeout(r, 30));
+    // The run completed, so owner released its run lease; simulate a foreign
+    // process still working on the run by holding the lease directly.
+    const persistence = owner.getPersistence();
+    const lease = persistence.acquireRunLease(runId);
+    assert.ok(lease, "lease acquired (stands in for a live foreign owner)");
+    try {
+      assert.equal(deleter.deleteRun(runId), false, "cross-process delete refused while leased");
+      assert.ok(persistence.load(runId), "the run file survived the refused delete");
+    } finally {
+      persistence.releaseRunLease(lease);
+    }
+    assert.equal(deleter.deleteRun(runId), true, "delete proceeds once the lease is gone");
+  }),
+);
+
+test(
+  "deleteRun refuses for a terminal in-memory run leased by a foreign process (audit2 #16 r1)",
+  withTempCwd(async (cwd) => {
+    // r1 MAJOR 1: a PAUSED run stays in this.runs but its lease was released
+    // at pause settle — the managed branch must not bypass the lease gate.
+    const owner = new WorkflowManager({ cwd, agent: fakeAgent() });
+    const { runId } = owner.startInBackground(oneAgentScript);
+    await new Promise((r) => setTimeout(r, 30));
+    assert.ok(owner.getRun(runId), "run is managed in-memory");
+    assert.equal(owner.getRun(runId)?.status, "completed");
+    // Terminal in-memory entries hold no lease; a foreign process holds it now.
+    const foreign = new WorkflowManager({ cwd });
+    const lease = foreign.getPersistence().acquireRunLease(runId);
+    assert.ok(lease, "foreign lease acquired (stands in for a foreign resume)");
+    try {
+      assert.equal(owner.deleteRun(runId), false, "managed-branch delete must respect the foreign lease");
+      assert.ok(owner.getPersistence().load(runId), "the run file survived the refused delete");
+    } finally {
+      if (lease) foreign.getPersistence().releaseRunLease(lease);
+    }
+    assert.equal(owner.deleteRun(runId), true, "delete proceeds once the lease is gone");
+  }),
+);
+
+test(
+  "deleteRun keeps its no-throw contract when the lease probe fails (audit2 #16 r1)",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd });
+    // A runId containing a path separator makes the lock-file probe throw
+    // ENOENT — deleteRun must refuse gracefully, not crash /workflows rm.
+    assert.equal(manager.deleteRun("a/b"), false);
   }),
 );
 
