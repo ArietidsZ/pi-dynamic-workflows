@@ -957,6 +957,12 @@ describe("fmtTokenSegment estimate marking (#209)", () => {
     );
   });
 
+  it("keeps legacy callers without estimated as metered output", () => {
+    const rendered = fmtTokenSegment({ fresh: 1200, cacheRead: 0 }, fmtFull);
+    assert.equal(rendered, "1,200 tok");
+    assert.doesNotMatch(rendered, /~/);
+  });
+
   it("tokenFigures and aggregateAgentUsage propagate the flag", () => {
     assert.deepEqual(tokenFigures({ input: 10, output: 5, total: 15, estimated: true }), {
       fresh: 15,

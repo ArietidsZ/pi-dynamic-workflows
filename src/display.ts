@@ -139,7 +139,7 @@ export function fmtTokenCount(fresh: number, cacheRead: number, fmt: (n: number)
  * conservative by design.
  */
 export function fmtTokenSegment(
-  figures: { fresh: number; cacheRead: number; estimated: boolean },
+  figures: { fresh: number; cacheRead: number; estimated?: boolean },
   fmt: (n: number) => string,
 ): string {
   if (figures.fresh + figures.cacheRead <= 0) return "";
