@@ -1716,10 +1716,17 @@ export class WorkflowManager extends EventEmitter {
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) return false;
     // The pre-lease read is stale the moment it returns: another process could
-    // have stopped/deleted the run in the window. Re-load under the lease and
-    // bail if the terminal status changed (attachCheckpointResponse pattern).
-    const fresh = this.persistence.load(runId);
-    if (!fresh || fresh.status !== persisted.status) {
+    // have stopped/deleted or otherwise updated the run in the window. Re-load
+    // under the lease and fail closed on ANY change: resuming from the stale
+    // snapshot could overwrite newer journal, agent, or checkpoint metadata.
+    let fresh: PersistedRunState | null;
+    try {
+      fresh = this.persistence.load(runId);
+    } catch (error) {
+      this.persistence.releaseRunLease(lease);
+      throw error;
+    }
+    if (!isDeepStrictEqual(fresh, persisted)) {
       this.persistence.releaseRunLease(lease);
       return false;
     }

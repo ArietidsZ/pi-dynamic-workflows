@@ -463,6 +463,56 @@ test(
 );
 
 test(
+  "resume keeps historical agent session metadata when the edited script fails to parse (#206)",
+  withTempCwd(async (cwd) => {
+    const agent = fakeAgent();
+    const runMock = test.mock.method(agent, "run");
+    const manager = new WorkflowManager({ cwd, agent });
+    manager.on("error", () => {});
+    const runId = "resume-parse-failure-lineage";
+    manager.getPersistence().save({
+      runId,
+      workflowName: "lineage_history",
+      script: oneAgentScript,
+      status: "paused",
+      phases: ["history"],
+      agents: [
+        {
+          id: 7,
+          callId: `${runId}:0`,
+          label: "historical-agent",
+          prompt: "already completed",
+          status: "done",
+          sessionId: "child-session-historical",
+          sessionFile: "/children/historical.jsonl",
+          startedAt: "2026-01-01T00:00:00.000Z",
+          endedAt: "2026-01-01T00:00:05.000Z",
+        },
+      ],
+      logs: ["history is retained"],
+      startedAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:05.000Z",
+    });
+
+    const malformedScript = `export const meta = { name: "broken", description: "broken" }
+const = ;`;
+    assert.equal(await manager.resume(runId, { script: malformedScript }), true);
+    for (let i = 0; i < 2000 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+
+    const persisted = manager.getPersistence().load(runId);
+    const historical = persisted?.agents.find((row) => row.callId === `${runId}:0`);
+    assert.equal(persisted?.status, "failed");
+    assert.equal(historical?.sessionId, "child-session-historical");
+    assert.equal(historical?.sessionFile, "/children/historical.jsonl");
+    assert.equal(historical?.startedAt, "2026-01-01T00:00:00.000Z");
+    assert.equal(historical?.endedAt, "2026-01-01T00:00:05.000Z");
+    assert.equal(runMock.mock.callCount(), 0, "the malformed script must fail before agent dispatch");
+  }),
+);
+
+test(
   "resume maps persisted ghost (queued/running) agents to interrupted-skipped (#206)",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
@@ -2573,6 +2623,87 @@ test(
     // Verify persistence was updated to completed
     const persisted = manager.listRuns().find((r) => r.runId === runId);
     assert.equal(persisted?.status, "completed", "persistence should reflect completed status");
+  }),
+);
+
+test(
+  "cold-start resume fails closed when the same-status record changes after lease acquisition",
+  withTempCwd(async (cwd) => {
+    const agent = fakeAgent();
+    const runMock = test.mock.method(agent, "run");
+    const manager = new WorkflowManager({ cwd, agent });
+    const persistence = manager.getPersistence();
+    const runId = "resume-stale-same-status";
+    persistence.save({
+      runId,
+      workflowName: "stale_snapshot",
+      script: oneAgentScript,
+      status: "paused",
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    const originalLoad = persistence.load.bind(persistence);
+    let loadCalls = 0;
+    test.mock.method(persistence, "load", (id: string) => {
+      loadCalls++;
+      if (loadCalls === 2) {
+        const current = originalLoad(id);
+        assert.ok(current, "the pre-lease record exists");
+        const concurrentUpdate = { ...current, logs: ["written by the other owner"] };
+        persistence.save(concurrentUpdate);
+        return concurrentUpdate;
+      }
+      return originalLoad(id);
+    });
+
+    assert.equal(await manager.resume(runId), false);
+    assert.equal(loadCalls, 2, "resume compares the pre-lease and leased reads");
+    assert.equal(runMock.mock.callCount(), 0, "the stale snapshot must not launch an agent");
+    assert.deepEqual(persistence.load(runId)?.logs, ["written by the other owner"]);
+
+    const replacementLease = persistence.acquireRunLease(runId);
+    assert.ok(replacementLease, "the rejected resume releases its lease");
+    persistence.releaseRunLease(replacementLease);
+  }),
+);
+
+test(
+  "cold-start resume releases its lease when the post-lease load throws",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    const persistence = manager.getPersistence();
+    const runId = "resume-post-lease-load-throws";
+    persistence.save({
+      runId,
+      workflowName: "load_failure",
+      script: oneAgentScript,
+      status: "paused",
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    const originalLoad = persistence.load.bind(persistence);
+    let loadCalls = 0;
+    test.mock.method(persistence, "load", (id: string) => {
+      loadCalls++;
+      if (loadCalls === 2) throw new Error("post-lease load failed");
+      return originalLoad(id);
+    });
+
+    await assert.rejects(manager.resume(runId), /post-lease load failed/);
+    assert.equal(loadCalls, 2);
+    assert.equal(manager.getRun(runId), undefined, "a failed re-read does not register a phantom run");
+
+    const replacementLease = persistence.acquireRunLease(runId);
+    assert.ok(replacementLease, "the throwing re-read releases its lease");
+    persistence.releaseRunLease(replacementLease);
   }),
 );
 
