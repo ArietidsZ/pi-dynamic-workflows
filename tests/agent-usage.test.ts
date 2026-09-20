@@ -101,6 +101,19 @@ test("agent call usage tracker aborts estimates but commits cost-only terminal u
   assert.deepEqual(updates.at(-1)?.tokenUsage, { ...createEmptyAgentUsage(), cost: 0.5 });
 });
 
+test("closed or superseded attempts never evaluate a fallback estimate", () => {
+  const tracker = createAgentCallUsageTracker(() => {});
+  const closed = tracker.startAttempt();
+  closed.commitTerminalUsage();
+  const superseded = tracker.startAttempt();
+  tracker.startAttempt();
+  const unexpected = () => {
+    throw new Error("a closed attempt evaluated its fallback");
+  };
+  assert.deepEqual(closed.commitWithFallback(unexpected), { tokens: 0 });
+  assert.deepEqual(superseded.commitWithFallback(unexpected), { tokens: 0 });
+});
+
 test("agent usage equality compares every accounting field", () => {
   assert.equal(agentUsageEquals(FIRST_USAGE, { ...FIRST_USAGE }), true);
   assert.equal(agentUsageEquals(FIRST_USAGE, { ...FIRST_USAGE, cacheRead: 3 }), false);

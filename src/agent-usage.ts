@@ -86,6 +86,7 @@ export function createAgentCallUsageTracker(onUpdate: (update: AgentCallUsageUpd
           }
         },
         commitWithFallback(fallbackTotal: () => number) {
+          if (!isOpen()) return { tokens: 0 };
           if (terminalUsage && (terminalUsage.total > 0 || terminalUsage.cost > 0)) {
             return commitUsage(terminalUsage);
           }
