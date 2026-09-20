@@ -2348,6 +2348,7 @@ export class WorkflowManager extends EventEmitter {
     // process may then have resumed and rewritten the disk record. Persisting a
     // whole stale ManagedRun from here would clobber that newer status/journal.
     if (managed?.lease) {
+      if ((managed.autoResumeAttempts ?? 0) === attempts) return;
       managed.autoResumeAttempts = attempts;
       this.persistRun(managed);
       return;
@@ -2357,7 +2358,9 @@ export class WorkflowManager extends EventEmitter {
     try {
       const current = this.persistence.load(runId);
       if (!current) return;
-      this.persistence.save({ ...current, autoResumeAttempts: attempts });
+      if ((current.autoResumeAttempts ?? 0) !== attempts) {
+        this.persistence.save({ ...current, autoResumeAttempts: attempts });
+      }
       // A local entry without a lease is only a cache. Once the lease-guarded
       // merge succeeds, bring that cache up to date without making it an
       // authority for any other persisted field.
