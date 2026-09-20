@@ -123,9 +123,11 @@ export function parseResetHintMs(hint?: string, nowMs: number = Date.now()): num
   }
   const absoluteClock = /(?:resets?|resetting|try again)\s+at\s+(\d{1,2}):(\d{2})\s*([AP]M)\b/i.exec(hint);
   if (absoluteClock) {
-    let hour = Number.parseInt(absoluteClock[1], 10) % 12;
-    if (absoluteClock[3].toUpperCase() === "PM") hour += 12;
+    const clockHour = Number.parseInt(absoluteClock[1], 10);
     const minute = Number.parseInt(absoluteClock[2], 10);
+    if (clockHour < 1 || clockHour > 12 || minute > 59) return undefined;
+    let hour = clockHour % 12;
+    if (absoluteClock[3].toUpperCase() === "PM") hour += 12;
     const target = new Date(nowMs);
     target.setHours(hour, minute, 0, 0);
     // An explicit date elsewhere in the hint ("… at 3:20 PM on 2026-09-20")

@@ -147,6 +147,12 @@ test("parseResetHintMs: day and week units (audit2 #14)", () => {
   assert.equal(parseResetHintMs("resets in 3 days"), 3 * 86_400_000);
 });
 
+test("parseResetHintMs: invalid clock hints do not normalize into a different reset time", () => {
+  for (const hint of ["Try again at 13:20 PM", "Try again at 0:30 AM", "Reset at 3:99 PM; retry in 600 seconds"]) {
+    assert.equal(parseResetHintMs(hint), undefined);
+  }
+});
+
 test("parseResetHintMs: absolute ISO reset timestamp (audit2 #10)", () => {
   const now = Date.parse("2026-09-17T13:00:00+08:00");
   // The verbatim Ark/Codex quota message shape.
