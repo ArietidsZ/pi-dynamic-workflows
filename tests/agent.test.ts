@@ -2039,6 +2039,26 @@ test("a failed per-directory resource loader is evicted before the next attempt 
   }
 });
 
+test("the shared resource-loader memo is bounded while loaders are still pending (#109)", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-loader-pending-root-"));
+  const agentDir = mkdtempSync(join(root, "agent-"));
+  try {
+    const agent = new WorkflowAgent({ cwd: root });
+    type Priv = { getSharedResourceLoader(agentDir: string, cwd: string): Promise<unknown> };
+    const privateAgent = agent as unknown as Priv;
+    const promises = Array.from({ length: 12 }, (_, i) => {
+      const cwd = mkdtempSync(join(root, `cwd-${i}-`));
+      return privateAgent.getSharedResourceLoader(agentDir, cwd);
+    });
+    const loaders = (agent as unknown as { resourceLoaders: Map<string, unknown> }).resourceLoaders;
+
+    assert.ok(loaders.size <= 8, `the memo must be bounded before any loader resolves (got ${loaders.size})`);
+    await Promise.all(promises);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════════════
 // finalAssistantText — the unstructured result must come AFTER the last tool
 // result, so stale progress text can't be reported as a completed answer (#111)
@@ -2889,5 +2909,33 @@ test("fallback registry resolves to a real ModelRegistry on stock pi and is cach
     });
   } finally {
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent.run bounds the loader memo: one-off cwds are LRU-evicted (audit2 #41)", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-loader-lru-home-"));
+  const root = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-loader-lru-root-"));
+  const core = createFauxCore({
+    provider: "fauxtest-loader-lru",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const registry = await fauxRegistry(home, "fauxtest-loader-lru", core);
+      core.setResponses(
+        Array.from({ length: 12 }, (_, i) => fauxAssistantMessage(`answer ${i}`, { stopReason: "stop" })),
+      );
+      const agent = new WorkflowAgent({ cwd: root, modelRegistry: registry });
+      // Worktree-style fan-out: every call has a unique explicit cwd.
+      for (let i = 0; i < 12; i++) {
+        const dir = mkdtempSync(join(root, `wt-${i}-`));
+        await agent.run(`call ${i}`, { cwd: dir, model: "fauxtest-loader-lru/faux-model" });
+      }
+      const loaders = (agent as unknown as { resourceLoaders: Map<string, unknown> }).resourceLoaders;
+      assert.ok(loaders.size <= 8, `one-off worktree loaders are LRU-evicted (got ${loaders.size}, cap is 8)`);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
   }
 });

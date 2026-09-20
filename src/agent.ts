@@ -787,7 +787,34 @@ export class WorkflowAgent {
   private getSharedResourceLoader(agentDir: string, cwd = this.cwd): Promise<DefaultResourceLoader> {
     const key = JSON.stringify([agentDir, cwd]);
     const existing = this.resourceLoaders.get(key);
-    if (existing) return existing;
+    if (existing) {
+      // LRU-by-touch: keep hot entries (base cwd) resident ahead of one-off
+      // worktree loaders when pruneSharedResourceLoaders evicts.
+      this.resourceLoaders.delete(key);
+      this.resourceLoaders.set(key, existing);
+      return existing;
+    }
+    return this.buildSharedResourceLoader(agentDir, cwd, key);
+  }
+
+  /**
+   * Bound the loader memo (audit2 #41): worktree isolation gives every agent
+   * a unique cwd, so N worktree agents would otherwise retain N
+   * fully-reloaded loaders until run end. LRU-by-touch (hits re-insert in
+   * getSharedResourceLoader) keeps the hot entries — the base cwd is touched
+   * by every default call — while one-off worktree loaders are evicted first.
+   */
+  private static readonly MAX_SHARED_RESOURCE_LOADERS = 8;
+
+  private pruneSharedResourceLoaders(): void {
+    while (this.resourceLoaders.size > WorkflowAgent.MAX_SHARED_RESOURCE_LOADERS) {
+      const oldest = this.resourceLoaders.keys().next().value;
+      if (oldest === undefined) return;
+      this.resourceLoaders.delete(oldest);
+    }
+  }
+
+  private buildSharedResourceLoader(agentDir: string, cwd: string, key: string): Promise<DefaultResourceLoader> {
     const pending = (async () => {
       const loader = new DefaultResourceLoader({
         cwd,
@@ -801,10 +828,13 @@ export class WorkflowAgent {
       // Don't let a transient build failure (e.g. EMFILE during reload's disk
       // I/O) poison every subagent AND every retry of this run — clear the memo
       // so the next caller rebuilds instead of replaying the same rejection.
-      this.resourceLoaders.delete(key);
+      // Identity-checked: an older failed build must not delete a NEWER
+      // healthy pending entry for the same key (the map is LRU-evictable).
+      if (this.resourceLoaders.get(key) === pending) this.resourceLoaders.delete(key);
       throw err;
     });
     this.resourceLoaders.set(key, pending);
+    this.pruneSharedResourceLoaders();
     return pending;
   }
 
