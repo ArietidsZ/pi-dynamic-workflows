@@ -91,7 +91,8 @@ export function createAgentCallUsageTracker(onUpdate: (update: AgentCallUsageUpd
             return commitUsage(terminalUsage);
           }
           // Lazy: the fallback estimate JSON.stringifies the full result+prompt
-          // — only pay that when the provider gave no terminal usage (audit2 #9).
+          // — only pay that when no nonzero terminal tokens/cost were reported.
+          // A missing provider usage report can surface as all-zero SDK stats.
           return commitUsage({ ...createEmptyAgentUsage(), total: Math.max(0, fallbackTotal()) });
         },
         commitTerminalUsage() {

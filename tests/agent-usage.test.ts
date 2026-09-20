@@ -114,6 +114,18 @@ test("closed or superseded attempts never evaluate a fallback estimate", () => {
   assert.deepEqual(superseded.commitWithFallback(unexpected), { tokens: 0 });
 });
 
+test("an open attempt with all-zero SDK terminal stats still evaluates its fallback", () => {
+  const attempt = createAgentCallUsageTracker(() => {}).startAttempt();
+  attempt.reportTerminal(createEmptyAgentUsage());
+  let calls = 0;
+  const result = attempt.commitWithFallback(() => {
+    calls++;
+    return 7;
+  });
+  assert.equal(calls, 1);
+  assert.equal(result.tokens, 7);
+});
+
 test("agent usage equality compares every accounting field", () => {
   assert.equal(agentUsageEquals(FIRST_USAGE, { ...FIRST_USAGE }), true);
   assert.equal(agentUsageEquals(FIRST_USAGE, { ...FIRST_USAGE, cacheRead: 3 }), false);
