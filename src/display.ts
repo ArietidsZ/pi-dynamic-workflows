@@ -159,9 +159,8 @@ export function fmtCost(cost: number): string {
 }
 
 /** Full (non-compact) number style for print/text surfaces: locale-grouped digits. */
-// Cached formatter (audit2 #24): n.toLocaleString() allocates a fresh
-// Intl.NumberFormat per call and dominated render cost (~9.9µs/call). No
-// locale argument = the runtime default, matching toLocaleString() semantics.
+// Reuse one formatter across render calls. No locale argument means the
+// runtime default, matching toLocaleString() semantics.
 const FULL_NUMBER_FORMAT = new Intl.NumberFormat();
 export const fmtFull = (n: number): string => FULL_NUMBER_FORMAT.format(n);
 

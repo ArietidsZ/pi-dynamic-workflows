@@ -248,8 +248,8 @@ export class NavigatorModel {
   }
 
   // Rehydrated persisted snapshots, keyed by the parsed record OBJECT
-  // (audit2 #25): persistedToSnapshot re-stringifies every agent's full
-  // result — without this, browsing a completed run paid 4-17ms per frame.
+  // (audit2 #25): avoid re-stringifying every agent's full result when
+  // browsing the same unchanged persisted record in subsequent frames.
   // A fresh disk parse yields a new object, so invalidation is automatic.
   private rehydratedSnapshots = new WeakMap<PersistedRunState, { snapshot: WorkflowSnapshot; status: string }>();
 

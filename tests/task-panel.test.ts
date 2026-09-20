@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, renameSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, beforeEach, describe, it } from "node:test";
@@ -3668,4 +3668,69 @@ it("sessionFileContainsEntry finds entries before AND after the incremental scan
   // off-by-one cost regression (r1 M1) at the boolean level; the tail-window
   // sizing was verified by read-count probe in review.
   assert.equal(sessionFileContainsEntry(file, entry2), true, "repeat check of the last entry still finds it");
+});
+
+it("sessionFileContainsEntry finds a needle that crosses the 64 KiB scan boundary", async () => {
+  const { sessionFileContainsEntry } = await import("../src/task-panel.js");
+  const dir = mkdtempSync(join(tmpdir(), "pdw-scan-boundary-"));
+  const file = join(dir, "session.jsonl");
+  const entry = { id: "boundary", type: "custom_message", customType: "workflow-result" };
+  const header = `${JSON.stringify({ type: "session", cwd: dir })}\n`;
+  const boundary = 64 * 1024;
+  const prefixLength = boundary - 2 - Buffer.byteLength(header) - 1;
+  assert.ok(prefixLength > 0);
+  writeFileSync(file, `${header}${"x".repeat(prefixLength)}\n${JSON.stringify(entry)}\n`);
+
+  assert.equal(sessionFileContainsEntry(file, entry), true, "the record starts just before the 64 KiB boundary");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+it("sessionFileContainsEntry rescans from the head after a cached file offset becomes stale on truncate", async () => {
+  const { sessionFileContainsEntry } = await import("../src/task-panel.js");
+  const dir = mkdtempSync(join(tmpdir(), "pdw-scan-truncate-"));
+  const file = join(dir, "session.jsonl");
+  const entry = { id: "kept-after-truncate", type: "custom_message", customType: "workflow-result" };
+  const header = `${JSON.stringify({ type: "session", cwd: dir })}\n`;
+  const retained = `${header}${JSON.stringify(entry)}\n`;
+  writeFileSync(file, `${retained}${"z".repeat(70 * 1024)}\n`);
+
+  assert.equal(sessionFileContainsEntry(file, { id: "absent" }), false, "cache the original larger offset");
+  truncateSync(file, Buffer.byteLength(retained));
+  assert.equal(sessionFileContainsEntry(file, entry), true, "the retained record remains discoverable after shrink");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+it("sessionFileContainsEntry invalidates a same-path rename replacement", async () => {
+  const { sessionFileContainsEntry } = await import("../src/task-panel.js");
+  const dir = mkdtempSync(join(tmpdir(), "pdw-scan-rename-"));
+  const file = join(dir, "session.jsonl");
+  const replacement = join(dir, "session.replacement.jsonl");
+  const header = `${JSON.stringify({ type: "session", cwd: dir })}\n`;
+  const oldEntry = { id: "old-record", type: "custom_message", customType: "workflow-result" };
+  const newEntry = { id: "new-record", type: "custom_message", customType: "workflow-result" };
+  writeFileSync(file, `${header}${JSON.stringify(oldEntry)}\n`);
+  assert.equal(sessionFileContainsEntry(file, oldEntry), true);
+
+  writeFileSync(replacement, `${header}${JSON.stringify(newEntry)}\n`);
+  renameSync(replacement, file);
+  assert.equal(sessionFileContainsEntry(file, newEntry), true, "the replacement file's record is found");
+  assert.equal(sessionFileContainsEntry(file, oldEntry), false, "the old file's record is not retained by the cache");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+it("sessionFileContainsEntry requires the complete record and rejects other substrings", async () => {
+  const { sessionFileContainsEntry } = await import("../src/task-panel.js");
+  const dir = mkdtempSync(join(tmpdir(), "pdw-scan-record-"));
+  const file = join(dir, "session.jsonl");
+  const entry = { id: "duplicate-record", type: "custom_message", customType: "workflow-result" };
+  const header = `${JSON.stringify({ type: "session", cwd: dir })}\n`;
+  writeFileSync(file, `${header}${JSON.stringify(entry)}\n${JSON.stringify(entry)}\n`);
+
+  assert.equal(sessionFileContainsEntry(file, entry), true, "a duplicated complete record matches");
+  assert.equal(
+    sessionFileContainsEntry(file, { id: "duplicate", type: "custom_message", customType: "workflow-result" }),
+    false,
+    "a similar substring is not treated as the full record",
+  );
+  rmSync(dir, { recursive: true, force: true });
 });
