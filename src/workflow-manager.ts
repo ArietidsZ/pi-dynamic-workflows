@@ -1641,7 +1641,7 @@ export class WorkflowManager extends EventEmitter {
       // the LIVE managed record is durable: that persist carries it to disk.
       // Attaching here keeps the documented host flow (attach, then resume on
       // the "paused" event) usable while siblings still settle.
-      if (active && this.isCurrent(active)) {
+      if (active?.lease && this.isCurrent(active)) {
         if (!active.checkpoint) throw new Error("run has no durable checkpoint");
         const next = buildResuming(active.checkpoint);
         if (next === undefined) return;
@@ -1662,19 +1662,6 @@ export class WorkflowManager extends EventEmitter {
           active.checkpoint = previousCheckpoint;
           throw error;
         }
-        // Belt-and-suspenders: if the final persist already ran in the narrow
-        // window between drain end and execution settlement, persist again once
-        // settled so the response lands on disk either way.
-        // Runs on settle EITHER WAY — a suspended execution rejects with
-        // WorkflowCheckpointSuspensionError, and the narrow window this covers
-        // (final persist already ran, execution not yet settled) is exactly the
-        // rejection case. The caller's own promise still carries the error.
-        const persistIfStillOurs = () => {
-          if (this.runs.get(runId) === active && this.isCurrent(active) && active.checkpoint?.status === "resuming") {
-            this.persistRun(active);
-          }
-        };
-        void settlingExecution.then(persistIfStillOurs, persistIfStillOurs);
         return;
       }
       if (!(await waitForPausedExecutionSettlement(settlingExecution))) {

@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { isDeepStrictEqual } from "node:util";
 import type { AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
@@ -4747,12 +4748,36 @@ test(
       },
     });
     manager.on("error", () => {});
+    const persistence = manager.getPersistence();
+    const save = persistence.save.bind(persistence);
+    let runId = "";
+    let executionSettled = false;
+    const responsePersists: Array<{ hasLease: boolean; afterExecutionSettled: boolean }> = [];
+    persistence.save = (state) => {
+      if (
+        state.runId === runId &&
+        state.checkpoint?.status === "resuming" &&
+        isDeepStrictEqual(state.checkpoint.response, { approved: true })
+      ) {
+        responsePersists.push({
+          hasLease: manager.getRun(runId)?.lease !== undefined,
+          afterExecutionSettled: executionSettled,
+        });
+      }
+      save(state);
+    };
     const script = `export const meta = { name: 'cp_sibling', description: 'checkpoint with sibling' }
 const sibling = agent('slow-sibling', { label: 'slow' })
 await checkpoint({ kind: 'hold', checkpointId: 'hold-1', payload: {} })
 return await sibling`;
-    const { runId, promise } = manager.startInBackground(script);
+    const started = manager.startInBackground(script);
+    runId = started.runId;
+    const { promise } = started;
     promise.catch(() => {});
+    void promise.then(
+      () => (executionSettled = true),
+      () => (executionSettled = true),
+    );
     await slowRunning;
     // Wait for the checkpoint suspension to pause the run while the sibling is mid-flight.
     for (let i = 0; i < 2000; i++) {
@@ -4808,6 +4833,94 @@ return await sibling`;
       persisted?.journal?.some((entry) => entry.result === "slow-done"),
       "the in-flight sibling completed and journaled — not aborted by the suspension",
     );
+    assert.ok(responsePersists.length >= 2, "the attach and final checkpoint pause persist the attached response");
+    assert.ok(
+      responsePersists.every((write) => write.hasLease),
+      "every live response persist owns the run lease",
+    );
+    assert.ok(
+      responsePersists.every((write) => !write.afterExecutionSettled),
+      "execution settlement does not schedule a later response persist after its lease is released",
+    );
+  }),
+);
+
+test(
+  "an unleased active checkpoint drain falls back to the leased persistence attach path",
+  withTempCwd(async (cwd) => {
+    let releaseSlow: () => void = () => {};
+    const slowCanFinish = new Promise<void>((resolve) => {
+      releaseSlow = resolve;
+    });
+    let slowStarted: () => void = () => {};
+    const slowRunning = new Promise<void>((resolve) => {
+      slowStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          if (prompt === "slow-sibling") {
+            slowStarted();
+            await slowCanFinish;
+            return "slow-done";
+          }
+          return "ok";
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'unleased_attach', description: 'unleased checkpoint attach' }
+void agent('slow-sibling')
+await checkpoint({ kind: 'hold', checkpointId: 'hold-1', payload: {} })`;
+    const { runId, promise } = manager.startInBackground(script);
+    promise.catch(() => {});
+    await slowRunning;
+    for (let i = 0; i < 2000; i++) {
+      const logs = manager.getRun(runId)?.snapshot.logs ?? [];
+      if (logs.some((line) => line.includes("outstanding agent()"))) break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+
+    const active = manager.getRun(runId);
+    assert.ok(active?.lease, "the draining run starts with its execution lease");
+    manager.getPersistence().releaseRunLease(active.lease);
+    active.lease = undefined;
+
+    const persistence = manager.getPersistence();
+    const acquire = persistence.acquireRunLease.bind(persistence);
+    const save = persistence.save.bind(persistence);
+    let attachmentLeaseAcquisitions = 0;
+    let responsePersistedBeforeAttachmentLease = false;
+    persistence.acquireRunLease = (id) => {
+      attachmentLeaseAcquisitions++;
+      return acquire(id);
+    };
+    persistence.save = (state) => {
+      if (
+        state.runId === runId &&
+        state.checkpoint?.status === "resuming" &&
+        isDeepStrictEqual(state.checkpoint.response, { approved: true }) &&
+        attachmentLeaseAcquisitions === 0
+      ) {
+        responsePersistedBeforeAttachmentLease = true;
+      }
+      save(state);
+    };
+
+    const attaching = manager.attachCheckpointResponse(runId, "hold-1", { approved: true });
+    await Promise.resolve();
+    releaseSlow();
+    await promise.catch(() => {});
+    await attaching;
+
+    assert.ok(attachmentLeaseAcquisitions >= 1, "the unleased live record is not persisted through the drain path");
+    assert.equal(responsePersistedBeforeAttachmentLease, false, "no unleased live full-record response write occurs");
+    assert.deepEqual(persistence.load(runId)?.checkpoint, {
+      ...persistence.load(runId)?.checkpoint,
+      status: "resuming",
+      response: { approved: true },
+    });
   }),
 );
 
