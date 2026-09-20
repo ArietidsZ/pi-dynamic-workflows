@@ -517,14 +517,23 @@ export function createRunPersistence(
   const deleteRunFiles = (runId: string): boolean => {
     let deleted = false;
     for (const path of candidateRunPaths(runId)) {
-      const dir = path === primaryRunPath(runId) ? runsDir : legacyRunsDir;
-      // Best-effort cleanup of the sidecar files alongside the primary.
-      for (const sidecar of [`${path}.bak`, `${path}.tmp`, lockPath(dir, runId)]) {
+      // Delete every readable recovery candidate before releasing either lock:
+      // a foreign resume that acquires between those operations must never find
+      // a surviving primary, backup, or legacy record to resurrect.
+      for (const sidecar of [`${path}.bak`, `${path}.tmp`]) {
         unlinkIfExistsSafe(fs, sidecar);
         fileStateCache.delete(sidecar);
       }
       if (unlinkIfExistsSafe(fs, path)) deleted = true;
       fileStateCache.delete(path);
+    }
+    // Locks come LAST, after both primary and legacy data/recovery candidates
+    // have been removed. deleteRun() deliberately holds its acquired lease
+    // across this sequence, so opening this final release window sooner would
+    // let another process resume a record that is about to be deleted.
+    for (const lock of [primaryLockPath(runId), legacyLockPath(runId)]) {
+      unlinkIfExistsSafe(fs, lock);
+      fileStateCache.delete(lock);
     }
     return deleted;
   };
