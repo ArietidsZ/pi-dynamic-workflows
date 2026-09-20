@@ -5137,6 +5137,83 @@ return 'script returned'`;
 );
 
 test(
+  "abandoned drain does not start a queued agent after callbacks close",
+  withTempCwd(async (cwd) => {
+    let releaseHung!: () => void;
+    const hungGate = new Promise<void>((resolve) => {
+      releaseHung = resolve;
+    });
+    let markHungStarted!: () => void;
+    const hungStarted = new Promise<void>((resolve) => {
+      markHungStarted = resolve;
+    });
+    let queuedRunnerCalls = 0;
+    const manager = new WorkflowManager({
+      cwd,
+      concurrency: 1,
+      agent: {
+        async run(prompt: string) {
+          if (prompt === "hung") {
+            markHungStarted();
+            await hungGate; // deliberately ignores the manager's abort signal
+            return "hung-done";
+          }
+          queuedRunnerCalls++;
+          return "queued-done";
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'queued_after_abandon', description: 'queued drain abandonment' }
+void agent('hung', { label: 'hung' })
+void agent('queued', { label: 'queued' })
+return 'script-done'`;
+    const { runId, promise } = manager.startInBackground(script, undefined, {
+      concurrency: 1,
+      drainAbortGraceMs: 5,
+    });
+    await hungStarted;
+
+    for (let i = 0; i < 2_000; i++) {
+      const logs = manager.getRun(runId)?.snapshot.logs ?? [];
+      if (logs.some((line) => line.includes("outstanding agent()"))) break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.ok(
+      manager.getRun(runId)?.snapshot.logs.some((line) => line.includes("outstanding agent()")),
+      "the second call must be queued while the hung first call occupies the only limiter slot",
+    );
+
+    assert.equal(manager.pause(runId), true);
+    await promise;
+
+    const snapshotBeforeRelease = structuredClone(manager.getRun(runId)?.snapshot);
+    const persistedBeforeRelease = manager.getPersistence().load(runId);
+    let lateAgentStarts = 0;
+    manager.on("agentStart", () => lateAgentStarts++);
+
+    // Once the abandoned runner finally releases the sole limiter slot, the
+    // queued call must be rejected before worktree setup or onAgentStart.
+    releaseHung();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(queuedRunnerCalls, 0, "a queued agent must never reach the runner after abandonment");
+    assert.equal(lateAgentStarts, 0, "a queued agent must not announce agentStart after callbacks close");
+    assert.deepEqual(
+      manager.getRun(runId)?.snapshot,
+      snapshotBeforeRelease,
+      "releasing the abandoned runner must not mutate the terminal managed snapshot",
+    );
+    assert.deepEqual(
+      manager.getPersistence().load(runId),
+      persistedBeforeRelease,
+      "releasing the abandoned runner must not change the terminal persisted record",
+    );
+  }),
+);
+
+test(
   "pause() during the terminal drain keeps the run paused (not overwritten to completed) (audit2 r1 m7)",
   withTempCwd(async (cwd) => {
     let releaseSibling!: () => void;

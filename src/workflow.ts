@@ -941,6 +941,12 @@ export async function runWorkflow<T = unknown>(
     }
 
     return limiter(async () => {
+      // A queued call can obtain its slot after the top-level abort drain has
+      // already abandoned it. Do not create a worktree or announce a new agent
+      // for an execution whose callbacks have been closed.
+      if (shared.agentCallbacksClosed) {
+        throw new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true });
+      }
       const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
       const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
       const maxAttempts = retryAttempts + 1;
@@ -973,6 +979,11 @@ export async function runWorkflow<T = unknown>(
       });
 
       try {
+        // Worktree creation above is asynchronous; abandonment may have
+        // occurred while it was pending, before this first observer event.
+        if (shared.agentCallbacksClosed) {
+          throw new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true });
+        }
         options.onAgentStart?.({ id: deltaKey, label, phase: assignedPhase, prompt, model: displayModel });
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
           const attemptUsage = usageTracker.startAttempt();
