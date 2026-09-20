@@ -631,3 +631,51 @@ test("save() preserves the PREVIOUS version as .bak on overwrite (audit2 #36)", 
   const recovered = storage.load("demo");
   assert.equal(recovered?.script, "SCRIPT_V1", "an accidental overwrite leaves the old script recoverable");
 });
+
+test(
+  "save keeps a valid old .bak when the old primary is corrupt",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    const first = storage.save({ name: "corrupt-primary", description: "v1", script: "SCRIPT_V1" });
+    writeFileSync(first.path, "{ corrupt primary", "utf8");
+
+    storage.save({ name: "corrupt-primary", description: "v2", script: "SCRIPT_V2" });
+    assert.equal(JSON.parse(readFileSync(first.path, "utf8")).script, "SCRIPT_V2");
+    assert.equal(JSON.parse(readFileSync(`${first.path}.bak`, "utf8")).script, "SCRIPT_V1");
+  }),
+);
+
+test(
+  "save replaces a corrupt primary and corrupt .bak with a valid new .bak",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    const first = storage.save({ name: "corrupt-both", description: "v1", script: "SCRIPT_V1" });
+    writeFileSync(first.path, "{ corrupt primary", "utf8");
+    writeFileSync(`${first.path}.bak`, "{ corrupt backup", "utf8");
+
+    storage.save({ name: "corrupt-both", description: "v2", script: "SCRIPT_V2" });
+    assert.equal(JSON.parse(readFileSync(first.path, "utf8")).script, "SCRIPT_V2");
+    assert.equal(JSON.parse(readFileSync(`${first.path}.bak`, "utf8")).script, "SCRIPT_V2");
+  }),
+);
+
+test(
+  "save succeeds with a backup-write failure and leaves the new primary readable",
+  withIsolatedHome(async (cwd) => {
+    let failBackupWrite = true;
+    const storage = createWorkflowStorage(cwd, {
+      writeFileSync: ((path, data, options) => {
+        if (failBackupWrite && String(path).endsWith("backup-write-failure.json.bak")) {
+          failBackupWrite = false;
+          throw new Error("injected backup write failure");
+        }
+        return writeFileSync(path, data, options);
+      }) as typeof writeFileSync,
+    });
+
+    assert.doesNotThrow(() => storage.save({ name: "backup-write-failure", description: "new", script: "SCRIPT_NEW" }));
+    assert.equal(failBackupWrite, false, "the backup write failure must be exercised");
+    const path = join(workflowProjectPaths(cwd).savedDir, "backup-write-failure.json");
+    assert.equal(JSON.parse(readFileSync(path, "utf8")).script, "SCRIPT_NEW");
+  }),
+);
