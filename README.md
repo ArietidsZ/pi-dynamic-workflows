@@ -79,7 +79,7 @@ return await agent(
 - **Per-agent model routing** — use `small`, `medium`, or `big` tiers, or choose an exact provider/model and thinking level.
 - **Journaled resume** — replay completed agents after interruption without rerunning them or spending their tokens again. The orchestrator can also resume with an **edited script** (`resumeFromRunId`): unchanged `agent()` calls replay from cache and only edited/new ones re-run — so a single bad prompt no longer means paying to re-run the whole workflow.
 - **Git worktree isolation** — parallel agents edit on separate branches with `isolation: "worktree"`. Kept by default for merge; pass `keepWorktree: false` to delete (tests).
-- **Measured usage** — report real tokens and cost from each subagent session; add run, phase, or agent budgets only when you want them.
+- **Measured usage** — report real tokens and cost from each subagent session; add run, phase, or agent budgets only when you want them. When a provider session ends without reporting usage, the affected totals are heuristic character estimates and UI token surfaces render them with a `~` prefix (e.g. `~640 tok`) — never silently as metered figures. (Script-facing `budget.spent()/remaining()` are raw numbers and cannot carry the marker.)
 - **Visible background runs** — track phases, agents, models, fresh/cache tokens, cost, and live tok/s from the progress panel or `/workflows` navigator.
 - **Quality patterns** — compose `verify()`, `judgePanel()`, `loopUntilDry()`, and `completenessCheck()` instead of rebuilding review loops.
 - **Reusable workflows** — save any run as a command and call saved workflows from other workflows.
@@ -91,7 +91,7 @@ The installed extension generates this compact index from its executable capabil
 <!-- BEGIN GENERATED SUPPORTED WORKFLOW CAPABILITIES -->
 | Name | Classification | Signature | Options and defaults |
 | --- | --- | --- | --- |
-| agent | runtime-global | `agent(prompt, options?) => Promise<string \| structured value \| null>` | `label`: string (optional; default: derived from phase and call count)<br>`phase`: string (optional; default: current phase)<br>`schema`: plain JSON Schema (optional)<br>`model`: string (optional)<br>`thinking`: "off" \| "minimal" \| "low" \| "medium" \| "high" \| "xhigh" \| "max" (optional)<br>`tier`: string (optional)<br>`isolation`: "worktree" \| false (optional)<br>`keepWorktree`: boolean (optional; default: true)<br>`cwd`: string (optional)<br>`thread`: string (optional)<br>`agentType`: string (optional)<br>`timeoutMs`: number \| null (optional; default: run timeout; null disables)<br>`retries`: number (optional; default: run retry count) |
+| agent | runtime-global | `agent(prompt, options?) => Promise<string \| structured value \| null>` | `label`: string (optional; default: derived from phase and call count)<br>`phase`: string (optional; default: current phase)<br>`schema`: plain JSON Schema (optional)<br>`model`: string (optional)<br>`thinking`: "off" \| "minimal" \| "low" \| "medium" \| "high" \| "xhigh" \| "max" (optional)<br>`tier`: string (optional)<br>`isolation`: "worktree" \| false (optional)<br>`keepWorktree`: boolean (optional; default: true)<br>`cwd`: string (optional)<br>`thread`: string (optional)<br>`agentType`: string (optional)<br>`timeoutMs`: number \| null (optional; default: run timeout, finite ms in [1, 2^31-1]; null disables)<br>`retries`: number (optional; default: run retry count) |
 | parallel | runtime-global | `parallel(thunks) => Promise<Array<unknown \| null>>` | — |
 | pipeline | runtime-global | `pipeline(items, ...stages) => Promise<Array<unknown \| null>>` | — |
 | workflow | runtime-global | `workflow(savedName, childArgs?) => Promise<unknown>` | — |
@@ -185,7 +185,7 @@ Agent details use a compact summary by default: completed agents show their fina
 | `loopUntilDry` / `completenessCheck` | Repeat discovery until no new findings remain |
 | `workflow(name, args)` | Run a saved workflow inline |
 | `checkpoint(prompt, opts)` | Add a journaled human-approval gate |
-| `budget` | Inspect real tokens spent and remaining |
+| `budget` | Inspect tokens spent and remaining (raw numbers; UI surfaces mark heuristic estimates with `~`) |
 
 | Agent option | Description |
 | --- | --- |
@@ -234,7 +234,7 @@ Model tiers live at `~/.pi/workflows/model-tiers.json`. A project file at `~/.pi
 
 Use `/workflows-models` to edit them interactively; it is cwd-aware and can save to the project or global file. A project save writes the resolved map, including keys currently inherited from global. Without a config, the extension ranks authenticated models by capability hints and assigns distinct models when possible.
 
-Omitted `tokenBudget` and `agentTimeoutMs` values use configured `defaultTokenBudget` and `defaultAgentTimeoutMs` settings; without them, runs are unlimited and have no hard per-agent timeout. Add per-run or per-agent values when you need explicit gates. `concurrency` is clamped to 16; `agentRetries` retries only recoverable failures. Settings load in order (later wins): global `~/.pi/workflows/settings.json` → repo-local `<cwd>/.pi/workflows/settings.json` → the existing external project override `~/.pi/workflows/projects/<project>/settings.json`. Repo-local defaults can be version-controlled and shared as common repository configuration; external project overrides remain user-specific. `defaultTokenBudget` is a soft pre-call gate, and a project-level override of `null` cancels a global budget.
+Omitted `tokenBudget` and `agentTimeoutMs` values use configured `defaultTokenBudget` and `defaultAgentTimeoutMs` settings; without them, runs are unlimited and have no hard per-agent timeout. Add per-run or per-agent values when you need explicit gates. `concurrency` is clamped to 16; `agentRetries` retries only recoverable failures. Programmatic runs can tune the retry pacing via `agentRetryBackoffMs?: (failedAttempt: number) => number` (default `min(250*2^(N-1), 2000)` ms; the retry holds its concurrency slot during the wait). Settings load in order (later wins): global `~/.pi/workflows/settings.json` → repo-local `<cwd>/.pi/workflows/settings.json` → the existing external project override `~/.pi/workflows/projects/<project>/settings.json`. Repo-local defaults can be version-controlled and shared as common repository configuration; external project overrides remain user-specific. `defaultTokenBudget` is a soft pre-call gate, and a project-level override of `null` cancels a global budget.
 
 Set `"defaultEffort": "high"` or `"ultra"` in that settings file to opt a fresh session into the corresponding orchestration effort (`"off"` is the default). Project settings overlay the global value. This is an initial in-memory value only: `/effort` and `/ultracode` change the current session without writing settings, and reload/new/fork/session switches retain their existing in-process effort.
 
