@@ -27,6 +27,7 @@ import { registerWorkflowCommands } from "./workflow-commands.js";
 import { createWorkflowControlTool } from "./workflow-control-tool.js";
 import { installWorkflowKeywordArming } from "./workflow-editor.js";
 import { WorkflowManager } from "./workflow-manager.js";
+import { installWorkflowProgress } from "./workflow-progress.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
 import { loadWorkflowSettings, saveWorkflowSettingsForCwd } from "./workflow-settings.js";
 import { createWorkflowTool } from "./workflow-tool.js";
@@ -178,8 +179,11 @@ export default function extension(pi: ExtensionAPI) {
   pi.registerTool(workflowControlTool);
 
   let usageLimitScheduler = new UsageLimitScheduler(manager);
+  let disposeProgress: (() => void) | undefined;
 
   pi.on("session_shutdown", (event?: { reason?: string; targetSessionFile?: string }) => {
+    disposeProgress?.();
+    disposeProgress = undefined;
     usageLimitScheduler.dispose();
     // Always stop live sends first so a completion racing teardown cannot
     // deliver into the outgoing session (or throw on a just-stale ctx and be
@@ -254,6 +258,8 @@ export default function extension(pi: ExtensionAPI) {
   let armingInstalled = false;
 
   pi.on("session_start", (_event: unknown, ctx: ExtensionContext) => {
+    disposeProgress?.();
+    disposeProgress = undefined;
     // True project cwd for this session. Pi keeps process.cwd() on the
     // launching directory across /resume into another project; ctx.cwd is
     // the session header's project path.
@@ -335,6 +341,9 @@ export default function extension(pi: ExtensionAPI) {
     const previousSessionId = manager.getSessionId();
     manager.adoptLiveRunsToSession(sessionId, previousSessionId);
     manager.setSessionId(sessionId, sessionFile);
+    if (ctx.mode === "rpc" && sessionId) {
+      disposeProgress = installWorkflowProgress(pi, manager, sessionId);
+    }
 
     // Runtime is bound now (session_start fires after bindCore). Register a
     // session-stable delivery endpoint for THIS session only, then flush any

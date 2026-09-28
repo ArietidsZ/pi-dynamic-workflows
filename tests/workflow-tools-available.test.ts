@@ -24,9 +24,11 @@ import {
   discardWorkflowRuntime,
   handoffWorkflowRuntime,
   takeWorkflowRuntime,
+  WORKFLOW_EXTENSION_VERSION,
 } from "../src/extension-reload.js";
 import { _registerBoundSessionSendForTests, _resetDeliveryRegistriesForTests } from "../src/task-panel.js";
 import { buildArmedWorkflowPrompt, WORKFLOW_TOOL_NAME, type WorkflowModeState } from "../src/workflow-editor.js";
+import { WorkflowManager } from "../src/workflow-manager.js";
 import { saveWorkflowSettings } from "../src/workflow-settings.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
@@ -361,6 +363,74 @@ describe("installWorkflowKeywordArming - tool availability", () => {
 });
 
 describe("workflow extension - control tool availability", () => {
+  it("publishes progress in RPC sessions and detaches it on replacement", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-dw-rpc-progress-"));
+    try {
+      await withFakeHomeAsync(root, async () => {
+        for (const mode of ["tui", "rpc"] as const) {
+          discardWorkflowRuntime();
+          const cwd = join(root, mode);
+          const manager = new WorkflowManager({ cwd, agent: { run: async () => "verified" } });
+          handoffWorkflowRuntime({
+            cwd,
+            extensionVersion: WORKFLOW_EXTENSION_VERSION,
+            manager,
+            effort: { level: "off" },
+          });
+          const entries: Array<{ customType: string; data: any }> = [];
+          const handlers: Record<string, Array<(...args: any[]) => any>> = {};
+          const pi = {
+            registerTool: () => {},
+            registerCommand: () => {},
+            getCommands: () => [],
+            getActiveTools: () => ["workflow", "workflow_control"],
+            setActiveTools: () => {},
+            sendMessage: () => {},
+            appendEntry: (customType: string, data: unknown) => entries.push({ customType, data }),
+            on: (name: string, handler: (...args: any[]) => any) => {
+              handlers[name] ??= [];
+              handlers[name].push(handler);
+            },
+          } as unknown as ExtensionAPI;
+          const { default: installExtension } = await import("../src/pi-extension.js");
+          installExtension(pi);
+          const context = {
+            cwd,
+            mode,
+            modelRegistry: {},
+            sessionManager: { getSessionId: () => `progress-${mode}` },
+            ui: { setWidget: () => {}, notify: () => {} },
+          };
+          handlers.session_start[0]({}, context);
+          handlers.session_start[0]({}, context);
+          const script = `export const meta = {name: "progress", description: "progress"};
+return await agent("verify", {label: "check"});`;
+          await manager.runSync(script);
+          await Promise.resolve();
+
+          if (mode === "rpc") {
+            const completed = entries.filter((entry) => entry.data.status === "completed");
+            assert.equal(completed.length, 1, "repeated session_start must not duplicate observers");
+            assert.equal(completed[0].customType, "pi-dynamic-workflows:progress");
+            assert.equal(completed[0].data.doneCount, 1);
+          } else {
+            assert.deepEqual(entries, [], "TUI sessions retain their existing progress panel");
+          }
+
+          handlers.session_shutdown[0]({ reason: "reload" });
+          const countAtShutdown = entries.length;
+          await manager.runSync(script);
+          await Promise.resolve();
+          assert.equal(entries.length, countAtShutdown, "the outgoing session must receive no late progress");
+          discardWorkflowRuntime();
+        }
+      });
+    } finally {
+      discardWorkflowRuntime();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("registers both control tools and hands the live runtime across reload", async () => {
     const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-control-extension-"));
     try {
