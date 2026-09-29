@@ -179,11 +179,9 @@ export default function extension(pi: ExtensionAPI) {
   pi.registerTool(workflowControlTool);
 
   let usageLimitScheduler = new UsageLimitScheduler(manager);
-  let disposeProgress: (() => void) | undefined;
+  let disposeProgress: ReturnType<typeof installWorkflowProgress> | undefined;
 
   pi.on("session_shutdown", (event?: { reason?: string; targetSessionFile?: string }) => {
-    disposeProgress?.();
-    disposeProgress = undefined;
     usageLimitScheduler.dispose();
     // Always stop live sends first so a completion racing teardown cannot
     // deliver into the outgoing session (or throw on a just-stale ctx and be
@@ -201,42 +199,23 @@ export default function extension(pi: ExtensionAPI) {
       effort,
     };
 
-    if (reason && SESSION_REPLACEMENT_REASONS.has(reason)) {
-      // Destination checks differ by reason:
-      // - resume: fail-closed. Only hand off when the target session header
-      //   positively reads as this same project. Missing/corrupt/unreadable
-      //   headers must not smuggle a source-project manager across.
-      // - fork: Pi forks stay in the same project; the new session file may
-      //   not exist yet so a missing header is not a cross-project signal.
-      //   Only refuse when we positively read a different cwd.
-      // - reload/new: same project; always hand off.
-      if (reason === "resume") {
-        const targetCwd = sessionFileCwd(event?.targetSessionFile);
-        if (targetCwd !== cwd) {
-          pauseStrandedWorkflowRuntime(runtime);
-          discardWorkflowRuntime(cwd, runtime);
-          dropSessionDelivery(outgoingSessionId);
-          return;
-        }
-        handoffWorkflowRuntime(runtime);
-        return;
-      }
-      if (reason === "fork") {
-        const targetCwd = sessionFileCwd(event?.targetSessionFile);
-        if (targetCwd && targetCwd !== cwd) {
-          pauseStrandedWorkflowRuntime(runtime);
-          discardWorkflowRuntime(cwd, runtime);
-          dropSessionDelivery(outgoingSessionId);
-          return;
-        }
-        handoffWorkflowRuntime(runtime);
-        return;
-      }
+    let canHandoff = !!reason && SESSION_REPLACEMENT_REASONS.has(reason);
+    if (reason === "resume" || reason === "fork") {
+      const targetCwd = sessionFileCwd(event?.targetSessionFile);
+      // Resume requires a same-project header. A fork's new file may not yet
+      // exist; only a positively different project prevents its handoff.
+      canHandoff = reason === "resume" ? targetCwd === cwd : !targetCwd || targetCwd === cwd;
+    }
+    if (canHandoff) {
+      disposeProgress?.("handoff");
+      disposeProgress = undefined;
       handoffWorkflowRuntime(runtime);
       return;
     }
 
     pauseStrandedWorkflowRuntime(runtime);
+    disposeProgress?.("shutdown");
+    disposeProgress = undefined;
     discardWorkflowRuntime(cwd, runtime);
     dropSessionDelivery(outgoingSessionId);
   });

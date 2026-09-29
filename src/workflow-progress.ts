@@ -111,7 +111,7 @@ export function installWorkflowProgress(
   pi: Pick<ExtensionAPI, "appendEntry">,
   manager: WorkflowManager,
   sessionId: string,
-): () => void {
+): (reason?: "handoff" | "shutdown") => void {
   const previous = new Map<string, { header: string; agents: Map<number, string>; terminal: boolean }>();
   const owned = new Set<string>();
   const dirty = new Set<string>();
@@ -220,7 +220,35 @@ export function installWorkflowProgress(
     // Best-effort initial reconciliation; live events remain subscribed.
   }
 
-  return () => {
+  return (reason) => {
+    if (disposed) return;
+    if (reason === "handoff") {
+      try {
+        // Retire only work that adoption can move. Completed history without
+        // pending delivery stays in this session; inspect summaries, not results.
+        for (const runs of [
+          () =>
+            manager
+              .listLiveRuns()
+              .filter((run) => run.status === "running" || run.status === "paused" || run.pendingDelivery),
+          () => manager.listRuns().filter((run) => run.pendingDelivery),
+        ]) {
+          for (const run of runs()) {
+            if (run.sessionId === sessionId) {
+              deleted.add(run.runId);
+              urgent.add(run.runId);
+            }
+          }
+        }
+      } catch {
+        // Flush already queued state even if the history store is unavailable.
+      }
+    }
+    // Shutdown is the last point where appendEntry targets the outgoing
+    // session. Pause/terminal events may still be waiting for their microtask.
+    if (reason) {
+      for (const runId of new Set([...dirty, ...urgent])) publish(runId);
+    }
     disposed = true;
     if (timer) clearTimeout(timer);
     for (const event of lifecycleEvents) manager.off(event, scheduleImmediate);

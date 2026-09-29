@@ -367,6 +367,88 @@ test("rebound active runs and completed runs awaiting delivery receive full snap
   }
 });
 
+test("handoff retires migrating ownership synchronously without hydrating completed history", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const active = run();
+  active.snapshot.agents = [agent(1)];
+  const paused = run("paused");
+  paused.status = "paused";
+  const pending = run("pending");
+  pending.status = "completed";
+  pending.pendingDelivery = { kind: "complete" };
+  const diskPending = {
+    runId: "disk-pending",
+    sessionId: "session-1",
+    status: "completed",
+    pendingDelivery: { kind: "complete" },
+    agents: [],
+  } as unknown as PersistedRunState;
+  const history = {
+    runId: "history",
+    sessionId: "session-1",
+    status: "completed",
+    get agents() {
+      return assert.fail("handoff must not hydrate completed history");
+    },
+  } as unknown as PersistedRunState;
+  const diskPaused = {
+    ...diskPending,
+    runId: "disk-paused",
+    status: "paused",
+    pendingDelivery: undefined,
+  } as PersistedRunState;
+  const h = harness([active, paused, pending, run("foreign", "session-2")], [diskPending, history, diskPaused]);
+  await flush();
+  active.snapshot.agents[0].tokens = 42;
+  h.manager.emit("agentUsage", { runId: active.runId });
+  const before = h.records.length;
+  h.dispose("handoff");
+  assert.deepEqual(
+    h.records.slice(before).sort((a, b) => a.runId.localeCompare(b.runId)),
+    ["disk-pending", "paused", "pending", "run-1"].map((runId) => ({ version: 1, runId, deleted: true })),
+  );
+  const after = h.records.length;
+  h.dispose("handoff");
+  h.manager.emit("complete", { runId: active.runId });
+  await flush();
+  t.mock.timers.tick(1000);
+  assert.equal(h.records.length, after);
+  assert.equal(h.manager.eventNames().length, 0);
+});
+
+test("shutdown flushes queued pause, terminal and deletion state before returning", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const paused = run("paused");
+  const completed = run("completed");
+  const removed = run("removed");
+  const h = harness([paused, completed, removed]);
+  await flush();
+  paused.status = "paused";
+  h.manager.emit("paused", { runId: paused.runId });
+  completed.status = "completed";
+  h.manager.emit("complete", { runId: completed.runId });
+  h.live.delete(removed.runId);
+  h.manager.emit("deleted", { runId: removed.runId });
+  h.dispose("shutdown");
+  assert.equal(
+    progress(h.records)
+      .filter((entry) => entry.runId === paused.runId)
+      .at(-1)?.status,
+    "paused",
+  );
+  assert.equal(
+    progress(h.records)
+      .filter((entry) => entry.runId === completed.runId)
+      .at(-1)?.status,
+    "completed",
+  );
+  assert.deepEqual(h.records.at(-1), { version: 1, runId: removed.runId, deleted: true });
+  const after = h.records.length;
+  await flush();
+  t.mock.timers.tick(1000);
+  assert.equal(h.records.length, after);
+});
+
 test("real manager publishes synchronous workflows and native child session links", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "workflow-progress-"));
   const fakeHome = mkdtempSync(join(tmpdir(), "workflow-progress-home-"));
