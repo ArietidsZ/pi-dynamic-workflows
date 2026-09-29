@@ -222,6 +222,8 @@ The [full documentation](https://quintinshaw.github.io/pi-dynamic-workflows/) co
 <details>
 <summary><strong>Model tiers and run controls</strong></summary>
 
+Settings and model-tier paths below show the default workflow home; see [active workflow home](#active-workflow-home) for custom Pi profiles.
+
 Model tiers live at `~/.pi/workflows/model-tiers.json`. A project file at `~/.pi/workflows/projects/<project>/model-tiers.json` overlays the global map (project keys win). They accept Pi CLI-style thinking suffixes:
 
 ```json
@@ -251,6 +253,8 @@ Pausing and resuming a run keeps the limits it started with — `maxAgents`, `ag
 Programmatic hosts can set `drainAbortGraceMs` on `runWorkflow` or manager execution options to bound the final wait for agents that ignore cancellation. The default is 10,000 ms; `Infinity` waits without a bound. Finite values from 1 through 2,147,483,647 are rounded down; other values use the default. This is a host-only option, not a `workflow` tool input or persisted setting. It does not limit a successful run's final wait or a checkpoint suspension unless the run is also cancelled. After abandonment, already-reported terminal usage is retained, provisional usage is rolled back, and late agent callbacks cannot modify the settled run.
 
 </details>
+
+<a name="active-workflow-home"></a>
 
 <details>
 <summary><strong>Storage, resume, and persisted sessions</strong></summary>
@@ -287,7 +291,7 @@ Finished runs (completed, failed, or aborted) are retained in full on disk, capp
 <details>
 <summary><strong>Keyword trigger</strong></summary>
 
-Set a literal, case-insensitive custom trigger in `~/.pi/workflows/settings.json`:
+Set a literal, case-insensitive custom trigger in `~/.pi/workflows/settings.json` (see [active workflow home](#active-workflow-home) for custom Pi profiles):
 
 ```json
 {
