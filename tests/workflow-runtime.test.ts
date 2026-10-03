@@ -2890,6 +2890,111 @@ return { n, c }`;
     [{ runId: "foreign-run", index: 0, hash: "x", result: "y" } as JournalEntry],
     ["E", "C", "X"],
   );
+
+  // Foreign keys against a NO-preamble parent: nothing anywhere belongs to
+  // this run tree, yet the R16 size>0 gate engaged the sweep here (the
+  // preamble variant can't discriminate — E's own gap already disengages
+  // the child's journal inheritance, so both gates skip).
+  const bareParent = `export const meta = { name: 'parUpBare', description: 'p' }
+const n = await workflow('kidUp');
+const c = await agent('C');
+return { n, c }`;
+  const events: string[] = [];
+  let side = "unset";
+  const bare = await runWorkflow(bareParent, {
+    agent: {
+      async run(prompt: string) {
+        events.push(prompt);
+        if (prompt === "X") {
+          side = "set";
+          return "x-done";
+        }
+        return `c-sees-${side}`;
+      },
+    },
+    persistLogs: false,
+    runId: "r17-up-bare",
+    loadSavedWorkflow: (name) => (name === "kidUp" ? child : undefined),
+    resumeJournal: journalMap([{ runId: "foreign-run", index: 0, hash: "x", result: "y" } as JournalEntry]),
+    resumeMode: "replay-completed",
+  });
+  assert.equal(bare.result.c, "c-sees-unset", "a foreign journal must not engage the sweep's hold");
+  assert.deepEqual(events, ["C", "X"], "the parent's post-child call must beat the deferred dispatch");
+});
+
+test("a same-window pre-call gap fixes every downstream replay decision, so the sweep stays out (#231 R18)", async () => {
+  // G (a recoverable failure, never journaled) and the workflow() call share
+  // one parallel() dispatch window, so the parent prefix is "intact" at the
+  // call and the child inherits the journal — but every downstream replay
+  // decision is already fixed: in-window calls decided synchronously at
+  // dispatch, and C (dispatched after the window) is shadowed by G's gap no
+  // matter what the child's deferred misses do. C has an entry at a later
+  // index, so the unguarded reachability predicate engaged the sweep and
+  // its macrotask flipped the calibrated race (R18 MINOR-1).
+  const child = `export const meta = { name: 'kidSG', description: 'k' }
+let release;
+const gate = new Promise((r) => { release = r; });
+const p = (async () => { await gate; const x = await agent('X'); return x; })();
+let c = Promise.resolve();
+c = c.then(() => {});
+c = c.then(() => {});
+c = c.then(() => Promise.resolve());
+c.then(() => { release(); });
+return 'kid-done'`;
+  const parent = `export const meta = { name: 'parSG', description: 'p' }
+let wp;
+parallel([
+  () => agent('G'),
+  () => { wp = workflow('kidSG'); return 'w-started'; },
+]);
+const w = await wp;
+const c = await agent('C');
+return { w, c }`;
+
+  const journal: JournalEntry[] = [];
+  await runWorkflow(parent, {
+    agent: {
+      async run(prompt: string) {
+        return prompt === "C" ? "C-r" : "";
+      },
+    },
+    persistLogs: false,
+    runId: "r18-sg",
+    loadSavedWorkflow: (name) => (name === "kidSG" ? child : undefined),
+    onAgentJournal: (e) => journal.push(e),
+  });
+
+  const events: string[] = [];
+  let side = "unset";
+  let cLive = 0;
+  const resumed = await runWorkflow<{ w: string; c: string }>(parent, {
+    agent: {
+      async run(prompt: string) {
+        events.push(prompt);
+        if (prompt === "X") {
+          side = "set";
+          return "x-done";
+        }
+        if (prompt === "C") {
+          cLive++;
+          return `c-sees-${side}`;
+        }
+        return ""; // G fails recoverably again — a gap in the shared window.
+      },
+    },
+    persistLogs: false,
+    runId: "r18-sg",
+    loadSavedWorkflow: (name) => (name === "kidSG" ? child : undefined),
+    resumeJournal: journalMap(journal),
+    resumeMode: "replay-completed",
+  });
+  assert.equal(cLive, 1, "C is shadowed by the same-window gap and runs live");
+  assert.equal(
+    resumed.result.c,
+    "c-sees-unset",
+    "with every downstream decision fixed, no sweep hold may delay the parent",
+  );
+  assert.deepEqual(events, ["G", "C", "X"], "the parent's post-child call must beat the deferred dispatch");
 });
 
 test("an unusable cached entry (empty output) is an edit, not a gap, in replay-completed mode", async () => {

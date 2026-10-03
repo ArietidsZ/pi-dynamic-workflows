@@ -767,8 +767,12 @@ export async function runWorkflow<T = unknown>(
         for (const key of options.resumeJournal.keys()) {
           const sep = key.lastIndexOf(":");
           if (sep < 0) continue;
-          const index = Number(key.slice(sep + 1));
-          if (!Number.isInteger(index) || index < 0) continue;
+          const indexText = key.slice(sep + 1);
+          // Canonical decimal only: Number("") === 0, Number(" 1 ") === 1,
+          // and Number("0x10") === 16 would all slip past Number.isInteger
+          // and let a malformed key engage the sweep's hold (#231 R18).
+          if (!/^\d+$/.test(indexText)) continue;
+          const index = Number(indexText);
           const frame = key.slice(0, sep);
           if (frame === runId) {
             if (index > maxOwnIndex) maxOwnIndex = index;
@@ -1714,18 +1718,24 @@ export async function runWorkflow<T = unknown>(
       let childOwnMisses = 0;
       // Whether a deferred miss in THIS child could still change a replay
       // decision downstream of its return: this frame has a journaled call
-      // at a later index, or some OTHER nested frame has entries (its
-      // journal inheritance is decided by this frame's boundary at ITS
-      // dispatch). The child's zero-entry sweep holds one macrotask for
-      // exactly this; when nothing downstream can replay, the hold is pure,
-      // observable cost (#231 R16 empty journal, R17 upstream-only/foreign
-      // journals). Computed here because the child frame can see neither
-      // this frame's callSeq nor its runId. Conservative by construction:
-      // an EARLIER sibling frame's entries also engage it (their keys are
-      // indistinguishable from a later frame's at this point), which at
-      // worst re-adds the hold. Nested-frame own entries do NOT count for
-      // the current child: they drive its internal replay (the frame gate /
-      // full drain), not this frame's boundary.
+      // at a later index, or a nested frame has entries (its journal
+      // inheritance is decided by this frame's boundary at ITS dispatch).
+      // The child's zero-entry sweep holds one macrotask for exactly this;
+      // when nothing downstream can replay, the hold is pure, observable
+      // cost (#231 R16 empty journal, R17 upstream-only/foreign journals).
+      // Computed here because the child frame can see neither this frame's
+      // callSeq nor its runId. Two refinements:
+      // - A pre-call gap: with prefixIntact true it must share this call's
+      //   dispatch window, and then every downstream decision is already
+      //   fixed — in-window calls decided synchronously at dispatch (the
+      //   child cannot settle inside a synchronous window), post-window
+      //   calls are shadowed by the gap with or without this child's
+      //   advance — so the sweep would change nothing (#231 R18).
+      // - Conservative by construction: an EARLIER sibling frame's entries
+      //   also engage it (their keys are indistinguishable from a later
+      //   frame's at this point), which at worst re-adds the hold. The
+      //   current child's OWN entries technically engage it too, but a
+      //   child with entries takes the full-drain branch, never the sweep.
       // shared.nestedCallSeq, not shared.depth — see its doc comment: depth
       // returns to 0 between sequential sibling calls, which would otherwise
       // mint the same child runId (and hence colliding deltaKeys/event ids)
@@ -1733,10 +1743,9 @@ export async function runWorkflow<T = unknown>(
       const childRunId = `${runId}-nested${++shared.nestedCallSeq}`;
       const replaySweepRelevant =
         prefixIntact &&
+        !state.gaps.some((gap) => gap.index < state.callSeq) &&
         journalReach !== undefined &&
-        (journalReach.maxOwnIndex >= state.callSeq ||
-          journalReach.nestedFrames.size > 1 ||
-          (journalReach.nestedFrames.size === 1 && !journalReach.nestedFrames.has(childRunId)));
+        (journalReach.maxOwnIndex >= state.callSeq || journalReach.nestedFrames.size > 0);
       const childRun = workflowNestingScope.run(nestingDepth + 1, () =>
         runWorkflow(childScript, {
           ...options,
