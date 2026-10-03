@@ -108,7 +108,7 @@ const workflowToolSchema = Type.Object({
     Type.String({
       description: [
         "Resume a prior run (this ID) with an edited `script` instead of starting a new run.",
-        "Unchanged agent() calls replay from that run's cache; the first changed/new call onward re-runs.",
+        "Unchanged agent() calls replay from that run's cache; the first changed/new call onward re-runs (see resumeMode).",
         "Calls match by position: keep earlier good calls identical and in order. Always background.",
       ].join(" "),
     }),
@@ -259,7 +259,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           throw new Error(resumeFailureText(manager, runId, params.maxAgents));
         }
         return {
-          content: [{ type: "text", text: resumedText(parsed.meta.name, runId) }],
+          content: [{ type: "text", text: resumedText(parsed.meta.name, runId, params.resumeMode) }],
           details: { runId, background: true, resumedFrom: runId },
         };
       }
@@ -473,18 +473,29 @@ export function backgroundStartedText(name: string, runId: string): string {
  */
 export function reviseHint(runId: string | undefined): string {
   if (!runId) return "";
-  return `To revise without re-running everything: re-call workflow with resumeFromRunId="${runId}" and an edited script — unchanged agent() calls replay from cache, only edited/new ones re-run.`;
+  return `To revise without re-running everything: re-call workflow with resumeFromRunId="${runId}" and an edited script — unchanged agent() calls replay from cache, only edited/new ones re-run. For a run paused inside a fan-out, add resumeMode="replay-completed" to also replay completed fan-out siblings across the never-completed gap.`;
 }
 
 /**
  * The tool result returned when the model resumes a run with an edited script.
  * The resumed run is always background, so its result is delivered back later.
+ * The replay lines describe the policy actually chosen via resumeMode.
  */
-export function resumedText(name: string, runId: string): string {
+export function resumedText(name: string, runId: string, resumeMode?: WorkflowResumeMode): string {
+  const replay =
+    resumeMode === "replay-completed"
+      ? [
+          "Unchanged completed agent() calls replay from that run's journal (cache) — including",
+          "completed fan-out siblings across a never-completed gap; the first edited call —",
+          "and everything after it — re-runs live.",
+        ]
+      : [
+          "Unchanged agent() calls replay from that run's journal (cache); the first",
+          "edited or newly inserted agent() call — and everything after it — re-runs live.",
+        ];
   return [
     `Workflow "${name}" resumed from run ${runId} with your edited script.`,
-    "Unchanged agent() calls replay from that run's journal (cache); the first",
-    "edited or newly inserted agent() call — and everything after it — re-runs live.",
+    ...replay,
     "It runs in the background; the result is delivered back here when it finishes,",
     "and the conversation continues automatically. The user can wait or keep working.",
     `Track or cancel it with /workflows status ${runId} or /workflows stop ${runId}.`,

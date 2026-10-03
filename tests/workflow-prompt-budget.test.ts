@@ -65,7 +65,10 @@ const RENDERED_PROMPT_BUDGET_BYTES = 800;
 // #231 review hardening added same-batch scoping and the store/file
 // staleness caveat to that description, increasing the measured definition
 // from 4,751 to 4,863 bytes (+112); the ceiling moves with it.
-const TOOL_DEFINITION_BUDGET_BYTES = 4_863;
+// #231 R2 cross-referenced resumeMode from the resumeFromRunId description,
+// increasing the measured definition from 4,863 to 4,880 bytes (+17); the
+// ceiling moves with it.
+const TOOL_DEFINITION_BUDGET_BYTES = 4_880;
 
 test("rendered workflow prompt contribution stays within its accepted size", async () => {
   await withRenderedWorkflow(async ({ systemPrompt, promptLines }) => {

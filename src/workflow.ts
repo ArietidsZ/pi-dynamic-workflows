@@ -44,8 +44,14 @@ import { createWorktree, removeWorktree, type Worktree } from "./worktree.js";
  * a nested inner fan-out is mid-flight, that other batch is NOT cancelled and
  * finishes its already-reserved agents (still capped at maxAgents total). Only
  * the breaching fan-out's own queue is short-circuited.
+ *
+ * The store doubles as the resume replay generation marker via `dispatchOpen`
+ * (see parallel()/pipeline()): the ALS context is inherited transitively
+ * (nested workflow() frames, awaits inside a thunk), but only calls dispatched
+ * while the flag is still true were genuinely concurrent fan-out siblings —
+ * the distinction replay-completed gap-shadowing relies on.
  */
-const fanoutScope = new AsyncLocalStorage<{ cancelled: boolean }>();
+const fanoutScope = new AsyncLocalStorage<{ cancelled: boolean; dispatchOpen: boolean }>();
 const workflowNestingScope = new AsyncLocalStorage<number>();
 
 export interface WorkflowMetaPhase {
@@ -260,10 +266,12 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    * an EXISTING-but-unusable entry (changed hash, empty cached result) still
    * ends replay for its whole suffix, but a never-completed gap (no journal
    * entry — e.g. a call paused mid-flight inside a parallel() fan-out) only
-   * ends replay for its SEQUENTIAL downstream: completed calls dispatched by
-   * the same parallel()/pipeline() batch as the gap still replay, because
-   * fan-out siblings are concurrent with the gap — their prompts were fixed
-   * at dispatch, before the gap call could have produced anything. The gap
+   * ends replay for its SEQUENTIAL downstream: completed calls dispatched in
+   * the same fan-out's synchronous dispatch window as the gap still replay,
+   * because those siblings were concurrent with the gap — their prompts were
+   * fixed at dispatch, before the gap call could have produced anything.
+   * Calls dispatched after an await in a thunk and every call inside a nested
+   * workflow() frame are NOT in that window and count as sequential. The gap
    * position also hides prompt edits (no journaled hash to compare against),
    * which is exactly why downstream-of-gap calls must re-run live. Caveat:
    * siblings that coordinated with the gap call through the shared store or
@@ -541,13 +549,15 @@ interface RuntimeState {
   firstEdit: number;
   /**
    * Never-completed gaps seen so far this execution (no journal entry at that
-   * position), each with the fan-out batch that dispatched it (the
-   * parallel()/pipeline() fanoutScope store, or undefined for a top-level
-   * sequential call). Only "replay-completed" mode reads this: a gap shadows
-   * every later call EXCEPT siblings sharing its batch — see
-   * journalReplayAllowed for the rationale.
+   * position), each with the replay generation that dispatched it: the
+   * parallel()/pipeline() batch object, but ONLY when the call was dispatched
+   * inside that fan-out's synchronous dispatch window (before any sibling
+   * could have settled); undefined otherwise (top-level calls, calls after an
+   * await in a thunk, every call inside a nested workflow() frame). Only
+   * "replay-completed" mode reads this: a gap shadows every later call EXCEPT
+   * same-generation siblings — see journalReplayAllowed for the rationale.
    */
-  gaps: Array<{ index: number; batch: object | undefined }>;
+  gaps: Array<{ index: number; gen: object | undefined }>;
 }
 
 type AnyNode = Node & { [key: string]: any; start: number; end: number };
@@ -668,29 +678,33 @@ export async function runWorkflow<T = unknown>(
   // of ANY kind ends replay. "replay-completed": replay while index <
   // firstEdit (a changed/unusable EXISTING entry ends replay everywhere) AND
   // the call is not in a gap's shadow. A gap shadows every later call EXCEPT
-  // siblings dispatched by the SAME parallel()/pipeline() batch: fan-out
-  // siblings were concurrent with the gap call in the original run — their
-  // prompts were fixed at dispatch, before the gap call could have produced
-  // anything — so replaying them cannot serve a result derived from the gap
-  // call's (re-run) output. Sequential downstream calls have no such
-  // guarantee, and the gap position also hides prompt EDITS (there is no
-  // journaled hash to compare against), so they must re-run live. Top-level
-  // calls have no batch (undefined), and a batch-less gap therefore shadows
-  // everything after it.
-  const isGapShadowed = (index: number, batch: object | undefined) =>
-    state.gaps.some((gap) => gap.index < index && (gap.batch === undefined || gap.batch !== batch));
-  const journalReplayAllowed = (index: number, batch: object | undefined) =>
+  // same-generation siblings: calls dispatched inside the SAME fan-out's
+  // synchronous dispatch window (see parallel()/pipeline()) ran concurrently
+  // with the gap call in the original run — their prompts were fixed at
+  // dispatch, before the gap call could have produced anything — so replaying
+  // them cannot serve a result derived from the gap call's (re-run) output.
+  // Everything else has no such guarantee: top-level calls, calls dispatched
+  // after an await inside a thunk (a caught sibling failure settles first),
+  // and every call inside a nested workflow() frame all run strictly after
+  // the gap settled — and the gap position also hides prompt EDITS (there is
+  // no journaled hash to compare against) — so they must re-run live. Those
+  // calls all carry generation `undefined`, and a batch-less gap therefore
+  // shadows everything after it.
+  const isGapShadowed = (index: number, gen: object | undefined) =>
+    state.gaps.some((gap) => gap.index < index && (gap.gen === undefined || gap.gen !== gen));
+  const journalReplayAllowed = (index: number, gen: object | undefined) =>
     resolvedResumeMode === "replay-completed"
-      ? index < state.firstEdit && !isGapShadowed(index, batch)
+      ? index < state.firstEdit && !isGapShadowed(index, gen)
       : index < state.firstMiss;
-  const noteJournalMiss = (missedIndex: number, entry: JournalEntry | null | undefined, batch: object | undefined) => {
+  const noteJournalMiss = (missedIndex: number, entry: JournalEntry | null | undefined, gen: object | undefined) => {
     state.firstMiss = Math.min(state.firstMiss, missedIndex);
     // An entry that EXISTS but is unusable (changed hash, empty cached result)
     // is an edit: its whole suffix runs live in every mode. A gap (no entry —
     // the call never completed) ends the unchanged prefix and shadows its
-    // sequential downstream; same-batch siblings may still replay across it.
+    // sequential downstream; same-generation siblings may still replay across
+    // it.
     if (entry != null) state.firstEdit = Math.min(state.firstEdit, missedIndex);
-    else state.gaps.push({ index: missedIndex, batch });
+    else state.gaps.push({ index: missedIndex, gen });
   };
 
   const agentRunner = options.agent ?? new WorkflowAgent(options);
@@ -930,6 +944,13 @@ export async function runWorkflow<T = unknown>(
     // closes over this so a still-queued agent can bail once its OWN fan-out
     // breaches the cap, without affecting sibling or outer fan-outs.
     const batch = fanoutScope.getStore();
+    // Replay generation for resume gap-shadowing: the batch ONLY while its
+    // synchronous dispatch window is still open (see parallel()/pipeline()) —
+    // i.e. only when this call was dispatched before any sibling could have
+    // settled. The ALS store is inherited transitively into nested workflow()
+    // frames and across awaits inside a thunk, but the window is not: those
+    // calls get `undefined` here and are treated as sequential downstream.
+    const replayGen = batch?.dispatchOpen === true ? batch : undefined;
 
     // Check agent limit. A fan-out that overshoots the cap has already reserved
     // and queued up to `maxAgents` agents; the breaching call throws here, and
@@ -1015,7 +1036,8 @@ export async function runWorkflow<T = unknown>(
     // leaves stale downstream results served from the journal.
     // "replay-completed" mode: replay ends at the first EDIT everywhere, and
     // a never-completed gap ends it only for the gap's sequential downstream
-    // — completed siblings in the gap's own fan-out batch still replay.
+    // — completed siblings dispatched in the gap's own fan-out dispatch
+    // window still replay.
     // Namespaced the same way as SharedStore's deltaKey (deltaKey IS this
     // exact `${runId}:${callIndex}` string) so a nested workflow()'s
     // callIndex-0 can never accidentally replay the parent's callIndex-0
@@ -1024,7 +1046,12 @@ export async function runWorkflow<T = unknown>(
     const cached = agentOptions.thread ? undefined : options.resumeJournal?.get(deltaKey);
     const hashMatches = cached != null && cached.hash === callHash;
     const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
-    if (!shared.resumeBarrierReached && hashMatches && !cachedEmptyOutput && journalReplayAllowed(callIndex, batch)) {
+    if (
+      !shared.resumeBarrierReached &&
+      hashMatches &&
+      !cachedEmptyOutput &&
+      journalReplayAllowed(callIndex, replayGen)
+    ) {
       // Replay preserves the journaled model and historical session identity.
       const replayModel = cached.model ?? displayModel;
       options.onAgentStart?.({
@@ -1053,7 +1080,7 @@ export async function runWorkflow<T = unknown>(
     // cached result) marks where replay ends for this call's successors — see
     // noteJournalMiss for the gap-vs-edit distinction.
     if (!hashMatches || cachedEmptyOutput) {
-      noteJournalMiss(callIndex, cached, batch);
+      noteJournalMiss(callIndex, cached, replayGen);
     }
 
     // Budget gates, deliberately AFTER the replay lookup: a journaled cache hit
@@ -1408,33 +1435,45 @@ export async function runWorkflow<T = unknown>(
     // from these thunks see this store via fanoutScope.getStore(). A breach in
     // THIS fan-out flips `cancelled` so its own still-queued agents bail, without
     // touching a sibling fan-out running concurrently or an enclosing one.
-    const batch = { cancelled: false };
-    return fanoutScope.run(batch, () =>
-      Promise.all(
-        thunks.map(async (thunk, index) => {
-          try {
-            return await thunk();
-          } catch (error) {
-            if (error instanceof WorkflowCheckpointSuspensionError) throw error;
-            if (isAborted()) throw error;
-            const workflowError = wrapError(error);
-            // Non-recoverable failures (token budget / agent limit exhausted) must
-            // halt the whole run, exactly like a directly-awaited agent() — not be
-            // swallowed into a null in the result array.
-            if (!workflowError.recoverable) {
-              // Only a breached agent cap cancels the rest of this batch; the
-              // token budget stays a soft gate by design (in-flight agents may
-              // finish past it), and other non-recoverable errors don't imply
-              // the rest of the batch is doomed.
-              if (workflowError.code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) batch.cancelled = true;
-              throw workflowError;
+    // `dispatchOpen` additionally marks the synchronous dispatch window: it
+    // stays true only while the thunks below are being INVOKED (each runs its
+    // synchronous prefix, so every call dispatched in that prefix is genuinely
+    // concurrent with the others — none could have observed a sibling
+    // settling). Calls dispatched later (after an await in a thunk, or inside
+    // a nested workflow frame — the ALS store is inherited transitively, but
+    // the window is not) sample dispatchOpen === false and are treated as
+    // sequential for resume gap-shadowing (see journalReplayAllowed).
+    const batch = { cancelled: false, dispatchOpen: true };
+    try {
+      return fanoutScope.run(batch, () =>
+        Promise.all(
+          thunks.map(async (thunk, index) => {
+            try {
+              return await thunk();
+            } catch (error) {
+              if (error instanceof WorkflowCheckpointSuspensionError) throw error;
+              if (isAborted()) throw error;
+              const workflowError = wrapError(error);
+              // Non-recoverable failures (token budget / agent limit exhausted) must
+              // halt the whole run, exactly like a directly-awaited agent() — not be
+              // swallowed into a null in the result array.
+              if (!workflowError.recoverable) {
+                // Only a breached agent cap cancels the rest of this batch; the
+                // token budget stays a soft gate by design (in-flight agents may
+                // finish past it), and other non-recoverable errors don't imply
+                // the rest of the batch is doomed.
+                if (workflowError.code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) batch.cancelled = true;
+                throw workflowError;
+              }
+              log(`parallel[${index}] failed: ${workflowError.message}`);
+              return null;
             }
-            log(`parallel[${index}] failed: ${workflowError.message}`);
-            return null;
-          }
-        }),
-      ),
-    );
+          }),
+        ),
+      );
+    } finally {
+      batch.dispatchOpen = false;
+    }
   };
 
   const pipeline = async (
@@ -1446,34 +1485,41 @@ export async function runWorkflow<T = unknown>(
     if (stages.some((stage) => typeof stage !== "function")) {
       throw new TypeError("pipeline() stages must be functions: pipeline(items, item => ..., result => ...)");
     }
-    // Batch-scoped cancellation — see parallel() for the rationale.
-    const batch = { cancelled: false };
-    return fanoutScope.run(batch, () =>
-      Promise.all(
-        items.map(async (item, index) => {
-          let value: unknown = item;
-          for (const stage of stages) {
-            try {
-              throwIfAborted();
-              value = await stage(value, item, index);
-              throwIfAborted();
-            } catch (error) {
-              if (error instanceof WorkflowCheckpointSuspensionError) throw error;
-              if (isAborted()) throw error;
-              const workflowError = wrapError(error);
-              // Non-recoverable failures halt the whole run (see parallel()).
-              if (!workflowError.recoverable) {
-                if (workflowError.code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) batch.cancelled = true;
-                throw workflowError;
+    // Batch-scoped cancellation and the synchronous dispatch window — see
+    // parallel() for the rationale. Only each item's FIRST stage dispatches
+    // inside the window; later stages run after that item's stage settled, so
+    // they correctly sample dispatchOpen === false (sequential for gap-shadow).
+    const batch = { cancelled: false, dispatchOpen: true };
+    try {
+      return fanoutScope.run(batch, () =>
+        Promise.all(
+          items.map(async (item, index) => {
+            let value: unknown = item;
+            for (const stage of stages) {
+              try {
+                throwIfAborted();
+                value = await stage(value, item, index);
+                throwIfAborted();
+              } catch (error) {
+                if (error instanceof WorkflowCheckpointSuspensionError) throw error;
+                if (isAborted()) throw error;
+                const workflowError = wrapError(error);
+                // Non-recoverable failures halt the whole run (see parallel()).
+                if (!workflowError.recoverable) {
+                  if (workflowError.code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) batch.cancelled = true;
+                  throw workflowError;
+                }
+                log(`pipeline[${index}] failed: ${workflowError.message}`);
+                return null;
               }
-              log(`pipeline[${index}] failed: ${workflowError.message}`);
-              return null;
             }
-          }
-          return value;
-        }),
-      ),
-    );
+            return value;
+          }),
+        ),
+      );
+    } finally {
+      batch.dispatchOpen = false;
+    }
   };
 
   // Nested workflow(): run a saved workflow (or a raw script) inline, sharing this
@@ -1495,6 +1541,12 @@ export async function runWorkflow<T = unknown>(
     const workflowName = String(nameOrScript);
     options.onRuntimeEvent?.({ type: "workflow", stage: "start", name: workflowName, args: childArgs });
     const workflowBatch = fanoutScope.getStore();
+    // Same dispatch-window rule as agent(): this workflow() call counts as a
+    // concurrent fan-out sibling ONLY when dispatched inside the batch's
+    // synchronous window. Launched after an await in a thunk (e.g. after a
+    // caught gap call settled), it is sequential downstream and must not
+    // inherit the journal across that gap.
+    const replayGen = workflowBatch?.dispatchOpen === true ? workflowBatch : undefined;
     try {
       // Propagate the resumeJournal into the child frame ONLY while replay is
       // still open at the moment of this workflow() call — the same rule the
@@ -1510,13 +1562,16 @@ export async function runWorkflow<T = unknown>(
       // store values than it did originally, and a child cached under the
       // OLD store state would then replay a result stale with respect to the
       // NEW live state, even though the child's own hash still matches. A
-      // gap in the SAME fan-out batch as this workflow() call is the one
+      // gap in the SAME dispatch window as this workflow() call is the one
       // safe case: the child originally ran concurrently with it, before the
-      // gap call could have produced anything (same argument as same-batch
-      // sibling replay — see journalReplayAllowed).
+      // gap call could have produced anything (same argument as same-window
+      // sibling replay — see journalReplayAllowed). Note the child's OWN
+      // internal calls never inherit this window — they dispatch after it
+      // closes and get generation undefined in their own frame, so a gap
+      // inside the child still shadows the child's sequential downstream.
       const prefixIntact =
         resolvedResumeMode === "replay-completed"
-          ? state.firstEdit === Number.POSITIVE_INFINITY && !isGapShadowed(state.callSeq, workflowBatch)
+          ? state.firstEdit === Number.POSITIVE_INFINITY && !isGapShadowed(state.callSeq, replayGen)
           : state.firstMiss === Number.POSITIVE_INFINITY;
       const child = await workflowNestingScope.run(nestingDepth + 1, () =>
         runWorkflow(childScript, {
@@ -1766,7 +1821,9 @@ export async function runWorkflow<T = unknown>(
       shared.seenCheckpointIds.add(durableInput.checkpointId);
     }
     const activeResumeCheckpoint = shared.activeCheckpointResponse;
+    // Replay generation — same dispatch-window rule as agent() (see there).
     const batch = fanoutScope.getStore();
+    const replayGen = batch?.dispatchOpen === true ? batch : undefined;
     const callHash =
       promptText === null
         ? hashWorkflowCheckpoint(durableInput as WorkflowCheckpointInput)
@@ -1779,14 +1836,14 @@ export async function runWorkflow<T = unknown>(
       !shared.resumeBarrierReached &&
       cached != null &&
       cached.hash === callHash &&
-      journalReplayAllowed(callIndex, batch) &&
+      journalReplayAllowed(callIndex, replayGen) &&
       !replayingActiveCheckpoint
     ) {
       shared.agentCount++;
       return cached.result;
     }
     if (cached == null || cached.hash !== callHash) {
-      noteJournalMiss(callIndex, cached, batch);
+      noteJournalMiss(callIndex, cached, replayGen);
     }
     shared.agentCount++;
 

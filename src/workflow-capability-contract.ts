@@ -360,7 +360,7 @@ const capabilities: readonly CapabilityDescriptor[] = [
     constraints: [
       "one nested level",
       "shares limiter, counters, token accounting, and store",
-      "a nested workflow journals under its own runId and replays those entries only while the parent's replay prefix is intact; a parent gap or edit re-executes the child live",
+      "a nested workflow journals under its own runId and replays those entries only while the parent's replay is still open at the workflow() call; a parent edit, or a parent gap shadowing the call, re-executes the child live",
     ],
     evidence: ["tests/workflow-saved.test.ts", "tests/shared-store.test.ts"],
   }),
@@ -510,7 +510,7 @@ const capabilities: readonly CapabilityDescriptor[] = [
   ]),
   toolInput("resumeFromRunId", "resumeFromRunId?: string", [
     "resumes a prior incomplete run with an edited script",
-    "unchanged positional agent calls replay from cache until the first changed, inserted, or never-completed call",
+    "under the default prefix policy, unchanged positional agent calls replay from cache until the first changed, inserted, or never-completed call",
     "always runs in the background",
   ]),
   toolInput("resumeMode", 'resumeMode?: "prefix" | "replay-completed" = "prefix"', [

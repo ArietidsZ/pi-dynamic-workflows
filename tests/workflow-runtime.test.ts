@@ -1655,6 +1655,203 @@ return { x, n }`;
   assert.equal(replayRun.state.calls, 2, "a top-level gap shadows the later workflow() call: the child re-executes");
 });
 
+test("replay-completed resume re-runs a nested child's sequential downstream of an internal gap (#231 R2)", async () => {
+  // The fan-out batch object is inherited into a nested workflow()'s frame via
+  // AsyncLocalStorage, but the child's internal calls are NOT concurrent with
+  // the parent's fan-out — they run strictly after the child's own gap
+  // settled. The gap must shadow the child's sequential downstream, or a
+  // store-coordinated result replays stale (here: plan-for-undefined sitting
+  // next to the fresh REAL). Emulates store_put/store_get: the successful
+  // kid-gap seeds state kid-plan reads — a channel no call hash observes.
+  const child = `export const meta = { name: 'kid', description: 'kid' }
+let a = 'missing'
+try { a = await agent('kid-gap', { label: 'kg' }) } catch {}
+const b = await agent('kid-plan', { label: 'kp' })
+return { a, b }`;
+  const parent = `export const meta = { name: 'par', description: 'par' }
+const [x, n] = await parallel([
+  () => agent('parent-call', { label: 'pg' }),
+  () => workflow('kid'),
+])
+return { x, n }`;
+  const seeded = { value: undefined as string | undefined };
+  const makeRunner = (gapFails: boolean, calls: { n: number }) => ({
+    async run(prompt: string) {
+      calls.n++;
+      if (prompt === "kid-gap") {
+        if (gapFails) return "";
+        seeded.value = "REAL";
+        return "REAL";
+      }
+      if (prompt === "kid-plan") return `plan-for-${seeded.value ?? "undefined"}`;
+      return `ran:${prompt}`;
+    },
+  });
+  const firstCalls = { n: 0 };
+  const journal: JournalEntry[] = [];
+  const initial = await runWorkflow<{ x: string; n: { a: string | null; b: string } }>(parent, {
+    agent: makeRunner(true, firstCalls),
+    persistLogs: false,
+    runId: "nested-internal-gap-run",
+    loadSavedWorkflow: (name) => (name === "kid" ? child : undefined),
+    onAgentJournal: (e) => journal.push(e),
+  });
+  assert.equal(initial.result?.n.b, "plan-for-undefined", "run 1: the gap produced nothing for kid-plan to see");
+
+  seeded.value = undefined;
+  const secondCalls = { n: 0 };
+  const resumed = await runWorkflow<{ x: string; n: { a: string | null; b: string } }>(parent, {
+    agent: makeRunner(false, secondCalls),
+    persistLogs: false,
+    runId: "nested-internal-gap-run",
+    loadSavedWorkflow: (name) => (name === "kid" ? child : undefined),
+    resumeJournal: journalMap(journal),
+    resumeMode: "replay-completed",
+  });
+  assert.equal(secondCalls.n, 2, "only the child's gap + its sequential downstream re-run; the parent replays");
+  assert.equal(resumed.result?.n.a, "REAL");
+  assert.equal(resumed.result?.n.b, "plan-for-REAL", "the downstream call re-computed against the gap's new output");
+  assert.equal(resumed.result?.x, "ran:parent-call");
+});
+
+test("replay-completed resume re-executes a workflow() launched after a same-thunk gap (#231 R2)", async () => {
+  // The workflow() call here is dispatched AFTER the gap call settled (the
+  // thunk awaits it first), so it is sequential downstream — the child must
+  // re-execute live even though both calls carry the same inherited batch.
+  const child = `export const meta = { name: 'kid1', description: 'k' }
+return await agent('kid task', { label: 'kid' })`;
+  const parent = `export const meta = { name: 'par', description: 'p' }
+const xs = await parallel([
+  async () => {
+    try { await agent('gap-call', { label: 'g' }) } catch {}
+    return await workflow('kid1')
+  },
+])
+return xs`;
+  const first = gappingAgent("gap-call");
+  const journal: JournalEntry[] = [];
+  await runWorkflow(parent, {
+    agent: first.runner,
+    persistLogs: false,
+    runId: "thunk-nested-gap-run",
+    loadSavedWorkflow: (name) => (name === "kid1" ? child : undefined),
+    onAgentJournal: (e) => journal.push(e),
+  });
+
+  const second = countingAgent();
+  const resumed = await runWorkflow<string[]>(parent, {
+    agent: second.runner,
+    persistLogs: false,
+    runId: "thunk-nested-gap-run",
+    loadSavedWorkflow: (name) => (name === "kid1" ? child : undefined),
+    resumeJournal: journalMap(journal),
+    resumeMode: "replay-completed",
+  });
+  assert.equal(second.state.calls, 2, "the gap re-runs AND the sequentially-launched child re-executes live");
+  assert.deepEqual(resumed.result, ["ran:kid task"]);
+});
+
+test("replay-completed resume re-runs a same-thunk call dispatched after the gap settled (#231 R2)", async () => {
+  // Same dispatch-window rule without nesting: plan-call runs strictly after
+  // the gap call settled, so it is sequential downstream and must re-run —
+  // only the genuinely concurrent sibling replays.
+  const script = `export const meta = { name: 'thunk_seq', description: 'same-thunk sequential' }
+const xs = await parallel([
+  async () => {
+    try { await agent('gap-call', { label: 'g' }) } catch {}
+    return await agent('plan-call', { label: 'p' })
+  },
+  () => agent('sibling', { label: 's' }),
+])
+return xs`;
+  const seeded = { value: undefined as string | undefined };
+  const makeRunner = (gapFails: boolean, calls: { n: number }) => ({
+    async run(prompt: string) {
+      calls.n++;
+      if (prompt === "gap-call") {
+        if (gapFails) return "";
+        seeded.value = "REAL";
+        return "REAL";
+      }
+      if (prompt === "plan-call") return `plan-for-${seeded.value ?? "undefined"}`;
+      return `ran:${prompt}`;
+    },
+  });
+  const firstCalls = { n: 0 };
+  const journal: JournalEntry[] = [];
+  await runWorkflow<string[]>(script, {
+    agent: makeRunner(true, firstCalls),
+    persistLogs: false,
+    runId: "thunk-seq-gap-run",
+    onAgentJournal: (e) => journal.push(e),
+  });
+
+  seeded.value = undefined;
+  const secondCalls = { n: 0 };
+  const resumed = await runWorkflow<string[]>(script, {
+    agent: makeRunner(false, secondCalls),
+    persistLogs: false,
+    runId: "thunk-seq-gap-run",
+    resumeJournal: journalMap(journal),
+    resumeMode: "replay-completed",
+  });
+  assert.equal(secondCalls.n, 2, "the gap + the same-thunk downstream re-run; the concurrent sibling replays");
+  assert.deepEqual(resumed.result, ["plan-for-REAL", "ran:sibling"]);
+});
+
+test("an unusable cached entry (empty output) is an edit, not a gap, in replay-completed mode", async () => {
+  // Defensive branch: organic empty output is never journaled, but a legacy or
+  // hand-edited journal CAN hold an unusable entry. It must pin firstEdit
+  // (whole suffix live) rather than degrade to a batch-shadowed gap.
+  const first = countingAgent();
+  const journal: JournalEntry[] = [];
+  await runWorkflow(threeCallScript, {
+    agent: first.runner,
+    persistLogs: false,
+    runId: "empty-cached-run",
+    onAgentJournal: (e) => journal.push(e),
+  });
+  const tampered = journalMap(journal.map((e) => (e.index === 1 ? { ...e, result: "" } : e)));
+
+  const second = countingAgent();
+  await runWorkflow(threeCallScript, {
+    agent: second.runner,
+    persistLogs: false,
+    runId: "empty-cached-run",
+    resumeJournal: tampered,
+    resumeMode: "replay-completed",
+  });
+  assert.equal(second.state.calls, 2, "the unusable entry (1) and its whole suffix (2) re-run; only 0 replays");
+});
+
+test("an invalid resumeMode value falls back to prefix with a warning", async () => {
+  const first = countingAgent();
+  const journal: JournalEntry[] = [];
+  await runWorkflow(threeCallScript, {
+    agent: first.runner,
+    persistLogs: false,
+    runId: "bad-mode-run",
+    onAgentJournal: (e) => journal.push(e),
+  });
+
+  const logs: string[] = [];
+  const editedScript = threeCallScript.replace("'B'", "'B-edited'");
+  const second = countingAgent();
+  await runWorkflow(editedScript, {
+    agent: second.runner,
+    persistLogs: false,
+    runId: "bad-mode-run",
+    resumeJournal: journalMap(journal),
+    resumeMode: "bogus" as unknown as "prefix",
+    onLog: (message) => logs.push(message),
+  });
+  assert.equal(second.state.calls, 2, "invalid mode falls back to prefix: the edit and its suffix re-run");
+  assert.ok(
+    logs.some((message) => message.includes("ignoring invalid resumeMode")),
+    "the fallback is logged",
+  );
+});
+
 test("callSeq is deterministic under parallel()", async () => {
   const journal: JournalEntry[] = [];
   const script = `export const meta = { name: 'par', description: 'parallel order' }

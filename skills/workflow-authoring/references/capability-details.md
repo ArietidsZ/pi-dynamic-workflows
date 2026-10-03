@@ -73,7 +73,7 @@ Every exact fact below is projected from the installed extension's capability co
 - Signature: `workflow(savedName, childArgs?) => Promise<unknown>`
 - Constraint: one nested level
 - Constraint: shares limiter, counters, token accounting, and store
-- Constraint: a nested workflow journals under its own runId and replays those entries only while the parent's replay prefix is intact; a parent gap or edit re-executes the child live
+- Constraint: a nested workflow journals under its own runId and replays those entries only while the parent's replay is still open at the workflow() call; a parent edit, or a parent gap shadowing the call, re-executes the child live
 
 <a id="verify"></a>
 ## verify
@@ -323,7 +323,7 @@ Every exact fact below is projected from the installed extension's capability co
 - Support: `supported`
 - Signature: `resumeFromRunId?: string`
 - Constraint: resumes a prior incomplete run with an edited script
-- Constraint: unchanged positional agent calls replay from cache until the first changed, inserted, or never-completed call
+- Constraint: under the default prefix policy, unchanged positional agent calls replay from cache until the first changed, inserted, or never-completed call
 - Constraint: always runs in the background
 
 <a id="tool-input-resumemode"></a>

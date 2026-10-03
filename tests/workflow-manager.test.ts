@@ -649,6 +649,68 @@ test(
 );
 
 test(
+  "an explicit resumeMode overrides the run's persisted policy in both directions (#231)",
+  withTempCwd(async (cwd) => {
+    const attempts = new Map<string, number>();
+    let markFirstStarted: () => void = () => {};
+    const firstStarted = new Promise<void>((resolve) => {
+      markFirstStarted = resolve;
+    });
+    let markSecondStarted: () => void = () => {};
+    const secondStarted = new Promise<void>((resolve) => {
+      markSecondStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt, options) {
+          options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+          const attempt = (attempts.get(prompt) ?? 0) + 1;
+          attempts.set(prompt, attempt);
+          if (prompt === "p0" && attempt <= 2) {
+            if (attempt === 1) markFirstStarted();
+            else markSecondStarted();
+            await new Promise<void>((_resolve, reject) => {
+              options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+            });
+          }
+          return `${prompt}-done`;
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    const { runId, promise } = manager.startInBackground(threeParallelScript);
+    promise.catch(() => {});
+    await firstStarted;
+    for (let i = 0; i < 2000; i++) {
+      if ((manager.getPersistence().load(runId)?.journal?.length ?? 0) >= 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(manager.pause(runId), true);
+
+    // Persist replay-completed via the first resume (paused again mid-retry).
+    assert.equal(await manager.resume(runId, { resumeMode: "replay-completed" }), true);
+    await secondStarted;
+    assert.equal(manager.pause(runId), true);
+    assert.equal(manager.getPersistence().load(runId)?.resumeMode, "replay-completed");
+
+    // An explicit "prefix" wins over the persisted policy AND re-persists.
+    assert.equal(await manager.resume(runId, { resumeMode: "prefix" }), true);
+    for (let i = 0; i < 2000 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+
+    const persisted = manager.getPersistence().load(runId);
+    assert.equal(persisted?.status, "completed");
+    assert.equal(persisted?.resumeMode, "prefix", "the explicit override replaces the persisted policy");
+    assert.equal(attempts.get("p0"), 3, "the gap call re-ran on every resume");
+    assert.equal(attempts.get("p1"), 2, "explicit prefix: the gap re-runs completed sibling p1");
+    assert.equal(attempts.get("p2"), 2, "explicit prefix: the gap re-runs completed sibling p2");
+  }),
+);
+
+test(
   "resume keeps historical agent session metadata when the edited script fails to parse (#206)",
   withTempCwd(async (cwd) => {
     const agent = fakeAgent();
