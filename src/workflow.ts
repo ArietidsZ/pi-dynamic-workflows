@@ -1699,34 +1699,31 @@ export async function runWorkflow<T = unknown>(
       // instead of replaying results computed against the old child state.
       // Same-window siblings already made their replay decision synchronously
       // at dispatch, before the child could have produced anything, so they
-      // are unaffected.
+      // are unaffected. The advance must run on BOTH settle paths: a child
+      // that re-ran calls live and then THREW still invalidates this frame's
+      // journaled downstream (#231 R13 F2).
       //
-      // The advance rides a .then pair ONLY when this frame can actually
-      // replay (replay-completed with a journal): the settlement handler adds
-      // one microtask tick between the child settling and this frame
-      // resuming, and that tick is itself observable — it flips the race
-      // between a microtask-deferred dispatch inside the child and this
-      // frame's post-child call (#231 R12 F1). Prefix — and a fresh start
-      // that merely DECLARED replay-completed for its future resumes — must
-      // await the raw child promise exactly as the base runtime did: default
-      // behavior byte-for-byte unchanged, and a start-time declaration must
-      // not change the live execution.
+      // It runs in a try/finally, never a .then/.finally on the child
+      // promise: any wrapper adds a microtask tick between the child settling
+      // and this frame resuming, and that tick is itself observable — it
+      // flips the race between a microtask-deferred dispatch inside the
+      // child and this frame's post-child call (#231 R12 F1). No mode
+      // predicate is needed: the miss hook is replay-completed-gated at
+      // noteJournalMiss, so childOwnMisses can only increment where a replay
+      // can actually engage the boundary; elsewhere the advance is a no-op,
+      // and with no journal the boundary is unread, so a fresh start that
+      // merely DECLARED replay-completed stays observably identical to
+      // prefix (invariant: a start-time declaration must not change the live
+      // execution).
       const advanceForChildMisses = () => {
         if (childOwnMisses > 0) state.firstEdit = Math.min(state.firstEdit, state.callSeq);
       };
-      const child =
-        resolvedResumeMode === "replay-completed" && options.resumeJournal !== undefined
-          ? await childRun.then(
-              (childResult) => {
-                advanceForChildMisses();
-                return childResult;
-              },
-              (error: unknown) => {
-                advanceForChildMisses();
-                throw error;
-              },
-            )
-          : await childRun;
+      let child: Awaited<typeof childRun>;
+      try {
+        child = await childRun;
+      } finally {
+        advanceForChildMisses();
+      }
       return child.result;
     } finally {
       options.onRuntimeEvent?.({ type: "workflow", stage: "end", name: workflowName, args: childArgs });

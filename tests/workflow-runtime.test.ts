@@ -2538,23 +2538,27 @@ return { n, c }`;
 
 test("a deferred child dispatch never races ahead of the parent's post-child call outside a replay (#231 R12)", async () => {
   // Base-runtime ordering contract: awaiting a workflow() child resumes the
-  // parent on the child's own settlement microtask — any wrapper that adds a
-  // tick (a .finally()/.then() on the child promise) lets a microtask-deferred
+  // parent on the child's own settlement microtask — ANY wrapper on the child
+  // promise (.then/.finally) adds a tick and lets a microtask-deferred
   // dispatch inside the child run FIRST, which is result-visible when the
-  // parent's post-child call observes that dispatch's side effect. The gate
-  // frame's post-child call (#231 R12 F1). The gate below releases X after
-  // two promise-adoption hops — calibrated so it lands in the one-tick window
-  // between the base-timing parent resume (C wins: "c-sees-unset") and a
-  // +1-tick resume (X wins: "c-sees-set"); a shorter chain fires before even
-  // the base resume and cannot discriminate. Prefix fresh, a fresh start that
-  // merely DECLARES replay-completed, and a prefix resume must all exhibit
-  // the base order — only an actual replay-completed resume may tick.
+  // parent's post-child call observes that dispatch's side effect (#231 R12
+  // F1). The gate below releases X after two 1-job hops and one adoption hop —
+  // calibrated by mutation so it lands exactly in the one-tick window between
+  // the base-timing resume (C wins: "c-sees-unset") and a +1-tick resume (X
+  // wins: "c-sees-set"); a shorter chain fires before even the base resume
+  // and a longer one survives a +1 wrapper, so neither can discriminate (R13
+  // F1). Promise job counts are spec-pinned, so the window is stable across
+  // engines. Prefix fresh, a fresh start that merely DECLARES
+  // replay-completed, and a prefix resume must all exhibit the base order;
+  // replay-completed with a journal takes its own delay from the zero-entry
+  // sweep, not from a wrapper, and is pinned by the R11 test instead.
   const child = `export const meta = { name: 'kidTick', description: 'k' }
 let release;
 const gate = new Promise((r) => { release = r; });
 const p = (async () => { await gate; const x = await agent('X'); return x; })();
 let c = Promise.resolve();
-c = c.then(() => Promise.resolve());
+c = c.then(() => {});
+c = c.then(() => {});
 c = c.then(() => Promise.resolve());
 c.then(() => { release(); });
 return 'kid-done'`;
@@ -2599,6 +2603,57 @@ return { n, c }`;
     );
     assert.deepEqual(events.slice(0, 1), ["C"], `${label}: C must dispatch first`);
   }
+});
+
+test("a child that re-ran live and then threw still advances the parent's boundary on the error path (#231 R13)", async () => {
+  // The boundary advance must run on BOTH settle paths: a child that re-ran a
+  // call live across a gap and then THREW still invalidated the state this
+  // frame's journaled downstream was computed against. Without the error-path
+  // advance, the parent's post-child call replays that stale result.
+  const child = `export const meta = { name: 'kidThrow', description: 'k' }
+const k = await agent('K');
+if (k === 'K-boom') throw new Error('child-boom');
+return 'kid-ok'`;
+  const parent = `export const meta = { name: 'parThrow', description: 'p' }
+let n;
+try { n = await workflow('kidThrow'); } catch (e) { n = 'caught:' + e.message; }
+const c = await agent('C');
+return { n, c }`;
+
+  // Run 1: K completes normally; K (child frame) and C (parent) both journal.
+  const journal: JournalEntry[] = [];
+  await runWorkflow(parent, {
+    agent: {
+      async run(prompt: string) {
+        return `${prompt}-r`;
+      },
+    },
+    persistLogs: false,
+    runId: "r13-throw",
+    loadSavedWorkflow: (name) => (name === "kidThrow" ? child : undefined),
+    onAgentJournal: (e) => journal.push(e),
+  });
+
+  // Run 2: K's entry is dropped (a gap), so the child re-runs K live, gets
+  // "K-boom", and throws; the parent catches. The child frame's miss must
+  // reach the parent's boundary on the ERROR path too, so C runs live.
+  const calls: string[] = [];
+  const resumed = await runWorkflow(parent, {
+    agent: {
+      async run(prompt: string) {
+        calls.push(prompt);
+        return prompt === "K" ? "K-boom" : `${prompt}-live`;
+      },
+    },
+    persistLogs: false,
+    runId: "r13-throw",
+    loadSavedWorkflow: (name) => (name === "kidThrow" ? child : undefined),
+    resumeJournal: journalMap(journal.filter((e) => e.result !== "K-r")),
+    resumeMode: "replay-completed",
+  });
+  assert.equal(resumed.result.n, "caught:child-boom");
+  assert.equal(resumed.result.c, "C-live", "the error-path advance must force the parent's post-child call live");
+  assert.deepEqual(calls, ["K", "C"], "K re-ran across the gap and C must not replay its stale entry");
 });
 
 test("an unusable cached entry (empty output) is an edit, not a gap, in replay-completed mode", async () => {
