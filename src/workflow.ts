@@ -307,6 +307,15 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    * the child's own misses — see workflowFn's post-child boundary advance.
    */
   onJournalMiss?: () => void;
+  /**
+   * Internal nested-frame plumbing (workflowFn): the parent frame's
+   * precomputed answer to "could a deferred miss in THIS child still change a
+   * replay decision downstream of its return" — a later journaled call of the
+   * parent frame, or another nested frame's entries. Gates the zero-entry
+   * sweep's one-macrotask hold so frames whose misses cannot matter settle
+   * with base (prefix) timing. Never set by hosts.
+   */
+  replaySweepRelevant?: boolean;
   /** Active durable checkpoint response supplied by WorkflowManager.resume(). */
   resumeCheckpoint?: WorkflowCheckpoint;
   /** Persist a durable checkpoint transition before it becomes externally observable. */
@@ -742,6 +751,34 @@ export async function runWorkflow<T = unknown>(
     for (const key of options.resumeJournal.keys()) if (key.startsWith(framePrefix)) return true;
     return false;
   })();
+
+  // Per-run journal reachability, consumed by workflowFn to gate the
+  // zero-entry sweep: the sweep's one-macrotask hold only buys anything when
+  // a deferred miss in the child could still change a replay decision
+  // DOWNSTREAM — a later journaled call of this frame, or another nested
+  // frame's entries (whose journal inheritance depends on this frame's
+  // boundary at ITS dispatch). Scanned once here rather than per workflow()
+  // call; only the top frame ever runs workflowFn (nesting is one level).
+  const journalReach = isTopLevelRun
+    ? (() => {
+        if (options.resumeJournal === undefined) return undefined;
+        let maxOwnIndex = -1;
+        const nestedFrames = new Set<string>();
+        for (const key of options.resumeJournal.keys()) {
+          const sep = key.lastIndexOf(":");
+          if (sep < 0) continue;
+          const index = Number(key.slice(sep + 1));
+          if (!Number.isInteger(index) || index < 0) continue;
+          const frame = key.slice(0, sep);
+          if (frame === runId) {
+            if (index > maxOwnIndex) maxOwnIndex = index;
+          } else if (frame.startsWith(`${runId}-nested`)) {
+            nestedFrames.add(frame);
+          }
+        }
+        return { maxOwnIndex, nestedFrames };
+      })()
+    : undefined;
 
   // Replay eligibility + miss bookkeeping, shared by the agent() and
   // checkpoint() replay sites below so both modes stay consistent across the
@@ -1675,6 +1712,31 @@ export async function runWorkflow<T = unknown>(
       // signal would also fire for a concurrent SIBLING frame's misses,
       // forcing this child's clean post-return calls live (#231 R5 F1).
       let childOwnMisses = 0;
+      // Whether a deferred miss in THIS child could still change a replay
+      // decision downstream of its return: this frame has a journaled call
+      // at a later index, or some OTHER nested frame has entries (its
+      // journal inheritance is decided by this frame's boundary at ITS
+      // dispatch). The child's zero-entry sweep holds one macrotask for
+      // exactly this; when nothing downstream can replay, the hold is pure,
+      // observable cost (#231 R16 empty journal, R17 upstream-only/foreign
+      // journals). Computed here because the child frame can see neither
+      // this frame's callSeq nor its runId. Conservative by construction:
+      // an EARLIER sibling frame's entries also engage it (their keys are
+      // indistinguishable from a later frame's at this point), which at
+      // worst re-adds the hold. Nested-frame own entries do NOT count for
+      // the current child: they drive its internal replay (the frame gate /
+      // full drain), not this frame's boundary.
+      // shared.nestedCallSeq, not shared.depth — see its doc comment: depth
+      // returns to 0 between sequential sibling calls, which would otherwise
+      // mint the same child runId (and hence colliding deltaKeys/event ids)
+      // for two different children.
+      const childRunId = `${runId}-nested${++shared.nestedCallSeq}`;
+      const replaySweepRelevant =
+        prefixIntact &&
+        journalReach !== undefined &&
+        (journalReach.maxOwnIndex >= state.callSeq ||
+          journalReach.nestedFrames.size > 1 ||
+          (journalReach.nestedFrames.size === 1 && !journalReach.nestedFrames.has(childRunId)));
       const childRun = workflowNestingScope.run(nestingDepth + 1, () =>
         runWorkflow(childScript, {
           ...options,
@@ -1685,6 +1747,7 @@ export async function runWorkflow<T = unknown>(
           onJournalMiss: () => {
             childOwnMisses++;
           },
+          replaySweepRelevant,
           args: childArgs,
           sharedRuntime: shared,
           // Propagate the parent's store so nested agents share the same key-value space.
@@ -1694,11 +1757,7 @@ export async function runWorkflow<T = unknown>(
           // Reuse the same runner so named threads span parent/child frames but
           // still die with this one top-level runWorkflow invocation.
           agent: agentRunner,
-          // shared.nestedCallSeq, not shared.depth — see its doc comment: depth
-          // returns to 0 between sequential sibling calls, which would otherwise
-          // mint the same child runId (and hence colliding deltaKeys/event ids)
-          // for two different children.
-          runId: `${runId}-nested${++shared.nestedCallSeq}`,
+          runId: childRunId,
           // The registry is snapshotted ONCE per run (:500): forward the
           // already-loaded registry so a mid-run .md edit can't change
           // agentDefinitionKey for nested-frame calls only (those journal
@@ -2274,12 +2333,7 @@ export async function runWorkflow<T = unknown>(
         options.signal?.removeEventListener("abort", externalWake);
         shared.runFatalController.signal.removeEventListener("abort", fatalWake);
       }
-    } else if (
-      !isTopLevelRun &&
-      resolvedResumeMode === "replay-completed" &&
-      options.resumeJournal !== undefined &&
-      options.resumeJournal.size > 0
-    ) {
+    } else if (!isTopLevelRun && resolvedResumeMode === "replay-completed" && options.replaySweepRelevant) {
       // Zero-entry frame (replayQuiescenceEnabled is false because the journal
       // has no keys for this frame): every call here is a gap noted
       // SYNCHRONOUSLY at dispatch (noteJournalMiss precedes the limiter), so
@@ -2300,12 +2354,15 @@ export async function runWorkflow<T = unknown>(
       // dispatch, so the sweep never waits for a settlement and needs no
       // abort/grace race.
       //
-      // The size guard: with an EMPTY journal no call anywhere can replay
-      // (every replay decision needs a cached entry), so the hold protects
-      // nothing — and its one macrotask is itself observable, delaying this
-      // frame's settlement past a deferred dispatch and flipping the parent's
-      // post-child ordering vs a prefix resume of the same empty journal
-      // (#231 R16). An empty journal therefore falls back to prefix timing.
+      // The relevance guard (replaySweepRelevant, computed at the workflow()
+      // call site): the hold only buys anything when a deferred miss HERE
+      // could still change a replay decision downstream — a later journaled
+      // call of the parent frame, or another nested frame's journal
+      // inheritance. Otherwise the one macrotask is pure, observable cost:
+      // it delays this frame's settlement past a deferred dispatch and
+      // flips the parent's post-child ordering vs a prefix resume (#231 R16
+      // empty journal, R17 upstream-only/foreign journals). Those shapes
+      // fall back to prefix timing.
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
     // Only the top-level frame drains/disposes (see isTopLevelRun) — a nested

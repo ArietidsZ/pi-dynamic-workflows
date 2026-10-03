@@ -2814,6 +2814,84 @@ return { n, c }`;
   );
 });
 
+test("a child whose misses cannot change any downstream replay adds no sweep hold (#231 R17)", async () => {
+  // The R16 gate skipped the zero-entry sweep only for an EMPTY journal. The
+  // hold is just as pure-cost when the journal's entries cannot replay
+  // downstream of the child: here E (index 0) is kept and C (index 1) is
+  // dropped, so the parent prefix is intact at the workflow() call (the
+  // child inherits the journal, unlike the R14 shape) but no entry sits
+  // downstream of it — and a foreign key (no entry for this run tree at
+  // all) is the same root cause. The sweep would change no replay decision
+  // in either case, so its one macrotask must not flip the calibrated race
+  // vs a prefix resume of the same journal. The load-bearing direction
+  // (entries downstream) is pinned by the R11 test.
+  const child = `export const meta = { name: 'kidUp', description: 'k' }
+let release;
+const gate = new Promise((r) => { release = r; });
+const p = (async () => { await gate; const x = await agent('X'); return x; })().catch(() => {});
+let c = Promise.resolve();
+c = c.then(() => {});
+c = c.then(() => {});
+c = c.then(() => Promise.resolve());
+c.then(() => { release(); });
+return 'kid-done'`;
+  const parent = `export const meta = { name: 'parUp', description: 'p' }
+await agent('E');
+const n = await workflow('kidUp');
+const c = await agent('C');
+return { n, c }`;
+
+  const journal: JournalEntry[] = [];
+  await runWorkflow(parent, {
+    agent: {
+      async run(prompt: string) {
+        return prompt === "X" ? "" : `${prompt}-r`;
+      },
+    },
+    persistLogs: false,
+    runId: "r17-up",
+    loadSavedWorkflow: (name) => (name === "kidUp" ? child : undefined),
+    onAgentJournal: (e) => journal.push(e),
+  });
+
+  const scenario = async (label: string, entries: JournalEntry[], expected: string[]) => {
+    const events: string[] = [];
+    let side = "unset";
+    const resumed = await runWorkflow(parent, {
+      agent: {
+        async run(prompt: string) {
+          events.push(prompt);
+          if (prompt === "X") {
+            side = "set";
+            return "x-done";
+          }
+          return prompt === "C" ? `c-sees-${side}` : `${prompt}-live`;
+        },
+      },
+      persistLogs: false,
+      runId: "r17-up",
+      loadSavedWorkflow: (name) => (name === "kidUp" ? child : undefined),
+      resumeJournal: journalMap(entries),
+      resumeMode: "replay-completed",
+    });
+    assert.equal(resumed.result.c, "c-sees-unset", `${label}: a non-load-bearing sweep must not delay the parent`);
+    assert.deepEqual(events, expected, `${label}: the parent's live calls must keep base dispatch order`);
+  };
+
+  // Upstream-only: E's entry stays (index 0) and replays, C's is dropped.
+  await scenario(
+    "upstream-only journal",
+    journal.filter((e) => e.result !== "C-r"),
+    ["C", "X"],
+  );
+  // Foreign: no key of this run tree at all, so E re-runs live too.
+  await scenario(
+    "foreign journal",
+    [{ runId: "foreign-run", index: 0, hash: "x", result: "y" } as JournalEntry],
+    ["E", "C", "X"],
+  );
+});
+
 test("an unusable cached entry (empty output) is an edit, not a gap, in replay-completed mode", async () => {
   // Defensive branch: organic empty output is never journaled, but a legacy or
   // hand-edited journal CAN hold an unusable entry. It must pin firstEdit
