@@ -451,6 +451,166 @@ describe("workflow extension - control tool availability", () => {
     }
   });
 
+  it("registers both tools with deferred exposure, inert on hosts without tool search", async () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-deferred-exposure-"));
+    try {
+      await withFakeHomeAsync(fakeHome, async () => {
+        discardWorkflowRuntime(process.cwd());
+        const registeredTools: Array<{ name: string; exposure?: string }> = [];
+        const activeTools = ["bash", "read"];
+        const handlers: Record<string, Array<(...args: any[]) => any>> = {};
+        const pi = {
+          registerTool: (tool: { name: string; exposure?: string }) => registeredTools.push(tool),
+          registerCommand: () => {},
+          getCommands: () => [],
+          on: (event: string, handler: (...args: any[]) => any) => {
+            if (!handlers[event]) handlers[event] = [];
+            handlers[event].push(handler);
+          },
+          getActiveTools: () => [...activeTools],
+          setActiveTools: (tools: string[]) => {
+            activeTools.splice(0, activeTools.length, ...tools);
+          },
+          sendMessage: () => {},
+        } as unknown as ExtensionAPI;
+        const { default: installExtension } = await import("../src/pi-extension.js");
+        installExtension(pi);
+
+        assert.deepEqual(
+          registeredTools.slice(0, 2).map((tool) => [tool.name, tool.exposure]),
+          [
+            ["workflow", "deferred"],
+            ["workflow_control", "deferred"],
+          ],
+          "pi >= 0.99 defers the tools to tool_search; older hosts ignore the field and keep them active",
+        );
+
+        // No active tool_search: session_start must force-activate both, exactly
+        // as it did before deferral existed.
+        handlers.session_start[0](
+          {},
+          {
+            cwd: process.cwd(),
+            model: undefined,
+            modelRegistry: {},
+            sessionManager: { getSessionId: () => "session-deferred" },
+            ui: { setWidget: () => {}, notify: () => {} },
+          },
+        );
+        assert.ok(activeTools.includes("workflow"));
+        assert.ok(activeTools.includes("workflow_control"));
+
+        handlers.session_shutdown?.[0]?.({ reason: "reload" });
+        discardWorkflowRuntime(process.cwd());
+      });
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves the tools deferred when an active tool_search can discover them", async () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-deferred-toolsearch-"));
+    try {
+      await withFakeHomeAsync(fakeHome, async () => {
+        discardWorkflowRuntime(process.cwd());
+        const activeTools = ["bash", "read", "tool_search"];
+        const handlers: Record<string, Array<(...args: any[]) => any>> = {};
+        const pi = {
+          registerTool: () => {},
+          registerCommand: () => {},
+          getCommands: () => [],
+          on: (event: string, handler: (...args: any[]) => any) => {
+            if (!handlers[event]) handlers[event] = [];
+            handlers[event].push(handler);
+          },
+          getActiveTools: () => [...activeTools],
+          setActiveTools: (tools: string[]) => {
+            activeTools.splice(0, activeTools.length, ...tools);
+          },
+          sendMessage: () => {},
+        } as unknown as ExtensionAPI;
+        const { default: installExtension } = await import("../src/pi-extension.js");
+        installExtension(pi);
+
+        handlers.session_start[0](
+          {},
+          {
+            cwd: process.cwd(),
+            model: undefined,
+            modelRegistry: {},
+            sessionManager: { getSessionId: () => "session-toolsearch" },
+            ui: { setWidget: () => {}, notify: () => {} },
+          },
+        );
+        assert.equal(activeTools.includes("workflow"), false, "searchable tools stay deferred (prompt relief)");
+        assert.equal(activeTools.includes("workflow_control"), false, "searchable tools stay deferred (prompt relief)");
+
+        handlers.session_shutdown?.[0]?.({ reason: "reload" });
+        discardWorkflowRuntime(process.cwd());
+      });
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  it("activates the control tool (only) when a run starts or resumes while deferred", async () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-deferred-liverun-"));
+    try {
+      await withFakeHomeAsync(fakeHome, async () => {
+        discardWorkflowRuntime(process.cwd());
+        const activeTools = ["bash", "read", "tool_search"];
+        const setCalls: string[][] = [];
+        const handlers: Record<string, Array<(...args: any[]) => any>> = {};
+        const pi = {
+          registerTool: () => {},
+          registerCommand: () => {},
+          getCommands: () => [],
+          on: (event: string, handler: (...args: any[]) => any) => {
+            if (!handlers[event]) handlers[event] = [];
+            handlers[event].push(handler);
+          },
+          getActiveTools: () => [...activeTools],
+          setActiveTools: (tools: string[]) => {
+            setCalls.push([...tools]);
+            activeTools.splice(0, activeTools.length, ...tools);
+          },
+          sendMessage: () => {},
+        } as unknown as ExtensionAPI;
+        const { default: installExtension } = await import("../src/pi-extension.js");
+        installExtension(pi);
+        handlers.session_start[0](
+          {},
+          {
+            cwd: process.cwd(),
+            model: undefined,
+            modelRegistry: {},
+            sessionManager: { getSessionId: () => "session-liverun" },
+            ui: { setWidget: () => {}, notify: () => {} },
+          },
+        );
+        assert.equal(setCalls.length, 0, "tool_search present: session_start changed nothing");
+
+        // Reach the live manager through the reload-staging pattern (shutdown
+        // disposes the usage-limit scheduler, so only the activation listener
+        // remains on these events).
+        handlers.session_shutdown?.[0]?.({ reason: "reload" });
+        const staged = takeWorkflowRuntime(process.cwd());
+        assert.ok(staged);
+        staged.manager.emit("started", { runId: "run-1" });
+        assert.ok(activeTools.includes("workflow_control"), "a live run makes steering reachable without a search");
+        assert.equal(activeTools.includes("workflow"), false, "the workflow tool itself stays deferred");
+
+        const callsAfterStart = setCalls.length;
+        staged.manager.emit("resumed", { runId: "run-1" });
+        assert.equal(setCalls.length, callsAfterStart, "already active: no redundant loadout change");
+
+        discardWorkflowRuntime(process.cwd());
+      });
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
   it("hands the live runtime across in-process session replacement when the destination is safe", async () => {
     const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-control-extension-replace-"));
     const sessionDir = mkdtempSync(join(tmpdir(), "pi-dw-session-files-"));
