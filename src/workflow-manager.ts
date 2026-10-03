@@ -28,6 +28,7 @@ import {
   type RunPersistence,
   type RunStatus,
   sanitizeAutoResumeAttempts,
+  sanitizeResumeMode,
   settleInterruptedPersistedAgents,
   settleNonTerminalPersistedAgents,
   terminalRunInterruptCause,
@@ -40,6 +41,7 @@ import {
   parseWorkflowScript,
   runWorkflow,
   type WorkflowCheckpoint,
+  type WorkflowResumeMode,
   type WorkflowRunResult,
 } from "./workflow.js";
 
@@ -135,6 +137,13 @@ export interface ManagedRun {
    * recordAutoResumeAttempts(); read on cold start by the scheduler.
    */
   autoResumeAttempts?: number;
+  /**
+   * Journal replay policy for this run's resumes (see ExecOptions.resumeMode).
+   * Set by resume() from the explicit option or the persisted record and
+   * re-persisted on every write, so later resumes keep the chosen policy
+   * unless they override it. Undefined means "prefix" (default).
+   */
+  resumeMode?: WorkflowResumeMode;
   /**
    * A user-requested lifecycle transition that aborted this exact execution.
    *
@@ -260,10 +269,11 @@ export interface ExecOptions {
   resumeCheckpoint?: WorkflowCheckpoint;
   /**
    * Journal replay policy for a resumed execution — see
-   * WorkflowRunOptions.resumeMode in workflow.ts. Per-execution (not persisted):
-   * each resume() call picks; omit keeps "prefix".
+   * WorkflowRunOptions.resumeMode in workflow.ts. Only resume() passes one; an
+   * explicit choice is persisted on the run record so subsequent resumes keep
+   * it. Omit to keep the run's persisted policy (default "prefix").
    */
-  resumeMode?: "prefix" | "replay-completed";
+  resumeMode?: WorkflowResumeMode;
 
   /** Cap on total agents for this run. */
   maxAgents?: number;
@@ -328,10 +338,12 @@ export interface WorkflowResumeOptions {
    * "replay-completed" opts this resume into replaying completed journaled
    * calls across never-completed gaps (e.g. a parallel() fan-out paused
    * mid-flight), instead of re-running every call after the first gap. A
-   * changed call still re-runs its whole suffix. Omit keeps "prefix". See
-   * WorkflowRunOptions.resumeMode in workflow.ts for the store-staleness caveat.
+   * changed call still re-runs its whole suffix. An explicit choice is
+   * persisted on the run and kept by later resumes; omit to keep the run's
+   * persisted policy (default "prefix"). See WorkflowRunOptions.resumeMode in
+   * workflow.ts for the batch scoping and store-staleness caveat.
    */
-  resumeMode?: "prefix" | "replay-completed";
+  resumeMode?: WorkflowResumeMode;
 }
 
 export interface WorkflowManagerOptions {
@@ -1670,6 +1682,9 @@ export class WorkflowManager extends EventEmitter {
         // The scheduler's backoff counter — must round-trip or restarts reset
         // the give-up cap (#207).
         autoResumeAttempts: managed.autoResumeAttempts,
+        // The resume-chosen journal replay policy — must round-trip or a cold
+        // resume silently falls back to "prefix" and re-spends the gap suffix.
+        resumeMode: managed.resumeMode,
         // Start-time execution context, re-read by resume() (see ManagedRun).
         tokenBudget: managed.tokenBudget,
         toolset: managed.toolset,
@@ -2085,6 +2100,11 @@ export class WorkflowManager extends EventEmitter {
       // Same for the usage-limit backoff counter — it must survive manager
       // persists and process restarts or the give-up cap resets (#207).
       autoResumeAttempts: sanitizeAutoResumeAttempts(persisted.autoResumeAttempts),
+      // Journal replay policy: an explicit choice wins and persistRun() writes
+      // it below; otherwise the run keeps its previously chosen policy so a
+      // cold resume (e.g. workflow_control after a restart) replays the same
+      // way the resume that picked the policy did.
+      resumeMode: opts?.resumeMode ?? sanitizeResumeMode(persisted.resumeMode),
       // Restore start-time execution context: the budget the run started with
       // (legacy runs without one resume unbudgeted — never re-apply the current
       // default to a run that predates it) and the toolset tag executeRun
@@ -2174,7 +2194,7 @@ export class WorkflowManager extends EventEmitter {
     const execution = this.executeRun(managed, script, args, {
       resumeJournal,
       resumeCheckpoint: resumeCheckpoint?.status === "resuming" ? resumeCheckpoint : undefined,
-      resumeMode: opts?.resumeMode,
+      resumeMode: managed.resumeMode,
       initialTokenUsage: priorTokenUsage,
       // Adopt the persisted phase sub-budget baselines so a phase ceiling
       // holds cumulatively across this resume (audit2 #4).

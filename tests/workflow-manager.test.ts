@@ -581,6 +581,74 @@ test(
 );
 
 test(
+  "a resumeMode choice persists on the run: a later resume keeps it without being told (#231)",
+  withTempCwd(async (cwd) => {
+    const attempts = new Map<string, number>();
+    let markFirstStarted: () => void = () => {};
+    const firstStarted = new Promise<void>((resolve) => {
+      markFirstStarted = resolve;
+    });
+    let markSecondStarted: () => void = () => {};
+    const secondStarted = new Promise<void>((resolve) => {
+      markSecondStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt, options) {
+          options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+          const attempt = (attempts.get(prompt) ?? 0) + 1;
+          attempts.set(prompt, attempt);
+          if (prompt === "p0" && attempt <= 2) {
+            // Attempts 1 and 2 die on a pause abort without journaling, so the
+            // gap survives the first resume; attempt 3 completes.
+            if (attempt === 1) markFirstStarted();
+            else markSecondStarted();
+            await new Promise<void>((_resolve, reject) => {
+              options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+            });
+          }
+          return `${prompt}-done`;
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    const { runId, promise } = manager.startInBackground(threeParallelScript);
+    promise.catch(() => {});
+    await firstStarted;
+    for (let i = 0; i < 2000; i++) {
+      if ((manager.getPersistence().load(runId)?.journal?.length ?? 0) >= 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(manager.pause(runId), true);
+
+    // The first resume picks replay-completed, then pauses again mid-gap-retry.
+    assert.equal(await manager.resume(runId, { resumeMode: "replay-completed" }), true);
+    await secondStarted;
+    assert.equal(manager.pause(runId), true);
+    assert.equal(
+      manager.getPersistence().load(runId)?.resumeMode,
+      "replay-completed",
+      "the explicit choice is written to the run record",
+    );
+
+    // The second resume passes nothing: the persisted policy must apply, or
+    // the completed siblings would re-run under the prefix fallback.
+    assert.equal(await manager.resume(runId), true);
+    for (let i = 0; i < 2000 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+
+    const persisted = manager.getPersistence().load(runId);
+    assert.equal(persisted?.status, "completed");
+    assert.equal(attempts.get("p0"), 3, "the gap call re-ran on every resume");
+    assert.equal(attempts.get("p1"), 1, "the persisted replay-completed policy replays sibling p1 again");
+    assert.equal(attempts.get("p2"), 1, "the persisted replay-completed policy replays sibling p2 again");
+  }),
+);
+
+test(
   "resume keeps historical agent session metadata when the edited script fails to parse (#206)",
   withTempCwd(async (cwd) => {
     const agent = fakeAgent();

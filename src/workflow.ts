@@ -62,6 +62,9 @@ export interface WorkflowMeta {
   model?: string;
 }
 
+/** Journal replay policy for a resumed run — see WorkflowRunOptions.resumeMode. */
+export type WorkflowResumeMode = "prefix" | "replay-completed";
+
 /** One cached agent/checkpoint result, keyed by its deterministic workflow call identity. */
 export interface JournalEntry {
   index: number;
@@ -253,17 +256,20 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   /**
    * Journal replay policy for a resumed run. "prefix" (default): longest-
    * unchanged-prefix — the first call that misses the journal (changed, new,
-   * or never completed) and every later call run live. "replay-completed": a
-   * never-completed gap (no journal entry — e.g. a call paused mid-flight
-   * inside a parallel() fan-out) no longer forces its completed successors to
-   * re-run; every call whose hash still matches its journal entry replays up
-   * to the first CHANGED call, which still invalidates its whole suffix in
-   * both modes. Opt in per resume when re-spending completed parallel
-   * siblings is worse than the caveat: dependencies that flow through the
-   * shared store (not prompts) can replay stale values across a re-run gap,
-   * because no hash observes store reads.
+   * or never completed) and every later call run live. "replay-completed":
+   * an EXISTING-but-unusable entry (changed hash, empty cached result) still
+   * ends replay for its whole suffix, but a never-completed gap (no journal
+   * entry — e.g. a call paused mid-flight inside a parallel() fan-out) only
+   * ends replay for its SEQUENTIAL downstream: completed calls dispatched by
+   * the same parallel()/pipeline() batch as the gap still replay, because
+   * fan-out siblings are concurrent with the gap — their prompts were fixed
+   * at dispatch, before the gap call could have produced anything. The gap
+   * position also hides prompt edits (no journaled hash to compare against),
+   * which is exactly why downstream-of-gap calls must re-run live. Caveat:
+   * siblings that coordinated with the gap call through the shared store or
+   * the filesystem can replay stale values — no hash observes those channels.
    */
-  resumeMode?: "prefix" | "replay-completed";
+  resumeMode?: WorkflowResumeMode;
   /** Called after each live agent completes so the caller can persist the journal. */
   onAgentJournal?: (entry: JournalEntry) => void;
   /** Active durable checkpoint response supplied by WorkflowManager.resume(). */
@@ -525,15 +531,23 @@ interface RuntimeState {
    * Index of the first call whose journal entry EXISTS but is unusable (hash
    * changed, or an unusable cached result such as empty output) — the edit
    * boundary. Differs from firstMiss only at a gap (no journal entry at all:
-   * the call never completed, e.g. paused mid-flight), which pins firstMiss
-   * but not firstEdit. Only "replay-completed" resume mode reads this field:
-   * there a completed call after a gap still replays (callIndex < firstEdit),
-   * while a changed call invalidates its whole suffix exactly like prefix
-   * mode. A positional script edit (insert/remove/reorder) still surfaces as
+   * the call never completed), which pins firstMiss but not firstEdit. Only
+   * "replay-completed" resume mode reads this field: there, replay ends at
+   * the first edit everywhere, while gaps are handled per-call via `gaps`
+   * below. A positional script edit (insert/remove/reorder) still surfaces as
    * an EXISTING entry with a mismatched hash at the shifted indexes, i.e. as
-   * an edit — pure gaps only ever mean "nothing completed at this position".
+   * an edit.
    */
   firstEdit: number;
+  /**
+   * Never-completed gaps seen so far this execution (no journal entry at that
+   * position), each with the fan-out batch that dispatched it (the
+   * parallel()/pipeline() fanoutScope store, or undefined for a top-level
+   * sequential call). Only "replay-completed" mode reads this: a gap shadows
+   * every later call EXCEPT siblings sharing its batch — see
+   * journalReplayAllowed for the rationale.
+   */
+  gaps: Array<{ index: number; batch: object | undefined }>;
 }
 
 type AnyNode = Node & { [key: string]: any; start: number; end: number };
@@ -636,20 +650,47 @@ export async function runWorkflow<T = unknown>(
     callSeq: 0,
     firstMiss: Number.POSITIVE_INFINITY,
     firstEdit: Number.POSITIVE_INFINITY,
+    gaps: [],
   };
 
-  // Replay boundary + miss bookkeeping, shared by the agent() and checkpoint()
-  // replay sites below so "prefix" and "replay-completed" stay consistent
-  // across both. The boundary is the ONLY thing the mode changes: replay is
-  // free (no usage commits), so post-gap replays cost nothing either way.
-  const journalReplayBoundary = () => (options.resumeMode === "replay-completed" ? state.firstEdit : state.firstMiss);
-  const noteJournalMiss = (missedIndex: number, entry: JournalEntry | null | undefined) => {
+  // An out-of-schema caller (plain JS, or a typo like "replay_completed")
+  // must not silently get prefix semantics — warn once, then fall back.
+  const requestedResumeMode = options.resumeMode as string | undefined;
+  const resolvedResumeMode: WorkflowResumeMode =
+    requestedResumeMode === "replay-completed" || requestedResumeMode === "prefix" ? requestedResumeMode : "prefix";
+  if (requestedResumeMode !== undefined && requestedResumeMode !== resolvedResumeMode) {
+    options.onLog?.(`ignoring invalid resumeMode (${JSON.stringify(requestedResumeMode)}); using "prefix"`);
+  }
+
+  // Replay eligibility + miss bookkeeping, shared by the agent() and
+  // checkpoint() replay sites below so both modes stay consistent across the
+  // two. "prefix" (default): replay while index < firstMiss — the first miss
+  // of ANY kind ends replay. "replay-completed": replay while index <
+  // firstEdit (a changed/unusable EXISTING entry ends replay everywhere) AND
+  // the call is not in a gap's shadow. A gap shadows every later call EXCEPT
+  // siblings dispatched by the SAME parallel()/pipeline() batch: fan-out
+  // siblings were concurrent with the gap call in the original run — their
+  // prompts were fixed at dispatch, before the gap call could have produced
+  // anything — so replaying them cannot serve a result derived from the gap
+  // call's (re-run) output. Sequential downstream calls have no such
+  // guarantee, and the gap position also hides prompt EDITS (there is no
+  // journaled hash to compare against), so they must re-run live. Top-level
+  // calls have no batch (undefined), and a batch-less gap therefore shadows
+  // everything after it.
+  const isGapShadowed = (index: number, batch: object | undefined) =>
+    state.gaps.some((gap) => gap.index < index && (gap.batch === undefined || gap.batch !== batch));
+  const journalReplayAllowed = (index: number, batch: object | undefined) =>
+    resolvedResumeMode === "replay-completed"
+      ? index < state.firstEdit && !isGapShadowed(index, batch)
+      : index < state.firstMiss;
+  const noteJournalMiss = (missedIndex: number, entry: JournalEntry | null | undefined, batch: object | undefined) => {
     state.firstMiss = Math.min(state.firstMiss, missedIndex);
     // An entry that EXISTS but is unusable (changed hash, empty cached result)
     // is an edit: its whole suffix runs live in every mode. A gap (no entry —
-    // the call never completed) only ends the unchanged prefix;
-    // "replay-completed" mode lets later completed calls replay across it.
+    // the call never completed) ends the unchanged prefix and shadows its
+    // sequential downstream; same-batch siblings may still replay across it.
     if (entry != null) state.firstEdit = Math.min(state.firstEdit, missedIndex);
+    else state.gaps.push({ index: missedIndex, batch });
   };
 
   const agentRunner = options.agent ?? new WorkflowAgent(options);
@@ -967,14 +1008,14 @@ export async function runWorkflow<T = unknown>(
     // calls throw.)
     shared.agentCount++;
     const label = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount);
-    // Resume replay: a cached result replays only while this call's index is
-    // before the mode's replay boundary (see journalReplayBoundary). "prefix"
-    // mode (default): the boundary is the first miss of ANY kind — once a call
-    // misses, it AND everything after run live (matching Claude Code's
-    // contract), so an edited upstream call never leaves stale downstream
-    // results served from the journal. "replay-completed" mode: the boundary
-    // is the first EDIT — a never-completed gap no longer forces completed
-    // later calls to re-run.
+    // Resume replay: a cached result replays only while journalReplayAllowed
+    // holds for this call. "prefix" mode (default): replay ends at the first
+    // miss of ANY kind — once a call misses, it AND everything after run live
+    // (matching Claude Code's contract), so an edited upstream call never
+    // leaves stale downstream results served from the journal.
+    // "replay-completed" mode: replay ends at the first EDIT everywhere, and
+    // a never-completed gap ends it only for the gap's sequential downstream
+    // — completed siblings in the gap's own fan-out batch still replay.
     // Namespaced the same way as SharedStore's deltaKey (deltaKey IS this
     // exact `${runId}:${callIndex}` string) so a nested workflow()'s
     // callIndex-0 can never accidentally replay the parent's callIndex-0
@@ -983,7 +1024,7 @@ export async function runWorkflow<T = unknown>(
     const cached = agentOptions.thread ? undefined : options.resumeJournal?.get(deltaKey);
     const hashMatches = cached != null && cached.hash === callHash;
     const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
-    if (!shared.resumeBarrierReached && hashMatches && !cachedEmptyOutput && callIndex < journalReplayBoundary()) {
+    if (!shared.resumeBarrierReached && hashMatches && !cachedEmptyOutput && journalReplayAllowed(callIndex, batch)) {
       // Replay preserves the journaled model and historical session identity.
       const replayModel = cached.model ?? displayModel;
       options.onAgentStart?.({
@@ -1009,10 +1050,10 @@ export async function runWorkflow<T = unknown>(
       return cached.result;
     }
     // A genuine miss (no journal entry, or the hash changed, or an unusable
-    // cached result) marks where replay ends for this mode — see
+    // cached result) marks where replay ends for this call's successors — see
     // noteJournalMiss for the gap-vs-edit distinction.
     if (!hashMatches || cachedEmptyOutput) {
-      noteJournalMiss(callIndex, cached);
+      noteJournalMiss(callIndex, cached, batch);
     }
 
     // Budget gates, deliberately AFTER the replay lookup: a journaled cache hit
@@ -1453,30 +1494,29 @@ export async function runWorkflow<T = unknown>(
     const childScript = resolved ?? String(nameOrScript);
     const workflowName = String(nameOrScript);
     options.onRuntimeEvent?.({ type: "workflow", stage: "start", name: workflowName, args: childArgs });
+    const workflowBatch = fanoutScope.getStore();
     try {
-      // Propagate the resumeJournal into the child frame ONLY while the
-      // parent's own replay boundary is still intact at the moment of this
-      // workflow() call. In "prefix" mode that boundary is the first miss of
-      // any kind (state.firstMiss === Infinity, i.e. every parent
-      // agent()/checkpoint() call BEFORE this one was a cache hit). In
-      // "replay-completed" mode it is the first EDIT (state.firstEdit): a
-      // never-completed gap wrote nothing in the original run, so the child's
-      // journaled entries — also computed without any writes from that call —
-      // stay as valid as they are for the parent's own post-gap calls.
-      // Namespacing alone (see JournalEntry.runId) is NOT sufficient for the
-      // edit case: SharedStore content itself is not part of
-      // any call's hash, so a cached child result was computed against
-      // whatever store state the UPSTREAM parent calls had written at the
-      // time it originally ran live. If an upstream parent call is edited and
-      // re-runs live, it may write different store
-      // values than it did originally — a child cached under the OLD store
-      // state would then be replaying a result that's stale with respect to
-      // the NEW live state, even though the child's own hash still matches.
-      // Once anything upstream in the parent has been edited, cut
-      // the child off from the journal entirely so it runs fully live.
+      // Propagate the resumeJournal into the child frame ONLY while replay is
+      // still open at the moment of this workflow() call — the same rule the
+      // frame's own calls use: in "prefix" mode, no miss of any kind yet
+      // (state.firstMiss === Infinity); in "replay-completed" mode, no EDIT
+      // yet (state.firstEdit === Infinity) and no gap shadowing this call.
+      // Namespacing alone (see JournalEntry.runId) is NOT sufficient:
+      // SharedStore content itself is not part of any call's hash, so a
+      // cached child result was computed against whatever store state the
+      // UPSTREAM parent calls had written at the time it originally ran
+      // live. A parent call that re-runs live (an edit — or a gap whose
+      // re-run this child would follow sequentially) may write different
+      // store values than it did originally, and a child cached under the
+      // OLD store state would then replay a result stale with respect to the
+      // NEW live state, even though the child's own hash still matches. A
+      // gap in the SAME fan-out batch as this workflow() call is the one
+      // safe case: the child originally ran concurrently with it, before the
+      // gap call could have produced anything (same argument as same-batch
+      // sibling replay — see journalReplayAllowed).
       const prefixIntact =
-        options.resumeMode === "replay-completed"
-          ? state.firstEdit === Number.POSITIVE_INFINITY
+        resolvedResumeMode === "replay-completed"
+          ? state.firstEdit === Number.POSITIVE_INFINITY && !isGapShadowed(state.callSeq, workflowBatch)
           : state.firstMiss === Number.POSITIVE_INFINITY;
       const child = await workflowNestingScope.run(nestingDepth + 1, () =>
         runWorkflow(childScript, {
@@ -1726,6 +1766,7 @@ export async function runWorkflow<T = unknown>(
       shared.seenCheckpointIds.add(durableInput.checkpointId);
     }
     const activeResumeCheckpoint = shared.activeCheckpointResponse;
+    const batch = fanoutScope.getStore();
     const callHash =
       promptText === null
         ? hashWorkflowCheckpoint(durableInput as WorkflowCheckpointInput)
@@ -1738,14 +1779,14 @@ export async function runWorkflow<T = unknown>(
       !shared.resumeBarrierReached &&
       cached != null &&
       cached.hash === callHash &&
-      callIndex < journalReplayBoundary() &&
+      journalReplayAllowed(callIndex, batch) &&
       !replayingActiveCheckpoint
     ) {
       shared.agentCount++;
       return cached.result;
     }
     if (cached == null || cached.hash !== callHash) {
-      noteJournalMiss(callIndex, cached);
+      noteJournalMiss(callIndex, cached, batch);
     }
     shared.agentCount++;
 

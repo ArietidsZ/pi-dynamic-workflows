@@ -1345,30 +1345,56 @@ test("resume in parallel(): editing one thunk re-runs that index and every later
   assert.equal(second.state.calls, 2, "changed thunk (index 1) + later index (2) re-run; index 0 cached");
 });
 
+/** Fake agent whose gapPrompt call fails every attempt with empty output, so
+ * that call is never journaled — an organic never-completed gap (#231). */
+function gappingAgent(gapPrompt: string) {
+  const state = { calls: 0 };
+  return {
+    state,
+    runner: {
+      async run(prompt: string) {
+        state.calls++;
+        if (prompt === gapPrompt) return "";
+        return `ran:${prompt}`;
+      },
+    },
+  };
+}
+
+function journalMap(journal: JournalEntry[]) {
+  return new Map(journal.map((e) => [`${e.runId}:${e.index}`, e] as const));
+}
+
 const gapParallelScript = `export const meta = { name: 'gap_par', description: 'gap resume' }
 const xs = await parallel([
-  () => agent('a', { label: 'p0' }),
+  () => agent('gap-call', { label: 'p0' }),
   () => agent('b', { label: 'p1' }),
   () => agent('c', { label: 'p2' }),
 ])
 return xs`;
 
 test("replay-completed resume replays completed parallel siblings across a gap (#231)", async () => {
-  // The #231 scenario: a parallel() fan-out paused with one call un-journaled
-  // (paused mid-flight → gap at index 0) and both siblings completed. Default
-  // prefix mode re-runs ALL THREE; replay-completed re-runs only the gap.
-  const first = countingAgent();
+  // The #231 scenario: a parallel() fan-out where one call never journaled
+  // (every attempt failed recoverably → organic gap at index 0) and both
+  // siblings completed. Default prefix mode re-runs ALL THREE; replay-completed
+  // re-runs only the gap.
+  const first = gappingAgent("gap-call");
   const journal: JournalEntry[] = [];
-  await runWorkflow(gapParallelScript, {
+  const initial = await runWorkflow<Array<string | null>>(gapParallelScript, {
     agent: first.runner,
     persistLogs: false,
     runId: "gap-run",
     onAgentJournal: (e) => journal.push(e),
   });
   assert.equal(first.state.calls, 3);
+  assert.deepEqual(
+    journal.map((e) => e.index).sort((a, b) => a - b),
+    [1, 2],
+    "the empty-output call journals nothing — an organic gap at index 0",
+  );
+  assert.equal(initial.result?.[0], null, "the original run saw null where the gap's re-run will see a result");
 
-  // Simulate the pause: the index-0 call never journaled; its siblings did.
-  const gapJournal = new Map(journal.filter((e) => e.index !== 0).map((e) => [`${e.runId}:${e.index}`, e] as const));
+  const resumeJournal = journalMap(journal);
 
   // Default (prefix) keeps the existing contract: the gap at index 0 ends the
   // replayable prefix, so all three calls run live.
@@ -1377,7 +1403,7 @@ test("replay-completed resume replays completed parallel siblings across a gap (
     agent: prefixRun.runner,
     persistLogs: false,
     runId: "gap-run",
-    resumeJournal: gapJournal,
+    resumeJournal,
   });
   assert.equal(prefixRun.state.calls, 3, "prefix mode: a gap at index 0 still re-runs the whole fan-out");
 
@@ -1388,11 +1414,11 @@ test("replay-completed resume replays completed parallel siblings across a gap (
     agent: replayRun.runner,
     persistLogs: false,
     runId: "gap-run",
-    resumeJournal: gapJournal,
+    resumeJournal,
     resumeMode: "replay-completed",
   });
   assert.equal(replayRun.state.calls, 1, "replay-completed: only the never-completed gap re-runs");
-  assert.deepEqual(resumed.result, ["ran:a", "ran:b", "ran:c"]);
+  assert.deepEqual(resumed.result, ["ran:gap-call", "ran:b", "ran:c"]);
 });
 
 test("replay-completed resume still re-runs an edited call and its whole suffix", async () => {
@@ -1418,39 +1444,154 @@ test("replay-completed resume still re-runs an edited call and its whole suffix"
 });
 
 test("replay-completed resume replays between a gap and a later edit", async () => {
-  const first = countingAgent();
+  const script = `export const meta = { name: 'gap_edit', description: 'gap+edit' }
+const xs = await parallel([
+  () => agent('gap-call', { label: 'p0' }),
+  () => agent('B', { label: 'p1' }),
+  () => agent('C', { label: 'p2' }),
+])
+return xs`;
+  const first = gappingAgent("gap-call");
   const journal: JournalEntry[] = [];
-  await runWorkflow(threeCallScript, {
+  await runWorkflow(script, {
     agent: first.runner,
     persistLogs: false,
     runId: "gap-edit-run",
     onAgentJournal: (e) => journal.push(e),
   });
 
-  // Gap at index 0 (never journaled) AND an edit at index 2: index 1 is a
-  // completed, unchanged call sitting between them — it must replay.
-  const gapJournal = new Map(journal.filter((e) => e.index !== 0).map((e) => [`${e.runId}:${e.index}`, e] as const));
-  const editedScript = threeCallScript.replace("'C'", "'C-edited'");
+  // Organic gap at index 0 AND an edit at index 2: index 1 is a completed,
+  // unchanged call in the gap's own fan-out batch — it must replay.
+  const editedScript = script.replace("'C'", "'C-edited'");
   const second = countingAgent();
-  const resumed = await runWorkflow<{ a: string; b: string; c: string }>(editedScript, {
+  const resumed = await runWorkflow<string[]>(editedScript, {
     agent: second.runner,
     persistLogs: false,
     runId: "gap-edit-run",
-    resumeJournal: gapJournal,
+    resumeJournal: journalMap(journal),
     resumeMode: "replay-completed",
   });
-  assert.equal(second.state.calls, 2, "gap (0) + edit (2) run live; the completed middle call (1) replays");
-  assert.equal(resumed.result.b, "ran:B", "the replayed middle result comes from the journal");
+  assert.equal(second.state.calls, 2, "gap (0) + edit (2) run live; the completed same-batch middle call (1) replays");
+  assert.equal(resumed.result?.[1], "ran:B", "the replayed middle result comes from the journal");
 });
 
-test("replay-completed resume keeps the nested workflow journal across a parent gap", async () => {
+test("replay-completed resume re-runs sequential calls after a fan-out gap (stale-replay guard, #231)", async () => {
+  // The gap's re-run returns a REAL result the original run never had (the
+  // original saw null), so every call that ran after it must re-run — a
+  // cached downstream result was computed against the old partial state and
+  // nothing hashes the difference. Siblings inside the gap's own fan-out
+  // batch ran concurrently with it and replay safely; a SEQUENTIAL
+  // downstream call does not.
+  const script = `export const meta = { name: 'gap_seq', description: 'gap+sequential' }
+const xs = await parallel([
+  () => agent('gap-call', { label: 'p0' }),
+  () => agent('b', { label: 'p1' }),
+])
+const s = await agent('summarize', { label: 'sum' })
+return { xs, s }`;
+  const first = gappingAgent("gap-call");
+  const journal: JournalEntry[] = [];
+  const initial = await runWorkflow<{ xs: Array<string | null>; s: string }>(script, {
+    agent: first.runner,
+    persistLogs: false,
+    runId: "gap-seq-run",
+    onAgentJournal: (e) => journal.push(e),
+  });
+  assert.equal(initial.result?.xs[0], null);
+  assert.deepEqual(
+    journal.map((e) => e.index).sort((a, b) => a - b),
+    [1, 2],
+    "the gap journals nothing; the same-batch sibling and the sequential call do",
+  );
+
+  const second = countingAgent();
+  const resumed = await runWorkflow<{ xs: string[]; s: string }>(script, {
+    agent: second.runner,
+    persistLogs: false,
+    runId: "gap-seq-run",
+    resumeJournal: journalMap(journal),
+    resumeMode: "replay-completed",
+  });
+  assert.equal(second.state.calls, 2, "the gap re-runs AND the sequential downstream call re-runs with it");
+  assert.deepEqual(resumed.result?.xs, ["ran:gap-call", "ran:b"], "the same-batch sibling still replays");
+  assert.equal(resumed.result?.s, "ran:summarize", "the downstream call re-computed against the new state");
+});
+
+test("replay-completed resume: a top-level (sequential) gap shadows every later call", async () => {
+  // A gap outside any fan-out batch has no concurrency relationship with
+  // later calls — they ran strictly after it — so replay-completed gives
+  // them no immunity: the whole suffix re-runs, exactly like prefix mode.
+  const script = `export const meta = { name: 'seq_gap', description: 'sequential gap' }
+const a = await agent('gap-call', { label: 'a' })
+const b = await agent('b', { label: 'b' })
+return { a, b }`;
+  const first = gappingAgent("gap-call");
+  const journal: JournalEntry[] = [];
+  await runWorkflow(script, {
+    agent: first.runner,
+    persistLogs: false,
+    runId: "seq-gap-run",
+    onAgentJournal: (e) => journal.push(e),
+  });
+
+  const second = countingAgent();
+  await runWorkflow(script, {
+    agent: second.runner,
+    persistLogs: false,
+    runId: "seq-gap-run",
+    resumeJournal: journalMap(journal),
+    resumeMode: "replay-completed",
+  });
+  assert.equal(second.state.calls, 2, "a sequential gap re-runs its whole suffix even in replay-completed mode");
+});
+
+test("replay-completed resume does not replay across a gap into a LATER fan-out batch", async () => {
+  const script = `export const meta = { name: 'two_batches', description: 'two batches' }
+const xs = await parallel([
+  () => agent('gap-call', { label: 'p0' }),
+  () => agent('a1', { label: 'p1' }),
+])
+const ys = await parallel([
+  () => agent('b1', { label: 'p2' }),
+  () => agent('b2', { label: 'p3' }),
+])
+return { xs, ys }`;
+  const first = gappingAgent("gap-call");
+  const journal: JournalEntry[] = [];
+  await runWorkflow(script, {
+    agent: first.runner,
+    persistLogs: false,
+    runId: "two-batch-run",
+    onAgentJournal: (e) => journal.push(e),
+  });
+
+  const second = countingAgent();
+  const resumed = await runWorkflow<{ xs: string[]; ys: string[] }>(script, {
+    agent: second.runner,
+    persistLogs: false,
+    runId: "two-batch-run",
+    resumeJournal: journalMap(journal),
+    resumeMode: "replay-completed",
+  });
+  assert.equal(
+    second.state.calls,
+    3,
+    "the gap (0) and both later-batch calls (2, 3) re-run; the same-batch sibling (1) replays",
+  );
+  assert.deepEqual(resumed.result?.xs, ["ran:gap-call", "ran:a1"]);
+  assert.deepEqual(resumed.result?.ys, ["ran:b1", "ran:b2"]);
+});
+
+test("replay-completed resume keeps the nested journal for a workflow() sibling in the gap's batch", async () => {
   const child = `export const meta = { name: 'kid', description: 'k' }
 return await agent('kid task', { label: 'kid' })`;
   const parent = `export const meta = { name: 'par', description: 'p' }
-const p = await agent('parent task', { label: 'p' })
-const n = await workflow('kid')
-return { p, n }`;
-  const first = countingAgent();
+const [x, n] = await parallel([
+  () => agent('gap-call', { label: 'g' }),
+  () => workflow('kid'),
+])
+return { x, n }`;
+  const first = gappingAgent("gap-call");
   const journal: JournalEntry[] = [];
   await runWorkflow(parent, {
     agent: first.runner,
@@ -1459,38 +1600,59 @@ return { p, n }`;
     loadSavedWorkflow: (name) => (name === "kid" ? child : undefined),
     onAgentJournal: (e) => journal.push(e),
   });
-  assert.equal(first.state.calls, 2);
-
-  // The parent call (nested-gap-run:0) never journaled; the child's call
-  // (nested-gap-run-nested1:0) did. A gap cut the child off from the journal
-  // under prefix mode; replay-completed propagates it (the gap wrote nothing
-  // in the original run, so the child's entry is not store-stale).
-  const gapJournal = new Map(
-    journal
-      .filter((e) => !(e.runId === "nested-gap-run" && e.index === 0))
-      .map((e) => [`${e.runId}:${e.index}`, e] as const),
+  assert.equal(first.state.calls, 2, "the gap attempt + the child's agent");
+  assert.deepEqual(
+    journal.map((e) => `${e.runId}:${e.index}`),
+    ["nested-gap-run-nested1:0"],
+    "only the nested child call journaled",
   );
-  const prefixRun = countingAgent();
-  await runWorkflow(parent, {
-    agent: prefixRun.runner,
-    persistLogs: false,
-    runId: "nested-gap-run",
-    loadSavedWorkflow: (name) => (name === "kid" ? child : undefined),
-    resumeJournal: gapJournal,
-  });
-  assert.equal(prefixRun.state.calls, 2, "prefix mode: a parent gap still cuts the child off from the journal");
 
+  // The workflow() call shares the gap's fan-out batch: the child originally
+  // ran concurrently with the gap call, so its cached result cannot be stale
+  // with respect to the gap's re-run — it replays.
   const replayRun = countingAgent();
-  const resumed = await runWorkflow<{ p: string; n: string }>(parent, {
+  const resumed = await runWorkflow<{ x: string; n: string }>(parent, {
     agent: replayRun.runner,
     persistLogs: false,
     runId: "nested-gap-run",
     loadSavedWorkflow: (name) => (name === "kid" ? child : undefined),
-    resumeJournal: gapJournal,
+    resumeJournal: journalMap(journal),
     resumeMode: "replay-completed",
   });
-  assert.equal(replayRun.state.calls, 1, "replay-completed: only the parent gap re-runs; the nested call replays");
-  assert.equal(resumed.result.n, "ran:kid task", "the nested result replays from the child frame's journal entry");
+  assert.equal(replayRun.state.calls, 1, "only the gap re-runs; the same-batch nested workflow replays its journal");
+  assert.equal(resumed.result?.n, "ran:kid task", "the nested result replays from the child frame's journal entry");
+});
+
+test("replay-completed resume cuts a nested workflow off after a TOP-LEVEL parent gap", async () => {
+  const child = `export const meta = { name: 'kid', description: 'k' }
+return await agent('kid task', { label: 'kid' })`;
+  const parent = `export const meta = { name: 'par', description: 'p' }
+const x = await agent('gap-call', { label: 'g' })
+const n = await workflow('kid')
+return { x, n }`;
+  const first = gappingAgent("gap-call");
+  const journal: JournalEntry[] = [];
+  await runWorkflow(parent, {
+    agent: first.runner,
+    persistLogs: false,
+    runId: "nested-seq-gap-run",
+    loadSavedWorkflow: (name) => (name === "kid" ? child : undefined),
+    onAgentJournal: (e) => journal.push(e),
+  });
+
+  // The workflow() call is sequential top-level, after a top-level gap: it
+  // originally ran after the gap call, so the child's cached result may have
+  // observed the old partial state — the child re-executes live.
+  const replayRun = countingAgent();
+  await runWorkflow<{ x: string; n: string }>(parent, {
+    agent: replayRun.runner,
+    persistLogs: false,
+    runId: "nested-seq-gap-run",
+    loadSavedWorkflow: (name) => (name === "kid" ? child : undefined),
+    resumeJournal: journalMap(journal),
+    resumeMode: "replay-completed",
+  });
+  assert.equal(replayRun.state.calls, 2, "a top-level gap shadows the later workflow() call: the child re-executes");
 });
 
 test("callSeq is deterministic under parallel()", async () => {

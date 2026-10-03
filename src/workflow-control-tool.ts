@@ -40,7 +40,7 @@ const workflowControlSchema = Type.Object(
     resumeMode: Type.Optional(
       Type.Union([Type.Literal("prefix"), Type.Literal("replay-completed")], {
         description:
-          "Journal replay policy. For resume only. prefix (default): the first changed/new/never-completed call and everything after it re-run live. replay-completed: completed calls after a never-completed gap (e.g. a parallel fan-out paused mid-flight) also replay from the journal; a changed call still re-runs its whole suffix.",
+          "Journal replay policy. For resume only. prefix (default): the first changed/new/never-completed call and everything after it re-run live. replay-completed: completed calls also replay across a never-completed gap within the same fan-out batch (e.g. a parallel fan-out paused mid-flight); a changed call still re-runs its whole suffix. An explicit choice persists on the run: later resumes keep it. Store/file-passed results are not hash-checked and can replay stale across a gap.",
       }),
     ),
   },

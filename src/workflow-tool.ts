@@ -15,7 +15,7 @@ import {
   type WorkflowSnapshot,
 } from "./display.js";
 import { WorkflowError, WorkflowErrorCode } from "./errors.js";
-import { parseWorkflowScript, type WorkflowRunResult } from "./workflow.js";
+import { parseWorkflowScript, type WorkflowResumeMode, type WorkflowRunResult } from "./workflow.js";
 import { WorkflowManager } from "./workflow-manager.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
 import { loadWorkflowSettings } from "./workflow-settings.js";
@@ -116,7 +116,7 @@ const workflowToolSchema = Type.Object({
   resumeMode: Type.Optional(
     Type.Union([Type.Literal("prefix"), Type.Literal("replay-completed")], {
       description:
-        "Replay policy with resumeFromRunId. prefix (default): the first changed/new/never-completed call onward re-runs. replay-completed: completed calls also replay across a never-completed gap (paused fan-out); a changed call still re-runs its suffix.",
+        "Replay policy with resumeFromRunId. prefix (default): the first changed/new/never-completed call onward re-runs. replay-completed: completed calls also replay across a never-completed gap within the same fan-out batch (paused fan-out); a changed call still re-runs its suffix. Store/file-passed results are not hash-checked and can replay stale across a gap.",
     }),
   ),
 });
@@ -132,7 +132,7 @@ export type WorkflowToolInput = {
   agentTimeoutMs?: number;
   tokenBudget?: number;
   resumeFromRunId?: string;
-  resumeMode?: "prefix" | "replay-completed";
+  resumeMode?: WorkflowResumeMode;
 };
 
 export interface WorkflowToolOptions {
