@@ -2656,6 +2656,81 @@ return { n, c }`;
   assert.deepEqual(calls, ["K", "C"], "K re-ran across the gap and C must not replay its stale entry");
 });
 
+test("a journal-less child in a replay-completed resume adds no tick to the parent's resume (#231 R14)", async () => {
+  // When the parent's prefix broke BEFORE the workflow() call (E's entry is
+  // dropped), the child frame runs journal-less: no drain and no zero-entry
+  // sweep engage, so a .then/.finally wrapper on the child promise would be
+  // the ONLY delay on this frame's resume — and it is observable: on the
+  // calibrated 2/1 gate it flips the race between the child's deferred
+  // dispatch and this frame's post-child call (#231 R13 F3). Pin the
+  // tick-free timing in this shape too; the R12 gated pair passes every
+  // other test while getting this ordering wrong (R14 M1). The gate chain is
+  // the same one the R12 test calibrates — see its comment for the window.
+  const child = `export const meta = { name: 'kidJL', description: 'k' }
+let release;
+const gate = new Promise((r) => { release = r; });
+const p = (async () => { await gate; const x = await agent('X'); return x; })();
+let c = Promise.resolve();
+c = c.then(() => {});
+c = c.then(() => {});
+c = c.then(() => Promise.resolve());
+c.then(() => { release(); });
+return 'kid-done'`;
+  const parent = `export const meta = { name: 'parJL', description: 'p' }
+await agent('E');
+const n = await workflow('kidJL');
+const c = await agent('C');
+return { n, c }`;
+
+  // Run 1: journal E and C (X's empty result is never journaled).
+  const journal: JournalEntry[] = [];
+  await runWorkflow(parent, {
+    agent: {
+      async run(prompt: string) {
+        return prompt === "X" ? "" : `${prompt}-r`;
+      },
+    },
+    persistLogs: false,
+    runId: "r14-jl",
+    loadSavedWorkflow: (name) => (name === "kidJL" ? child : undefined),
+    onAgentJournal: (e) => journal.push(e),
+  });
+
+  // Run 2: drop E so the parent's prefix is already broken at the workflow()
+  // call and the child inherits no journal. C is live in every timing (E's
+  // gap shadows it), so the ONLY signal is ordering: with base timing C's
+  // runner beats the deferred X; one added tick flips it.
+  const events: string[] = [];
+  let side = "unset";
+  const resumed = await runWorkflow(parent, {
+    agent: {
+      async run(prompt: string) {
+        events.push(prompt);
+        if (prompt === "X") {
+          side = "set";
+          return "x-done";
+        }
+        return prompt === "C" ? `c-sees-${side}` : `${prompt}-live`;
+      },
+    },
+    persistLogs: false,
+    runId: "r14-jl",
+    loadSavedWorkflow: (name) => (name === "kidJL" ? child : undefined),
+    resumeJournal: journalMap(journal.filter((e) => e.result !== "E-r")),
+    resumeMode: "replay-completed",
+  });
+  assert.equal(
+    resumed.result.c,
+    "c-sees-unset",
+    "no wrapper may delay the parent's resume behind the journal-less child",
+  );
+  assert.deepEqual(
+    events,
+    ["E", "C", "X"],
+    "the parent's post-child call must run before the child's deferred dispatch",
+  );
+});
+
 test("an unusable cached entry (empty output) is an edit, not a gap, in replay-completed mode", async () => {
   // Defensive branch: organic empty output is never journaled, but a legacy or
   // hand-edited journal CAN hold an unusable entry. It must pin firstEdit

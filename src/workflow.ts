@@ -1708,11 +1708,12 @@ export async function runWorkflow<T = unknown>(
       // and this frame resuming, and that tick is itself observable — it
       // flips the race between a microtask-deferred dispatch inside the
       // child and this frame's post-child call (#231 R12 F1). No mode
-      // predicate is needed: the miss hook is replay-completed-gated at
-      // noteJournalMiss, so childOwnMisses can only increment where a replay
-      // can actually engage the boundary; elsewhere the advance is a no-op,
-      // and with no journal the boundary is unread, so a fresh start that
-      // merely DECLARED replay-completed stays observably identical to
+      // predicate is needed: in prefix the miss hook never fires (it is
+      // replay-completed-gated at noteJournalMiss), so the advance is a
+      // no-op there; in a fresh start that merely DECLARED replay-completed
+      // the hook DOES fire and the advance does write firstEdit, but with
+      // no journal the boundary is unread — its only read sites require a
+      // cached entry — so the live execution stays observably identical to
       // prefix (invariant: a start-time declaration must not change the live
       // execution).
       const advanceForChildMisses = () => {
