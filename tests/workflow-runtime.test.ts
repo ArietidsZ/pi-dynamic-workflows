@@ -2163,6 +2163,73 @@ return { n, c }`;
   );
 });
 
+test("the quiescence drain waits out a long replayed-call chain before the late gap (#231 R15)", async () => {
+  // The drain shape above with the gap deferred behind TWENTY replayed calls:
+  // each replayed call's cache-hit settle costs microtask hops, so the gap's
+  // dispatch lands dozens of hops after the child frame's return. This pins
+  // why the drain polls on a macrotask — the event loop drains the microtask
+  // queue completely before any timer fires, so a macrotask flush waits out a
+  // replayed chain of ANY length; a bounded N-hop microtask flush passes the
+  // 3-call test above while replaying the parent's post-child call stale
+  // here (R15 MINOR-1).
+  const chain = Array.from({ length: 20 }, (_, i) => `await agent('r${i + 1}')`).join("\n");
+  const child = `export const meta = { name: 'kidLongGap', description: 'kid' }
+const p = parallel([
+  async () => {
+    ${chain}
+    await agent('k-gap')
+  },
+])
+return 'kid-done'`;
+  const parent = `export const meta = { name: 'parLongGap', description: 'p' }
+const n = await workflow('kidLongGap')
+const c = await agent('parent-c')
+return { n, c }`;
+
+  const journal: JournalEntry[] = [];
+  let sideEffect = "stale";
+  await runWorkflow<{ n: string; c: string }>(parent, {
+    agent: {
+      async run(prompt: string) {
+        if (prompt === "k-gap") return "";
+        if (prompt === "parent-c") return `c-for-${sideEffect}`;
+        return `r:${prompt}`;
+      },
+    },
+    persistLogs: false,
+    runId: "r15-long-gap",
+    loadSavedWorkflow: (name) => (name === "kidLongGap" ? child : undefined),
+    onAgentJournal: (e) => journal.push(e),
+  });
+
+  const calls: string[] = [];
+  const resumed = await runWorkflow<{ n: string; c: string }>(parent, {
+    agent: {
+      async run(prompt: string) {
+        calls.push(prompt);
+        if (prompt === "k-gap") {
+          sideEffect = "REAL";
+          return "gap-result";
+        }
+        if (prompt === "parent-c") return `c-for-${sideEffect}`;
+        return `r:${prompt}`;
+      },
+    },
+    persistLogs: false,
+    runId: "r15-long-gap",
+    loadSavedWorkflow: (name) => (name === "kidLongGap" ? child : undefined),
+    resumeJournal: journalMap(journal),
+    resumeMode: "replay-completed",
+  });
+  assert.ok(calls.includes("k-gap"), "the gap itself re-runs live");
+  assert.equal(calls.includes("r1"), false, "the child's completed prefix replays");
+  assert.equal(
+    resumed.result.c,
+    "c-for-REAL",
+    "the drain must still be waiting when the 20-call replay chain reaches the gap",
+  );
+});
+
 test("a late-noted edit in an un-awaited child fan-out still forces the parent's post-child calls live (#231 R6)", async () => {
   // Same late-arrival shape as the gap test above, but the child's last call
   // holds an unusable cached entry (an edit): whole-suffix liveness is the
@@ -2490,14 +2557,27 @@ test("a deferred first dispatch in a zero-entry child frame still advances the p
   // The per-frame gate disengages the full drain when the child frame has no
   // journaled entries — but the frame's FIRST dispatch can be deferred past
   // the frame's return by a microtask bootstrap (here a gate released by a
-  // 2-hop promise chain). Without the one-macrotask sweep, nothing has noted
+  // 100-hop promise chain). Without the one-macrotask sweep, nothing has noted
   // a miss when the parent's post-child finally reads the frame's count, and
-  // the parent's call replays stale — the R6 defect.
+  // the parent's call replays stale — the R6 defect. The chain's length also
+  // pins WHY the sweep uses a macrotask: the event loop drains the microtask
+  // queue completely before any timer fires, so a macrotask waits out a
+  // deferred chain of ANY length — a bounded N-hop microtask flush (N < 100)
+  // would pass a short-chain version of this test while replaying stale here
+  // (#231 R15).
+  const hops = Array.from({ length: 100 }, () => "c = c.then(() => {});").join("\n");
   const child = `export const meta = { name: 'kidLate11', description: 'k' }
 let release;
 const gate = new Promise((r) => { release = r; });
-const p = (async () => { await gate; const x = await agent('X'); return x; })();
-Promise.resolve().then(() => Promise.resolve()).then(() => { release(); });
+// The catch is load-bearing: in run 1 (no sweep) the 100-hop chain outlives
+// the completed run, so the deferred dispatch throws WORKFLOW_ABORTED into
+// this fire-and-forget promise — the base runtime's documented abandonment
+// behavior. Run 2's sweep resolves long after a 100-hop chain, so the
+// dispatch lands in time there and the catch stays unused.
+const p = (async () => { await gate; const x = await agent('X'); return x; })().catch(() => {});
+let c = Promise.resolve();
+${hops}
+c.then(() => { release(); });
 return 'kid-done'`;
   const parent = `export const meta = { name: 'parLate11', description: 'p' }
 const n = await workflow('kidLate11')

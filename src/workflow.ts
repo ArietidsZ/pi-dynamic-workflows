@@ -282,8 +282,14 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    * the same fan-out's synchronous dispatch window as the gap still replay,
    * because those siblings were concurrent with the gap — their prompts were
    * fixed at dispatch, before the gap call could have produced anything.
-   * Calls dispatched after an await in a thunk and every call inside a nested
-   * workflow() frame are NOT in that window and count as sequential. The gap
+   * Calls dispatched after an await in a thunk are NOT in that window and
+   * count as sequential. A nested workflow() frame's calls are likewise
+   * sequential relative to the PARENT frame's windows — the inherited batch
+   * carries the parent's frame tag — except the child's OWN fan-out, whose
+   * same-window cohort replays across a gap internal to that child. The
+   * workflow() call itself follows the same dispatch-timing rule as any
+   * other call: dispatched in the gap's own window it replays with its
+   * child journal; dispatched later it re-executes live. The gap
    * position also hides prompt edits (no journaled hash to compare against),
    * which is exactly why downstream-of-gap calls must re-run live. A nested
    * frame's internal gap or edit likewise ends replay for the parent frame's
@@ -576,7 +582,11 @@ interface RuntimeState {
    * parallel()/pipeline() batch object, but ONLY when the call was dispatched
    * inside that fan-out's synchronous dispatch window (before any sibling
    * could have settled); undefined otherwise (top-level calls, calls after an
-   * await in a thunk, every call inside a nested workflow() frame). Only
+   * await in a thunk, and calls that sampled an ANCESTOR frame's window — a
+   * nested workflow() frame's call outside the child's own fan-out sees the
+   * inherited batch but its foreign frame tag; the child's own
+   * parallel()/pipeline() opens a fresh window tagged with the child's
+   * runId). Only
    * "replay-completed" mode reads this: a gap shadows every later call EXCEPT
    * same-generation siblings — see journalReplayAllowed for the rationale.
    */
@@ -746,7 +756,10 @@ export async function runWorkflow<T = unknown>(
   // them cannot serve a result derived from the gap call's (re-run) output.
   // Everything else has no such guarantee: top-level calls, calls dispatched
   // after an await inside a thunk (a caught sibling failure settles first),
-  // and every call inside a nested workflow() frame all run strictly after
+  // and calls that sampled an ancestor frame's window (a nested frame's call
+  // outside its own fan-out — its own parallel()/pipeline() gets a fresh
+  // window tagged with the child's runId, so the child's own same-window
+  // siblings DO replay across its internal gap) all run strictly after
   // the gap settled — and the gap position also hides prompt EDITS (there is
   // no journaled hash to compare against) — so they must re-run live. Those
   // calls all carry generation `undefined`, and a batch-less gap therefore
@@ -1712,8 +1725,10 @@ export async function runWorkflow<T = unknown>(
       // replay-completed-gated at noteJournalMiss), so the advance is a
       // no-op there; in a fresh start that merely DECLARED replay-completed
       // the hook DOES fire and the advance does write firstEdit, but with
-      // no journal the boundary is unread — its only read sites require a
-      // cached entry — so the live execution stays observably identical to
+      // no journal the write is dead in effect — the reads that can change
+      // behavior are gated by a cached entry, and the propagation read's
+      // false branch (prefixIntact) yields the same undefined journal
+      // either way — so the live execution stays observably identical to
       // prefix (invariant: a start-time declaration must not change the live
       // execution).
       const advanceForChildMisses = () => {
