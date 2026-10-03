@@ -2629,9 +2629,11 @@ test("a deferred child dispatch never races ahead of the parent's post-child cal
   // and a longer one survives a +1 wrapper, so neither can discriminate (R13
   // F1). Promise job counts are spec-pinned, so the window is stable across
   // engines. Prefix fresh, a fresh start that merely DECLARES
-  // replay-completed, and a prefix resume must all exhibit the base order;
-  // replay-completed with a journal takes its own delay from the zero-entry
-  // sweep, not from a wrapper, and is pinned by the R11 test instead.
+  // replay-completed, a prefix resume, and a replay-completed resume with an
+  // EMPTY journal (nothing anywhere can replay, so the zero-entry sweep's
+  // macrotask hold would be pure, observable cost — #231 R16) must all
+  // exhibit the base order. Replay-completed with entries takes its own
+  // delay from the sweep, not from a wrapper, and is pinned by the R11 test.
   const child = `export const meta = { name: 'kidTick', description: 'k' }
 let release;
 const gate = new Promise((r) => { release = r; });
@@ -2674,6 +2676,7 @@ return { n, c }`;
     ["prefix fresh", {}],
     ["declared fresh", { resumeMode: "replay-completed" }],
     ["prefix resume", { resumeJournal: journalMap([]), resumeMode: "prefix" }],
+    ["replay resume, empty journal", { resumeJournal: journalMap([]), resumeMode: "replay-completed" }],
   ] as const) {
     const { c, events } = await scenario(extra, `r12-tick-${label}`);
     assert.equal(

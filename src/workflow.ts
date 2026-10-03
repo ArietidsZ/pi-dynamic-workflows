@@ -754,16 +754,19 @@ export async function runWorkflow<T = unknown>(
   // with the gap call in the original run — their prompts were fixed at
   // dispatch, before the gap call could have produced anything — so replaying
   // them cannot serve a result derived from the gap call's (re-run) output.
-  // Everything else has no such guarantee: top-level calls, calls dispatched
-  // after an await inside a thunk (a caught sibling failure settles first),
-  // and calls that sampled an ancestor frame's window (a nested frame's call
-  // outside its own fan-out — its own parallel()/pipeline() gets a fresh
-  // window tagged with the child's runId, so the child's own same-window
-  // siblings DO replay across its internal gap) all run strictly after
-  // the gap settled — and the gap position also hides prompt EDITS (there is
-  // no journaled hash to compare against) — so they must re-run live. Those
-  // calls all carry generation `undefined`, and a batch-less gap therefore
-  // shadows everything after it.
+  // Everything else carries no such proof: top-level calls, calls dispatched
+  // after an await inside a thunk, and calls that sampled an ancestor
+  // frame's window (a nested frame's call outside its own fan-out — the
+  // child's own parallel()/pipeline() opens a fresh window tagged with the
+  // child's runId, so the child's own same-window siblings DO replay across
+  // its internal gap). Only dispatch inside the gap's own window proves a
+  // prompt was fixed before the gap call could have produced anything; for
+  // every other call the runtime cannot rule out dependence (a prompt built
+  // after an await may incorporate the gap's output, a cross-frame result
+  // may incorporate store state the gap's re-run changes) — and the gap
+  // position also hides prompt EDITS (there is no journaled hash to compare
+  // against) — so they must re-run live. Those calls all carry generation
+  // `undefined`, and a batch-less gap therefore shadows everything after it.
   const isGapShadowed = (index: number, gen: object | undefined) =>
     state.gaps.some((gap) => gap.index < index && (gap.gen === undefined || gap.gen !== gen));
   const journalReplayAllowed = (index: number, gen: object | undefined) =>
@@ -2271,7 +2274,12 @@ export async function runWorkflow<T = unknown>(
         options.signal?.removeEventListener("abort", externalWake);
         shared.runFatalController.signal.removeEventListener("abort", fatalWake);
       }
-    } else if (!isTopLevelRun && resolvedResumeMode === "replay-completed" && options.resumeJournal !== undefined) {
+    } else if (
+      !isTopLevelRun &&
+      resolvedResumeMode === "replay-completed" &&
+      options.resumeJournal !== undefined &&
+      options.resumeJournal.size > 0
+    ) {
       // Zero-entry frame (replayQuiescenceEnabled is false because the journal
       // has no keys for this frame): every call here is a gap noted
       // SYNCHRONOUSLY at dispatch (noteJournalMiss precedes the limiter), so
@@ -2291,6 +2299,13 @@ export async function runWorkflow<T = unknown>(
       // its root settled) — a call reached within the sweep notes its gap at
       // dispatch, so the sweep never waits for a settlement and needs no
       // abort/grace race.
+      //
+      // The size guard: with an EMPTY journal no call anywhere can replay
+      // (every replay decision needs a cached entry), so the hold protects
+      // nothing — and its one macrotask is itself observable, delaying this
+      // frame's settlement past a deferred dispatch and flipping the parent's
+      // post-child ordering vs a prefix resume of the same empty journal
+      // (#231 R16). An empty journal therefore falls back to prefix timing.
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
     // Only the top-level frame drains/disposes (see isTopLevelRun) — a nested
