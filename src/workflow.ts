@@ -83,9 +83,12 @@ export interface JournalEntry {
    * on this the same way SharedStore's deltaKey already does. Absent on
    * journal entries persisted before this field existed; such legacy entries
    * are treated as belonging to the run's own top-level runId (see
-   * WorkflowManager.resume()) — a legacy entry that actually belonged to a
-   * nested frame simply cache-misses on resume (safe degradation: it re-runs
-   * live, it does not apply to the wrong call).
+   * WorkflowManager.resume()). A legacy entry that ACTUALLY belonged to a
+   * nested frame therefore collides with the top-level entry at the same
+   * index (the resume-journal map is last-write-wins); the call hash is the
+   * only guard against misapplication, so an identical parent call can
+   * replay what was really the nested frame's result (bounded-impact
+   * collision, pre-existing since namespacing was introduced).
    */
   runId?: string;
   /** sha256 of the call's identity (prompt + model + phase + agentType + schema). */
@@ -179,6 +182,14 @@ export interface SharedRuntime {
   activeThreads: Set<string>;
   /** Whether a threaded call has invalidated journal replay for the remaining run tree. */
   resumeBarrierReached: boolean;
+  /**
+   * Monotonic count of journal misses (gap or edit) recorded anywhere in this
+   * run tree during THIS execution. Frames are replay-isolated (each nested
+   * workflow() has its own RuntimeState), so this shared counter is how a
+   * parent frame learns that a child it awaited re-ran calls live across an
+   * internal gap/edit — see workflowFn's post-child boundary advance.
+   */
+  journalMisses?: number;
 }
 
 /** Runtime instrumentation for workflow boundaries, quality helpers, and control attempts. */
@@ -274,7 +285,9 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    * Calls dispatched after an await in a thunk and every call inside a nested
    * workflow() frame are NOT in that window and count as sequential. The gap
    * position also hides prompt edits (no journaled hash to compare against),
-   * which is exactly why downstream-of-gap calls must re-run live. Caveat:
+   * which is exactly why downstream-of-gap calls must re-run live. A nested
+   * frame's internal gap or edit likewise ends replay for the parent frame's
+   * calls dispatched after that child returns. Caveat:
    * siblings that coordinated with the gap call through the shared store or
    * the filesystem can replay stale values — no hash observes those channels.
    */
@@ -706,6 +719,9 @@ export async function runWorkflow<T = unknown>(
     // it.
     if (entry != null) state.firstEdit = Math.min(state.firstEdit, missedIndex);
     else state.gaps.push({ index: missedIndex, gen });
+    // Counted on the SHARED runtime so an awaiting parent frame can learn that
+    // a child re-ran calls live across an internal gap/edit (see workflowFn).
+    shared.journalMisses = (shared.journalMisses ?? 0) + 1;
   };
 
   const agentRunner = options.agent ?? new WorkflowAgent(options);
@@ -745,7 +761,9 @@ export async function runWorkflow<T = unknown>(
     inFlight: new Set<Promise<unknown>>(),
     activeThreads: new Set<string>(),
     resumeBarrierReached: false,
+    journalMisses: 0,
   };
+  shared.journalMisses ??= 0;
   if (!shared.pendingUsageFinalizers) {
     shared.pendingUsageFinalizers = new Set<() => void>();
   }
@@ -1579,31 +1597,52 @@ export async function runWorkflow<T = unknown>(
         resolvedResumeMode === "replay-completed"
           ? state.firstEdit === Number.POSITIVE_INFINITY && !isGapShadowed(state.callSeq, replayGen)
           : state.firstMiss === Number.POSITIVE_INFINITY;
-      const child = await workflowNestingScope.run(nestingDepth + 1, () =>
-        runWorkflow(childScript, {
-          ...options,
-          args: childArgs,
-          sharedRuntime: shared,
-          // Propagate the parent's store so nested agents share the same key-value space.
-          sharedStore: store,
-          resumeJournal: prefixIntact ? options.resumeJournal : undefined,
-          resumeFromRunId: undefined,
-          // Reuse the same runner so named threads span parent/child frames but
-          // still die with this one top-level runWorkflow invocation.
-          agent: agentRunner,
-          // shared.nestedCallSeq, not shared.depth — see its doc comment: depth
-          // returns to 0 between sequential sibling calls, which would otherwise
-          // mint the same child runId (and hence colliding deltaKeys/event ids)
-          // for two different children.
-          runId: `${runId}-nested${++shared.nestedCallSeq}`,
-          // The registry is snapshotted ONCE per run (:500): forward the
-          // already-loaded registry so a mid-run .md edit can't change
-          // agentDefinitionKey for nested-frame calls only (those journal
-          // entries would cache-miss on resume, nondeterministically).
-          agentRegistry,
-          persistLogs: false,
-        }),
-      );
+      // Snapshot the run-tree miss counter before the child runs: any NEW miss
+      // afterwards came from the child's own replay scan (or a concurrent
+      // sibling frame) and tells this frame the child did not replay cleanly.
+      const missesBefore = shared.journalMisses ?? 0;
+      const child = await workflowNestingScope
+        .run(nestingDepth + 1, () =>
+          runWorkflow(childScript, {
+            ...options,
+            args: childArgs,
+            sharedRuntime: shared,
+            // Propagate the parent's store so nested agents share the same key-value space.
+            sharedStore: store,
+            resumeJournal: prefixIntact ? options.resumeJournal : undefined,
+            resumeFromRunId: undefined,
+            // Reuse the same runner so named threads span parent/child frames but
+            // still die with this one top-level runWorkflow invocation.
+            agent: agentRunner,
+            // shared.nestedCallSeq, not shared.depth — see its doc comment: depth
+            // returns to 0 between sequential sibling calls, which would otherwise
+            // mint the same child runId (and hence colliding deltaKeys/event ids)
+            // for two different children.
+            runId: `${runId}-nested${++shared.nestedCallSeq}`,
+            // The registry is snapshotted ONCE per run (:500): forward the
+            // already-loaded registry so a mid-run .md edit can't change
+            // agentDefinitionKey for nested-frame calls only (those journal
+            // entries would cache-miss on resume, nondeterministically).
+            agentRegistry,
+            persistLogs: false,
+          }),
+        )
+        .finally(() => {
+          // A child that re-ran ANY call live across an internal gap or edit
+          // may have changed the store/return values the rest of THIS frame
+          // depends on, and this frame's own boundary never saw the child's
+          // per-frame misses. Calls dispatched after the child returns are
+          // its sequential downstream — advancing this frame's edit boundary
+          // forces them live instead of replaying results computed against
+          // the old child state. Same-window siblings already made their
+          // replay decision synchronously at dispatch, before the child could
+          // have produced anything, so they are unaffected. Prefix mode is
+          // deliberately untouched: its per-frame firstMiss has always been
+          // one-way (constraint: default behavior byte-for-byte unchanged).
+          if (resolvedResumeMode === "replay-completed" && (shared.journalMisses ?? 0) > missesBefore) {
+            state.firstEdit = Math.min(state.firstEdit, state.callSeq);
+          }
+        });
       return child.result;
     } finally {
       options.onRuntimeEvent?.({ type: "workflow", stage: "end", name: workflowName, args: childArgs });

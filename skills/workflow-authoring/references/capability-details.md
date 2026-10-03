@@ -73,7 +73,7 @@ Every exact fact below is projected from the installed extension's capability co
 - Signature: `workflow(savedName, childArgs?) => Promise<unknown>`
 - Constraint: one nested level
 - Constraint: shares limiter, counters, token accounting, and store
-- Constraint: a nested workflow journals under its own runId and replays those entries only while the parent's replay is still open at the workflow() call; a parent edit, or a parent gap shadowing the call, re-executes the child live
+- Constraint: a nested workflow journals under its own runId and replays those entries only while the parent's replay is still open at the workflow() call; a parent edit, or a parent gap shadowing the call, re-executes the child live, and a gap or edit inside the child re-runs the parent's calls dispatched after the child returns
 
 <a id="verify"></a>
 ## verify

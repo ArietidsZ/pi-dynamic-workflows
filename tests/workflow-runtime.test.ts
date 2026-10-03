@@ -1890,6 +1890,145 @@ return n`;
   assert.deepEqual(resumed.result, ["ran:GAP", "ran:sib"]);
 });
 
+// R4 scenario shape: parent call → workflow() → parent call, with the child's
+// first call failing organically in run 1 and succeeding on resume; a seed
+// channel (emulating store_put/store_get) makes staleness observable in
+// results, not just call counts.
+const r4Child = `export const meta = { name: 'kid', description: 'kid' }
+const a = await agent('kid-gap', { label: 'kg' })
+const b = await agent('kid-plan', { label: 'kp' })
+return { a, b }`;
+const r4Parent = `export const meta = { name: 'par', description: 'par' }
+const x = await agent('parent-a', { label: 'pa' })
+const n = await workflow('kid')
+const c = await agent('parent-c', { label: 'pc' })
+return { x, n, c }`;
+
+function r4Runner(gapFails: boolean, seeded: { value?: string }, calls: { n: number }) {
+  return {
+    async run(prompt: string) {
+      calls.n++;
+      if (prompt === "kid-gap") {
+        if (gapFails) return "";
+        seeded.value = "REAL";
+        return "REAL";
+      }
+      if (prompt === "kid-plan") return `plan-for-${seeded.value ?? "undefined"}`;
+      if (prompt === "parent-c") return `c-for-${seeded.value ?? "undefined"}`;
+      return `ran:${prompt}`;
+    },
+  };
+}
+
+test("replay-completed resume re-runs the parent's downstream after a child's internal gap (#231 R4)", async () => {
+  // The child's gap is recorded in the CHILD frame's state; without outward
+  // propagation the parent's later call (dispatched strictly after the child
+  // returned) replays a result computed before the child re-ran — stale.
+  const seeded: { value?: string } = {};
+  const firstCalls = { n: 0 };
+  const journal: JournalEntry[] = [];
+  const initial = await runWorkflow<{ x: string; n: { a: string | null; b: string }; c: string }>(r4Parent, {
+    agent: r4Runner(true, seeded, firstCalls),
+    persistLogs: false,
+    runId: "outward-gap-run",
+    loadSavedWorkflow: (name) => (name === "kid" ? r4Child : undefined),
+    onAgentJournal: (e) => journal.push(e),
+  });
+  assert.equal(initial.result?.c, "c-for-undefined", "run 1: parent-c journaled against the old child state");
+
+  seeded.value = undefined;
+  const secondCalls = { n: 0 };
+  const resumed = await runWorkflow<{ x: string; n: { a: string | null; b: string }; c: string }>(r4Parent, {
+    agent: r4Runner(false, seeded, secondCalls),
+    persistLogs: false,
+    runId: "outward-gap-run",
+    loadSavedWorkflow: (name) => (name === "kid" ? r4Child : undefined),
+    resumeJournal: journalMap(journal),
+    resumeMode: "replay-completed",
+  });
+  assert.equal(secondCalls.n, 3, "the child's gap + its downstream + the PARENT's downstream re-run; parent-a replays");
+  assert.equal(resumed.result?.x, "ran:parent-a");
+  assert.equal(resumed.result?.n.b, "plan-for-REAL");
+  assert.equal(resumed.result?.c, "c-for-REAL", "the parent's downstream re-computed against the new child state");
+});
+
+test("replay-completed resume re-runs the parent's downstream after an EDIT inside a child (#231 R4)", async () => {
+  const childV1 = `export const meta = { name: 'kid', description: 'kid' }
+const a = await agent('kid-x1', { label: 'kx' })
+const b = await agent('kid-plan', { label: 'kp' })
+return { a, b }`;
+  const childV2 = childV1.replace("'kid-x1'", "'kid-x2'");
+  const seeded: { value?: string } = {};
+  const makeRunner = (edited: boolean, calls: { n: number }) => ({
+    async run(prompt: string) {
+      calls.n++;
+      if (prompt === "kid-x1") return "x1-result";
+      if (prompt === "kid-x2") {
+        seeded.value = "REAL";
+        return "x2-result";
+      }
+      if (prompt === "kid-plan") return `plan-for-${seeded.value ?? "undefined"}`;
+      if (prompt === "parent-c") return `c-for-${seeded.value ?? "undefined"}`;
+      return `ran:${prompt}`;
+    },
+  });
+  const firstCalls = { n: 0 };
+  const journal: JournalEntry[] = [];
+  await runWorkflow(r4Parent, {
+    agent: makeRunner(false, firstCalls),
+    persistLogs: false,
+    runId: "outward-edit-run",
+    loadSavedWorkflow: (name) => (name === "kid" ? childV1 : undefined),
+    onAgentJournal: (e) => journal.push(e),
+  });
+
+  seeded.value = undefined;
+  const secondCalls = { n: 0 };
+  const resumed = await runWorkflow<{ x: string; n: { a: string | null; b: string }; c: string }>(r4Parent, {
+    agent: makeRunner(true, secondCalls),
+    persistLogs: false,
+    runId: "outward-edit-run",
+    loadSavedWorkflow: (name) => (name === "kid" ? childV2 : undefined),
+    resumeJournal: journalMap(journal),
+    resumeMode: "replay-completed",
+  });
+  assert.equal(
+    secondCalls.n,
+    3,
+    "the edited child call + its suffix + the PARENT's downstream re-run; parent-a replays",
+  );
+  assert.equal(resumed.result?.n.a, "x2-result");
+  assert.equal(resumed.result?.c, "c-for-REAL", "the child's edit propagates outward to the parent's downstream");
+});
+
+test("prefix resume keeps the legacy one-way frame boundary unchanged (#231 R4 control)", async () => {
+  // The outward propagation fix is scoped to replay-completed: prefix mode's
+  // per-frame firstMiss has always been one-way (verified at base 3bea96c),
+  // and the maintainer constraint is byte-for-byte unchanged prefix behavior.
+  const seeded: { value?: string } = {};
+  const firstCalls = { n: 0 };
+  const journal: JournalEntry[] = [];
+  await runWorkflow(r4Parent, {
+    agent: r4Runner(true, seeded, firstCalls),
+    persistLogs: false,
+    runId: "outward-prefix-run",
+    loadSavedWorkflow: (name) => (name === "kid" ? r4Child : undefined),
+    onAgentJournal: (e) => journal.push(e),
+  });
+
+  seeded.value = undefined;
+  const secondCalls = { n: 0 };
+  const resumed = await runWorkflow<{ x: string; n: { a: string | null; b: string }; c: string }>(r4Parent, {
+    agent: r4Runner(false, seeded, secondCalls),
+    persistLogs: false,
+    runId: "outward-prefix-run",
+    loadSavedWorkflow: (name) => (name === "kid" ? r4Child : undefined),
+    resumeJournal: journalMap(journal),
+  });
+  assert.equal(secondCalls.n, 2, "prefix: the child re-runs its suffix; the parent's downstream still replays");
+  assert.equal(resumed.result?.c, "c-for-undefined", "the legacy one-way boundary is deliberately preserved");
+});
+
 test("an unusable cached entry (empty output) is an edit, not a gap, in replay-completed mode", async () => {
   // Defensive branch: organic empty output is never journaled, but a legacy or
   // hand-edited journal CAN hold an unusable entry. It must pin firstEdit

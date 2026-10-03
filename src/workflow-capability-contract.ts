@@ -360,7 +360,7 @@ const capabilities: readonly CapabilityDescriptor[] = [
     constraints: [
       "one nested level",
       "shares limiter, counters, token accounting, and store",
-      "a nested workflow journals under its own runId and replays those entries only while the parent's replay is still open at the workflow() call; a parent edit, or a parent gap shadowing the call, re-executes the child live",
+      "a nested workflow journals under its own runId and replays those entries only while the parent's replay is still open at the workflow() call; a parent edit, or a parent gap shadowing the call, re-executes the child live, and a gap or edit inside the child re-runs the parent's calls dispatched after the child returns",
     ],
     evidence: ["tests/workflow-saved.test.ts", "tests/shared-store.test.ts"],
   }),

@@ -446,7 +446,11 @@ return xs`;
       /fan-out siblings across a never-completed gap/,
       "the confirmation describes the effective replay-completed policy",
     );
-    assert.doesNotMatch(text, /newly inserted agent\(\) call/, "it does not describe the prefix-only policy");
+    assert.doesNotMatch(
+      text,
+      /changed, new, or never-completed agent\(\) call/,
+      "it does not describe the prefix-only policy",
+    );
 
     for (let i = 0; i < 2000 && manager.getRun(runId)?.status === "running"; i++) {
       await new Promise((resolve) => setTimeout(resolve, 1));

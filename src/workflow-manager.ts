@@ -2173,9 +2173,10 @@ export class WorkflowManager extends EventEmitter {
     // above and like SharedStore's deltaKey — see JournalEntry.runId. A
     // legacy entry persisted before namespacing existed has no `runId`; it is
     // assumed to belong to this run's own top-level runId (the only frame
-    // that existed before nested workflow() journaling was namespaced), so it
-    // still resume-hits for a top-level call and safely cache-misses (re-runs
-    // live, does not misapply) for what was actually a nested-run entry.
+    // that existed before nested workflow() journaling was namespaced). If it
+    // REALLY belonged to a nested frame, it collides with the top-level entry
+    // at the same index (last write wins) and the call hash is the only guard
+    // — an identical top-level call can replay the nested frame's result.
     const resumeJournal = new Map(persistedJournal.map((e) => [`${e.runId ?? runId}:${e.index}`, e] as const));
     this.emit("resumed", { runId });
     // Run in the background; executeRun records status/errors on the managed run.

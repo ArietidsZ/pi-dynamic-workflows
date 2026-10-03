@@ -500,7 +500,7 @@ export function resumedText(name: string, runId: string, resumeMode?: WorkflowRe
         ]
       : [
           "Unchanged agent() calls replay from that run's journal (cache); the first",
-          "edited or newly inserted agent() call — and everything after it — re-runs live.",
+          "changed, new, or never-completed agent() call — and everything after it — re-runs live.",
         ];
   return [
     `Workflow "${name}" resumed from run ${runId} with your edited script.`,
