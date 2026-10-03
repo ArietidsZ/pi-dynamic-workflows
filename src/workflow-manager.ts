@@ -2103,8 +2103,13 @@ export class WorkflowManager extends EventEmitter {
       // Journal replay policy: an explicit choice wins and persistRun() writes
       // it below; otherwise the run keeps its previously chosen policy so a
       // cold resume (e.g. workflow_control after a restart) replays the same
-      // way the resume that picked the policy did.
-      resumeMode: opts?.resumeMode ?? sanitizeResumeMode(persisted.resumeMode),
+      // way the resume that picked the policy did. Sanitize BOTH sides: an
+      // out-of-schema explicit value must not persist/report a policy the
+      // runtime never honored (runWorkflow itself falls back to "prefix").
+      resumeMode:
+        opts?.resumeMode === undefined
+          ? sanitizeResumeMode(persisted.resumeMode)
+          : (sanitizeResumeMode(opts.resumeMode) ?? "prefix"),
       // Restore start-time execution context: the budget the run started with
       // (legacy runs without one resume unbudgeted — never re-apply the current
       // default to a run that predates it) and the toolset tag executeRun

@@ -711,6 +711,54 @@ test(
 );
 
 test(
+  "an out-of-schema explicit resumeMode is sanitized, not persisted as-is (#231 R5)",
+  withTempCwd(async (cwd) => {
+    let markStarted: () => void = () => {};
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt, options) {
+          options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+          if (prompt === "p0") {
+            markStarted();
+            await new Promise<void>((_resolve, reject) => {
+              options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+            });
+          }
+          return `${prompt}-done`;
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    const { runId, promise } = manager.startInBackground(threeParallelScript);
+    promise.catch(() => {});
+    await started;
+    for (let i = 0; i < 2000; i++) {
+      if ((manager.getPersistence().load(runId)?.journal?.length ?? 0) >= 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(manager.pause(runId), true);
+
+    // Both tool schemas restrict the literals, but a plain-JS caller can pass
+    // anything: the run must not persist/report a policy it never honored.
+    assert.equal(await manager.resume(runId, { resumeMode: "replay_completed" as never }), true);
+    for (let i = 0; i < 2000 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(manager.getRun(runId)?.resumeMode, "prefix", "invalid explicit mode falls back to prefix");
+    assert.equal(
+      manager.getPersistence().load(runId)?.resumeMode,
+      "prefix",
+      "the run record carries the honored policy, not the raw input",
+    );
+  }),
+);
+
+test(
   "resume keeps historical agent session metadata when the edited script fails to parse (#206)",
   withTempCwd(async (cwd) => {
     const agent = fakeAgent();

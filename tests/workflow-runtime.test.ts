@@ -1959,7 +1959,7 @@ const b = await agent('kid-plan', { label: 'kp' })
 return { a, b }`;
   const childV2 = childV1.replace("'kid-x1'", "'kid-x2'");
   const seeded: { value?: string } = {};
-  const makeRunner = (edited: boolean, calls: { n: number }) => ({
+  const makeRunner = (calls: { n: number }) => ({
     async run(prompt: string) {
       calls.n++;
       if (prompt === "kid-x1") return "x1-result";
@@ -1975,7 +1975,7 @@ return { a, b }`;
   const firstCalls = { n: 0 };
   const journal: JournalEntry[] = [];
   await runWorkflow(r4Parent, {
-    agent: makeRunner(false, firstCalls),
+    agent: makeRunner(firstCalls),
     persistLogs: false,
     runId: "outward-edit-run",
     loadSavedWorkflow: (name) => (name === "kid" ? childV1 : undefined),
@@ -1985,7 +1985,7 @@ return { a, b }`;
   seeded.value = undefined;
   const secondCalls = { n: 0 };
   const resumed = await runWorkflow<{ x: string; n: { a: string | null; b: string }; c: string }>(r4Parent, {
-    agent: makeRunner(true, secondCalls),
+    agent: makeRunner(secondCalls),
     persistLogs: false,
     runId: "outward-edit-run",
     loadSavedWorkflow: (name) => (name === "kid" ? childV2 : undefined),
@@ -2027,6 +2027,73 @@ test("prefix resume keeps the legacy one-way frame boundary unchanged (#231 R4 c
   });
   assert.equal(secondCalls.n, 2, "prefix: the child re-runs its suffix; the parent's downstream still replays");
   assert.equal(resumed.result?.c, "c-for-undefined", "the legacy one-way boundary is deliberately preserved");
+});
+
+test("a sibling child's gap does not force a clean child's post-return calls live (#231 R5)", async () => {
+  // The outward propagation signal must be scoped to the child's OWN frame:
+  // kidA replays cleanly and settles first; PA is dispatched after kidA
+  // returns while the gapping kidB is still in flight — the documented rule
+  // (only calls dispatched after the MISSING child returns re-run) requires
+  // PA to replay.
+  const kids: Record<string, string> = {
+    kidA: `export const meta = { name: 'kidA', description: 'clean' }
+return await agent('A1', { label: 'a1' })`,
+    kidB: `export const meta = { name: 'kidB', description: 'gaps' }
+const g = await agent('BGAP', { label: 'bgap' })
+const w = await agent('BWAIT', { label: 'bwait' })
+return { g, w }`,
+  };
+  const parent = `export const meta = { name: 'p', description: 'p' }
+const xs = await parallel([
+  async () => { const a = await workflow('kidA'); return await agent('PA', { label: 'pa' }) },
+  async () => { const b = await workflow('kidB'); return await agent('PB', { label: 'pb' }) },
+])
+return xs`;
+  const journal: JournalEntry[] = [];
+  await runWorkflow(parent, {
+    agent: {
+      async run(prompt: string) {
+        return prompt === "BGAP" ? "" : `ran:${prompt}`;
+      },
+    },
+    persistLogs: false,
+    runId: "r5-f1-run",
+    loadSavedWorkflow: (name) => kids[name],
+    onAgentJournal: (e) => journal.push(e),
+  });
+
+  let releaseB: () => void = () => {};
+  const bGate = new Promise<void>((resolve) => {
+    releaseB = resolve;
+  });
+  const calls: string[] = [];
+  const resume = runWorkflow(parent, {
+    agent: {
+      async run(prompt: string) {
+        calls.push(prompt);
+        if (prompt === "BGAP") return "";
+        if (prompt === "BWAIT") {
+          await bGate;
+          return "bwait";
+        }
+        return `ran:${prompt}`;
+      },
+    },
+    persistLogs: false,
+    runId: "r5-f1-run",
+    loadSavedWorkflow: (name) => kids[name],
+    resumeJournal: journalMap(journal),
+    resumeMode: "replay-completed",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  releaseB();
+  const resumed = await resume;
+
+  assert.equal(calls.includes("PA"), false, `PA must replay after the clean child: calls=${JSON.stringify(calls)}`);
+  assert.ok(calls.includes("PB"), "PB follows the gapping kidB's return and must re-run live");
+  assert.ok(calls.includes("BWAIT"), "kidB's own gap shadow forces its downstream live");
+  assert.equal((resumed.result as string[])[0], "ran:PA");
+  assert.equal((resumed.result as string[])[1], "ran:PB");
 });
 
 test("an unusable cached entry (empty output) is an edit, not a gap, in replay-completed mode", async () => {

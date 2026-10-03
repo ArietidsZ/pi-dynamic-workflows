@@ -182,14 +182,6 @@ export interface SharedRuntime {
   activeThreads: Set<string>;
   /** Whether a threaded call has invalidated journal replay for the remaining run tree. */
   resumeBarrierReached: boolean;
-  /**
-   * Monotonic count of journal misses (gap or edit) recorded anywhere in this
-   * run tree during THIS execution. Frames are replay-isolated (each nested
-   * workflow() has its own RuntimeState), so this shared counter is how a
-   * parent frame learns that a child it awaited re-ran calls live across an
-   * internal gap/edit — see workflowFn's post-child boundary advance.
-   */
-  journalMisses?: number;
 }
 
 /** Runtime instrumentation for workflow boundaries, quality helpers, and control attempts. */
@@ -294,6 +286,13 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   resumeMode?: WorkflowResumeMode;
   /** Called after each live agent completes so the caller can persist the journal. */
   onAgentJournal?: (entry: JournalEntry) => void;
+  /**
+   * Internal nested-frame plumbing (workflowFn): fired once per journal miss
+   * (gap or edit) recorded by THIS frame's replay scan, replay-completed mode
+   * only. A parent frame uses it to scope the outward gap/edit propagation to
+   * the child's own misses — see workflowFn's post-child boundary advance.
+   */
+  onJournalMiss?: () => void;
   /** Active durable checkpoint response supplied by WorkflowManager.resume(). */
   resumeCheckpoint?: WorkflowCheckpoint;
   /** Persist a durable checkpoint transition before it becomes externally observable. */
@@ -718,10 +717,13 @@ export async function runWorkflow<T = unknown>(
     // sequential downstream; same-generation siblings may still replay across
     // it.
     if (entry != null) state.firstEdit = Math.min(state.firstEdit, missedIndex);
-    else state.gaps.push({ index: missedIndex, gen });
-    // Counted on the SHARED runtime so an awaiting parent frame can learn that
-    // a child re-ran calls live across an internal gap/edit (see workflowFn).
-    shared.journalMisses = (shared.journalMisses ?? 0) + 1;
+    else if (resolvedResumeMode === "replay-completed") state.gaps.push({ index: missedIndex, gen });
+    // Per-FRAME hook (not a run-tree counter — a sibling frame's miss must not
+    // advance this frame's parent's boundary, #231 R5): lets an awaiting
+    // parent learn THIS child re-ran calls live across an internal gap/edit.
+    // Replay-completed only: prefix reads neither state.gaps nor the hook, so
+    // both stay unallocated/unfired there (base allocated nothing).
+    if (resolvedResumeMode === "replay-completed") options.onJournalMiss?.();
   };
 
   const agentRunner = options.agent ?? new WorkflowAgent(options);
@@ -761,9 +763,7 @@ export async function runWorkflow<T = unknown>(
     inFlight: new Set<Promise<unknown>>(),
     activeThreads: new Set<string>(),
     resumeBarrierReached: false,
-    journalMisses: 0,
   };
-  shared.journalMisses ??= 0;
   if (!shared.pendingUsageFinalizers) {
     shared.pendingUsageFinalizers = new Set<() => void>();
   }
@@ -1597,14 +1597,21 @@ export async function runWorkflow<T = unknown>(
         resolvedResumeMode === "replay-completed"
           ? state.firstEdit === Number.POSITIVE_INFINITY && !isGapShadowed(state.callSeq, replayGen)
           : state.firstMiss === Number.POSITIVE_INFINITY;
-      // Snapshot the run-tree miss counter before the child runs: any NEW miss
-      // afterwards came from the child's own replay scan (or a concurrent
-      // sibling frame) and tells this frame the child did not replay cleanly.
-      const missesBefore = shared.journalMisses ?? 0;
+      // Count THIS child's own journal misses via the per-frame hook: the
+      // child is replay-isolated (own RuntimeState), and a run-tree-wide
+      // signal would also fire for a concurrent SIBLING frame's misses,
+      // forcing this child's clean post-return calls live (#231 R5 F1).
+      let childOwnMisses = 0;
       const child = await workflowNestingScope
         .run(nestingDepth + 1, () =>
           runWorkflow(childScript, {
             ...options,
+            // After ...options so it overrides, and chained so an outer hook
+            // still fires for misses anywhere in the subtree.
+            onJournalMiss: () => {
+              childOwnMisses++;
+              options.onJournalMiss?.();
+            },
             args: childArgs,
             sharedRuntime: shared,
             // Propagate the parent's store so nested agents share the same key-value space.
@@ -1639,7 +1646,7 @@ export async function runWorkflow<T = unknown>(
           // have produced anything, so they are unaffected. Prefix mode is
           // deliberately untouched: its per-frame firstMiss has always been
           // one-way (constraint: default behavior byte-for-byte unchanged).
-          if (resolvedResumeMode === "replay-completed" && (shared.journalMisses ?? 0) > missesBefore) {
+          if (resolvedResumeMode === "replay-completed" && childOwnMisses > 0) {
             state.firstEdit = Math.min(state.firstEdit, state.callSeq);
           }
         });
