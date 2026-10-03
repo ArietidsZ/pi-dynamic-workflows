@@ -2096,6 +2096,141 @@ return xs`;
   assert.equal((resumed.result as string[])[1], "ran:PB");
 });
 
+test("a late-noted gap in an un-awaited child fan-out still forces the parent's post-child calls live (#231 R6)", async () => {
+  // The child's fan-out promise is never awaited, so its 4th call (k-gap, the
+  // gap) dispatches after the child frame's return statement. Without the
+  // nested-frame quiescence drain, workflow() resolves while the fan-out is
+  // still mid-flight; the miss is then noted after the parent's post-child
+  // boundary advanced, and parent-c replays its stale entry.
+  const child = `export const meta = { name: 'kidLateGap', description: 'kid' }
+const p = parallel([
+  async () => {
+    await agent('r1')
+    await agent('r2')
+    await agent('r3')
+    await agent('k-gap')
+  },
+])
+return 'kid-done'`;
+  const parent = `export const meta = { name: 'parLateGap', description: 'p' }
+const n = await workflow('kidLateGap')
+const c = await agent('parent-c')
+return { n, c }`;
+
+  const journal: JournalEntry[] = [];
+  let sideEffect = "stale";
+  const first = await runWorkflow<{ n: string; c: string }>(parent, {
+    agent: {
+      async run(prompt: string) {
+        if (prompt === "k-gap") return "";
+        if (prompt === "parent-c") return `c-for-${sideEffect}`;
+        return `r:${prompt}`;
+      },
+    },
+    persistLogs: false,
+    runId: "r6-late-gap",
+    loadSavedWorkflow: (name) => (name === "kidLateGap" ? child : undefined),
+    onAgentJournal: (e) => journal.push(e),
+  });
+  assert.equal(first.result.c, "c-for-stale");
+
+  const calls: string[] = [];
+  const resumed = await runWorkflow<{ n: string; c: string }>(parent, {
+    agent: {
+      async run(prompt: string) {
+        calls.push(prompt);
+        if (prompt === "k-gap") {
+          sideEffect = "REAL";
+          return "gap-result";
+        }
+        if (prompt === "parent-c") return `c-for-${sideEffect}`;
+        return `r:${prompt}`;
+      },
+    },
+    persistLogs: false,
+    runId: "r6-late-gap",
+    loadSavedWorkflow: (name) => (name === "kidLateGap" ? child : undefined),
+    resumeJournal: journalMap(journal),
+    resumeMode: "replay-completed",
+  });
+  assert.ok(calls.includes("k-gap"), "the gap itself re-runs live");
+  assert.equal(calls.includes("r1"), false, "the child's completed prefix replays");
+  assert.equal(resumed.result.n, "kid-done");
+  assert.equal(
+    resumed.result.c,
+    "c-for-REAL",
+    "parent-c was dispatched after the child returned; the late-noted gap must re-run it live",
+  );
+});
+
+test("a late-noted edit in an un-awaited child fan-out still forces the parent's post-child calls live (#231 R6)", async () => {
+  // Same late-arrival shape as the gap test above, but the child's last call
+  // holds an unusable cached entry (an edit): whole-suffix liveness is the
+  // edit rule, and it must reach the parent even when the child frame has
+  // already returned by the time the edit is discovered.
+  const child = `export const meta = { name: 'kidLateEdit', description: 'kid' }
+const p = parallel([
+  async () => {
+    await agent('r1')
+    await agent('r2')
+    await agent('r3')
+    await agent('k-edit')
+  },
+])
+return 'kid-done'`;
+  const parent = `export const meta = { name: 'parLateEdit', description: 'p' }
+const n = await workflow('kidLateEdit')
+const c = await agent('parent-c')
+return { n, c }`;
+
+  const journal: JournalEntry[] = [];
+  let sideEffect = "stale";
+  const first = await runWorkflow<{ n: string; c: string }>(parent, {
+    agent: {
+      async run(prompt: string) {
+        if (prompt === "parent-c") return `c-for-${sideEffect}`;
+        return `r:${prompt}`;
+      },
+    },
+    persistLogs: false,
+    runId: "r6-late-edit",
+    loadSavedWorkflow: (name) => (name === "kidLateEdit" ? child : undefined),
+    onAgentJournal: (e) => journal.push(e),
+  });
+  assert.equal(first.result.c, "c-for-stale");
+  // The child's k-edit entry becomes unusable on disk (legacy/hand-edited
+  // journal); on resume it is an edit, not a gap.
+  const tampered = journalMap(journal.map((e) => (e.result === "r:k-edit" ? { ...e, result: "" } : e)));
+
+  const calls: string[] = [];
+  const resumed = await runWorkflow<{ n: string; c: string }>(parent, {
+    agent: {
+      async run(prompt: string) {
+        calls.push(prompt);
+        if (prompt === "k-edit") {
+          sideEffect = "NEW";
+          return "edit-result";
+        }
+        if (prompt === "parent-c") return `c-for-${sideEffect}`;
+        return `r:${prompt}`;
+      },
+    },
+    persistLogs: false,
+    runId: "r6-late-edit",
+    loadSavedWorkflow: (name) => (name === "kidLateEdit" ? child : undefined),
+    resumeJournal: tampered,
+    resumeMode: "replay-completed",
+  });
+  assert.ok(calls.includes("k-edit"), "the edited call itself re-runs live");
+  assert.equal(calls.includes("r1"), false, "the child's clean prefix replays");
+  assert.equal(resumed.result.n, "kid-done");
+  assert.equal(
+    resumed.result.c,
+    "c-for-NEW",
+    "parent-c was dispatched after the child returned; the late-noted edit must re-run it live",
+  );
+});
+
 test("an unusable cached entry (empty output) is an edit, not a gap, in replay-completed mode", async () => {
   // Defensive branch: organic empty output is never journaled, but a legacy or
   // hand-edited journal CAN hold an unusable entry. It must pin firstEdit

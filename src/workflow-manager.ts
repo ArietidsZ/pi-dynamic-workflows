@@ -139,9 +139,10 @@ export interface ManagedRun {
   autoResumeAttempts?: number;
   /**
    * Journal replay policy for this run's resumes (see ExecOptions.resumeMode).
-   * Set by resume() from the explicit option or the persisted record and
-   * re-persisted on every write, so later resumes keep the chosen policy
-   * unless they override it. Undefined means "prefix" (default).
+   * Frozen at start from ExecOptions.resumeMode and re-resolved by resume()
+   * from the explicit option or the persisted record; re-persisted on every
+   * write, so later resumes keep the chosen policy unless they override it.
+   * Undefined means "prefix" (default).
    */
   resumeMode?: WorkflowResumeMode;
   /**
@@ -268,10 +269,13 @@ export interface ExecOptions {
   /** Durable checkpoint response being replayed by this execution. */
   resumeCheckpoint?: WorkflowCheckpoint;
   /**
-   * Journal replay policy for a resumed execution — see
-   * WorkflowRunOptions.resumeMode in workflow.ts. Only resume() passes one; an
-   * explicit choice is persisted on the run record so subsequent resumes keep
-   * it. Omit to keep the run's persisted policy (default "prefix").
+   * Journal replay policy — see WorkflowRunOptions.resumeMode in workflow.ts.
+   * resume() passes one for that execution; a start call may pass one as the
+   * policy declaration for the run's FUTURE resumes (a start execution has no
+   * journal to replay). An explicit valid choice is persisted on the run
+   * record so subsequent resumes keep it; an invalid one is treated as absent
+   * (the persisted policy stands). Omit to keep the run's persisted policy
+   * (default "prefix").
    */
   resumeMode?: WorkflowResumeMode;
 
@@ -748,6 +752,10 @@ export class WorkflowManager extends EventEmitter {
       parentSessionFile: this.sessionFile,
       lease,
       autoResume: exec.autoResume,
+      // A start-time resumeMode is a policy declaration for this run's FUTURE
+      // resumes (the start execution itself has no journal to replay): freeze
+      // and persist it like tokenBudget so resume() honors it (#231 R6).
+      resumeMode: sanitizeResumeMode(exec.resumeMode),
       // Resolve the budget once at start and freeze it on the run (see
       // ManagedRun.tokenBudget) so resume keeps start-time semantics.
       tokenBudget: exec.tokenBudget !== undefined ? exec.tokenBudget : this.defaultTokenBudget,
@@ -786,6 +794,10 @@ export class WorkflowManager extends EventEmitter {
         startedAt: managed.startedAt.toISOString(),
         updatedAt: managed.startedAt.toISOString(),
         autoResume: managed.autoResume,
+        // The start-declared replay policy (see ManagedRun.resumeMode) — the
+        // hand-built initial save must include it or the first persistRun has
+        // already lost it to a crash in between.
+        resumeMode: managed.resumeMode,
         // autoResumeAttempts deliberately omitted: the scheduler's counter
         // cannot exist before the run starts (ids are minted here).
         tokenBudget: managed.tokenBudget,
@@ -827,6 +839,8 @@ export class WorkflowManager extends EventEmitter {
     if (!lease) throw new Error(`Could not acquire workflow run lease for ${managed.runId}`);
     managed.lease = lease;
     managed.autoResume = exec.autoResume;
+    // Same freeze-at-start as startInBackground (see ManagedRun.resumeMode).
+    managed.resumeMode = sanitizeResumeMode(exec.resumeMode);
     managed.tokenBudget = exec.tokenBudget !== undefined ? exec.tokenBudget : this.defaultTokenBudget;
     managed.toolset = exec.toolset;
     // Same freeze-at-start pattern as tokenBudget (see startInBackground/ManagedRun).
@@ -2103,13 +2117,12 @@ export class WorkflowManager extends EventEmitter {
       // Journal replay policy: an explicit choice wins and persistRun() writes
       // it below; otherwise the run keeps its previously chosen policy so a
       // cold resume (e.g. workflow_control after a restart) replays the same
-      // way the resume that picked the policy did. Sanitize BOTH sides: an
-      // out-of-schema explicit value must not persist/report a policy the
-      // runtime never honored (runWorkflow itself falls back to "prefix").
-      resumeMode:
-        opts?.resumeMode === undefined
-          ? sanitizeResumeMode(persisted.resumeMode)
-          : (sanitizeResumeMode(opts.resumeMode) ?? "prefix"),
+      // way the resume that picked the policy did. Sanitize BOTH sides — and
+      // treat an out-of-schema explicit value as ABSENT (fall through to the
+      // persisted policy), never as "prefix": silently downgrading a valid
+      // persisted policy would mis-replay this resume and re-persist the
+      // downgrade (#231 R6).
+      resumeMode: sanitizeResumeMode(opts?.resumeMode) ?? sanitizeResumeMode(persisted.resumeMode),
       // Restore start-time execution context: the budget the run started with
       // (legacy runs without one resume unbudgeted — never re-apply the current
       // default to a run that predates it) and the toolset tag executeRun

@@ -551,13 +551,15 @@ interface RuntimeState {
   /**
    * Index of the first call whose journal entry EXISTS but is unusable (hash
    * changed, or an unusable cached result such as empty output) — the edit
-   * boundary. Differs from firstMiss only at a gap (no journal entry at all:
-   * the call never completed), which pins firstMiss but not firstEdit. Only
-   * "replay-completed" resume mode reads this field: there, replay ends at
-   * the first edit everywhere, while gaps are handled per-call via `gaps`
-   * below. A positional script edit (insert/remove/reorder) still surfaces as
-   * an EXISTING entry with a mismatched hash at the shifted indexes, i.e. as
-   * an edit.
+   * boundary. Differs from firstMiss at a gap (no journal entry at all: the
+   * call never completed), which pins firstMiss but not firstEdit, and at the
+   * nested-frame outward advance (a child's internal gap/edit moves this
+   * frame's edit boundary to the child's callSeq position without touching
+   * firstMiss — see workflowFn). Only "replay-completed" resume mode reads
+   * this field: there, replay ends at the first edit everywhere, while gaps
+   * are handled per-call via `gaps` below. A positional script edit
+   * (insert/remove/reorder) still surfaces as an EXISTING entry with a
+   * mismatched hash at the shifted indexes, i.e. as an edit.
    */
   firstEdit: number;
   /**
@@ -571,6 +573,15 @@ interface RuntimeState {
    * same-generation siblings — see journalReplayAllowed for the rationale.
    */
   gaps: Array<{ index: number; gen: object | undefined }>;
+  /**
+   * This frame's own outstanding agent() calls — the frame-scoped subset of
+   * SharedRuntime.inFlight (which tracks the whole run tree for the top-level
+   * teardown drain). Read only by the nested-frame finally in "replay-completed"
+   * mode: workflow() must not resolve while the child still has calls in
+   * flight, because a journal miss noted after resolution would arrive too
+   * late for the parent's post-child boundary advance (#231 R6).
+   */
+  inFlight: Set<Promise<unknown>>;
 }
 
 type AnyNode = Node & { [key: string]: any; start: number; end: number };
@@ -674,14 +685,25 @@ export async function runWorkflow<T = unknown>(
     firstMiss: Number.POSITIVE_INFINITY,
     firstEdit: Number.POSITIVE_INFINITY,
     gaps: [],
+    inFlight: new Set<Promise<unknown>>(),
   };
+
+  // This frame created `shared` fresh (rather than inheriting a parent
+  // workflow()'s) — i.e. it's the true top-level run, the only frame allowed
+  // to declare the run's fate sealed (see SharedRuntime.runFatalController) or
+  // drain/dispose the SharedStore. A nested workflow() call always passes both
+  // sharedRuntime and sharedStore together (see workflowFn below), so this is
+  // equivalent to `!options.sharedStore` — used at both choke points below.
+  const isTopLevelRun = !options.sharedRuntime;
 
   // An out-of-schema caller (plain JS, or a typo like "replay_completed")
   // must not silently get prefix semantics — warn once, then fall back.
   const requestedResumeMode = options.resumeMode as string | undefined;
   const resolvedResumeMode: WorkflowResumeMode =
     requestedResumeMode === "replay-completed" || requestedResumeMode === "prefix" ? requestedResumeMode : "prefix";
-  if (requestedResumeMode !== undefined && requestedResumeMode !== resolvedResumeMode) {
+  if (isTopLevelRun && requestedResumeMode !== undefined && requestedResumeMode !== resolvedResumeMode) {
+    // Warn at the run-tree root only: nested frames spread the same raw option
+    // and re-resolve it, and each would otherwise repeat the identical line.
     options.onLog?.(`ignoring invalid resumeMode (${JSON.stringify(requestedResumeMode)}); using "prefix"`);
   }
 
@@ -723,7 +745,14 @@ export async function runWorkflow<T = unknown>(
     // parent learn THIS child re-ran calls live across an internal gap/edit.
     // Replay-completed only: prefix reads neither state.gaps nor the hook, so
     // both stay unallocated/unfired there (base allocated nothing).
-    if (resolvedResumeMode === "replay-completed") options.onJournalMiss?.();
+    if (resolvedResumeMode === "replay-completed") {
+      try {
+        options.onJournalMiss?.();
+      } catch {
+        // Instrumentation must never abort the call the miss belongs to — the
+        // bookkeeping above is already committed by design.
+      }
+    }
   };
 
   const agentRunner = options.agent ?? new WorkflowAgent(options);
@@ -770,13 +799,6 @@ export async function runWorkflow<T = unknown>(
   const pendingUsageFinalizers = shared.pendingUsageFinalizers;
   shared.agentCallbacksClosed ??= false;
   const limiter = shared.limiter;
-  // This frame created `shared` fresh (rather than inheriting a parent
-  // workflow()'s) — i.e. it's the true top-level run, the only frame allowed
-  // to declare the run's fate sealed (see SharedRuntime.runFatalController) or
-  // drain/dispose the SharedStore. A nested workflow() call always passes both
-  // sharedRuntime and sharedStore together (see workflowFn below), so this is
-  // equivalent to `!options.sharedStore` — used at both choke points below.
-  const isTopLevelRun = !options.sharedRuntime;
 
   // One store instance per run; nested workflow() calls inherit the parent's store
   // so all agents across nesting levels share the same key-value space.
@@ -929,12 +951,20 @@ export async function runWorkflow<T = unknown>(
     // Track every call (awaited or not) so the top-level run can drain
     // outstanding calls before completing (see SharedRuntime.inFlight and the
     // drain in the finally below) — this is what stops a forgotten `await`
-    // from letting an agent mutate state after the run is torn down.
+    // from letting an agent mutate state after the run is torn down. The
+    // frame-scoped set additionally lets a NESTED frame reach quiescence
+    // before resolving (replay-completed only — see the finally below).
     shared.inFlight.add(call);
+    if (resolvedResumeMode === "replay-completed") state.inFlight.add(call);
     // Attaching a handler here (independent of whatever the script itself does
     // with the returned promise) also means an un-awaited call's eventual
     // rejection never becomes a process-crashing unhandled rejection.
-    call.catch(() => {}).finally(() => shared.inFlight.delete(call));
+    call
+      .catch(() => {})
+      .finally(() => {
+        shared.inFlight.delete(call);
+        state.inFlight.delete(call);
+      });
     return call;
   };
 
@@ -1606,11 +1636,12 @@ export async function runWorkflow<T = unknown>(
         .run(nestingDepth + 1, () =>
           runWorkflow(childScript, {
             ...options,
-            // After ...options so it overrides, and chained so an outer hook
-            // still fires for misses anywhere in the subtree.
+            // After ...options so this frame's count is exact: the hook is
+            // scoped to the frame it is passed to, so the wrapper REPLACES any
+            // outer hook rather than chaining into it (a top-level hook must
+            // not fire for child-frame misses, #231 R6).
             onJournalMiss: () => {
               childOwnMisses++;
-              options.onJournalMiss?.();
             },
             args: childArgs,
             sharedRuntime: shared,
@@ -2090,6 +2121,35 @@ export async function runWorkflow<T = unknown>(
     }
     throw error;
   } finally {
+    // Replay-completed only: a nested frame must reach quiescence before
+    // resolving, so every journal miss it will ever note is committed BEFORE
+    // workflowFn's post-child finally reads the frame's miss count — an
+    // un-awaited fan-out in the child can otherwise dispatch a call after the
+    // child script returned, note its gap/edit too late, and leave the
+    // parent's post-return calls replaying stale results (#231 R6). Loop
+    // because a settling call can schedule further work. Un-awaited success
+    // waits indefinitely (those results are wanted — same stance as the
+    // top-level drain); once aborted the wait stops here — the calls are
+    // abort-linked, the run's outcome is already decided, and the top-level
+    // drain still gives them its grace period. Prefix mode deliberately never
+    // waits: its one-way frame boundary is byte-for-byte base behavior.
+    if (!isTopLevelRun && resolvedResumeMode === "replay-completed") {
+      while (!isAborted()) {
+        if (state.inFlight.size > 0) {
+          await Promise.allSettled(Array.from(state.inFlight));
+          continue;
+        }
+        // The set is empty, but a replay chain can still be mid-microtask: a
+        // replayed call settles several hops before the script continuation
+        // it unblocks dispatches the frame's next call (possibly a gap/edit
+        // miss). One macrotask flushes every pending microtask-only chain;
+        // anything dispatched afterwards is registered and caught by the
+        // re-check. Work scheduled off a live call is covered because the
+        // call itself was awaited above.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        if (state.inFlight.size === 0) break;
+      }
+    }
     // Only the top-level frame drains/disposes (see isTopLevelRun) — a nested
     // workflow()'s in-flight agents are still tracked in this SAME shared set
     // and get drained once, here, when the whole run finishes.

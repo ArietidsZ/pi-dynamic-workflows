@@ -204,10 +204,10 @@ export interface PersistedRunState {
   autoResumeAttempts?: number;
   /**
    * Journal replay policy chosen for this run's resumes (see
-   * WorkflowRunOptions.resumeMode in workflow.ts). Set by the first resume()
-   * that passes one and carried forward so later resumes — including
-   * cold-start workflow_control resumes — keep it unless they explicitly
-   * override. Absent means "prefix" (the default).
+   * WorkflowRunOptions.resumeMode in workflow.ts). Declared at start or by
+   * the first resume() that passes one, and carried forward so later resumes
+   * — including cold-start workflow_control resumes — keep it unless they
+   * explicitly override. Absent means "prefix" (the default).
    */
   resumeMode?: WorkflowResumeMode;
   /**
