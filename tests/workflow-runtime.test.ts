@@ -1799,6 +1799,97 @@ return xs`;
   assert.deepEqual(resumed.result, ["plan-for-REAL", "ran:sibling"]);
 });
 
+test("replay-completed resume treats a nested frame's SYNC-PREFIX calls as sequential (#231 R3)", async () => {
+  // R3 F1: the child frame's script executes synchronously inside the
+  // ancestor fan-out's dispatch window (runWorkflow has no await before the
+  // vm runs the script), so without frame scoping the child's synchronous
+  // double-dispatch would capture the ANCESTOR batch as its generation and
+  // replay PLAN across the child's own gap — stale. Generations are
+  // frame-scoped: the child samples generation undefined, and its internal
+  // gap shadows everything after it.
+  const child = `export const meta = { name: 'kid', description: 'kid' }
+const p1 = agent('GAP', { label: 'g' })
+const p2 = agent('PLAN', { label: 'p' })
+const [a, b] = await Promise.all([p1, p2])
+return { a, b }`;
+  const parent = `export const meta = { name: 'par', description: 'par' }
+const [n] = await parallel([() => workflow('kid')])
+return n`;
+  const seeded = { value: undefined as string | undefined };
+  const makeRunner = (gapFails: boolean, calls: { n: number }) => ({
+    async run(prompt: string) {
+      calls.n++;
+      if (prompt === "GAP") {
+        if (gapFails) return "";
+        seeded.value = "REAL";
+        return "REAL";
+      }
+      if (prompt === "PLAN") return `plan-for-${seeded.value ?? "undefined"}`;
+      return `ran:${prompt}`;
+    },
+  });
+  const firstCalls = { n: 0 };
+  const journal: JournalEntry[] = [];
+  const initial = await runWorkflow<{ a: string | null; b: string }>(parent, {
+    agent: makeRunner(true, firstCalls),
+    persistLogs: false,
+    runId: "nested-sync-gap-run",
+    loadSavedWorkflow: (name) => (name === "kid" ? child : undefined),
+    onAgentJournal: (e) => journal.push(e),
+  });
+  assert.equal(initial.result?.b, "plan-for-undefined", "run 1: PLAN saw no seed");
+
+  seeded.value = undefined;
+  const secondCalls = { n: 0 };
+  const resumed = await runWorkflow<{ a: string | null; b: string }>(parent, {
+    agent: makeRunner(false, secondCalls),
+    persistLogs: false,
+    runId: "nested-sync-gap-run",
+    loadSavedWorkflow: (name) => (name === "kid" ? child : undefined),
+    resumeJournal: journalMap(journal),
+    resumeMode: "replay-completed",
+  });
+  assert.equal(secondCalls.n, 2, "the child's gap AND its sync-prefix sibling re-run: no cross-frame generation");
+  assert.equal(resumed.result?.a, "REAL");
+  assert.equal(resumed.result?.b, "plan-for-REAL", "PLAN re-computed against the gap's new output");
+});
+
+test("replay-completed resume still replays siblings inside a nested frame's OWN fan-out (#231 R3)", async () => {
+  // Frame scoping must not over-shadow: the child's own parallel() creates a
+  // batch tagged with the CHILD's frame, so genuine same-window siblings of
+  // the child's internal gap still replay.
+  const child = `export const meta = { name: 'kid', description: 'kid' }
+const xs = await parallel([
+  () => agent('GAP', { label: 'g' }),
+  () => agent('sib', { label: 's' }),
+])
+return xs`;
+  const parent = `export const meta = { name: 'par', description: 'par' }
+const n = await workflow('kid')
+return n`;
+  const first = gappingAgent("GAP");
+  const journal: JournalEntry[] = [];
+  await runWorkflow(parent, {
+    agent: first.runner,
+    persistLogs: false,
+    runId: "nested-own-fanout-run",
+    loadSavedWorkflow: (name) => (name === "kid" ? child : undefined),
+    onAgentJournal: (e) => journal.push(e),
+  });
+
+  const second = countingAgent();
+  const resumed = await runWorkflow<string[]>(parent, {
+    agent: second.runner,
+    persistLogs: false,
+    runId: "nested-own-fanout-run",
+    loadSavedWorkflow: (name) => (name === "kid" ? child : undefined),
+    resumeJournal: journalMap(journal),
+    resumeMode: "replay-completed",
+  });
+  assert.equal(second.state.calls, 1, "only the child's internal gap re-runs; its own-fan-out sibling replays");
+  assert.deepEqual(resumed.result, ["ran:GAP", "ran:sib"]);
+});
+
 test("an unusable cached entry (empty output) is an edit, not a gap, in replay-completed mode", async () => {
   // Defensive branch: organic empty output is never journaled, but a legacy or
   // hand-edited journal CAN hold an unusable entry. It must pin firstEdit

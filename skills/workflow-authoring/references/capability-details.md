@@ -334,7 +334,7 @@ Every exact fact below is projected from the installed extension's capability co
 - Signature: `resumeMode?: "prefix" \| "replay-completed" = "prefix"`
 - Constraint: applies only together with resumeFromRunId
 - Constraint: prefix: the first changed, new, or never-completed call and every later call re-run live
-- Constraint: replay-completed: completed calls replay across a never-completed gap within the same fan-out batch; a changed call still re-runs its whole suffix
+- Constraint: replay-completed: completed calls replay across a never-completed gap only when dispatched concurrently with the gap in one fan-out; a changed call still re-runs its whole suffix
 - Constraint: an explicit choice persists on the run; later resumes keep it unless overridden
 - Constraint: shared-store and filesystem results are not hash-checked and can replay stale across a gap
 

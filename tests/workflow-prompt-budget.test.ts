@@ -68,7 +68,10 @@ const RENDERED_PROMPT_BUDGET_BYTES = 800;
 // #231 R2 cross-referenced resumeMode from the resumeFromRunId description,
 // increasing the measured definition from 4,863 to 4,880 bytes (+17); the
 // ceiling moves with it.
-const TOOL_DEFINITION_BUDGET_BYTES = 4_880;
+// #231 R3 replaced the superseded "same fan-out batch" wording with the
+// concurrent-dispatch rule, increasing the measured definition from 4,880
+// to 4,902 bytes (+22); the ceiling moves with it.
+const TOOL_DEFINITION_BUDGET_BYTES = 4_902;
 
 test("rendered workflow prompt contribution stays within its accepted size", async () => {
   await withRenderedWorkflow(async ({ systemPrompt, promptLines }) => {

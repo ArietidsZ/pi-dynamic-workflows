@@ -383,6 +383,81 @@ test(
 );
 
 test(
+  "workflow tool: the resume confirmation describes the EFFECTIVE (persisted) replay policy, not the omitted parameter (#231 R3)",
+  withToolTempCwd(async (cwd) => {
+    const attempts = new Map<string, number>();
+    let markFirst: () => void = () => {};
+    const firstStarted = new Promise<void>((resolve) => {
+      markFirst = resolve;
+    });
+    let markSecond: () => void = () => {};
+    const secondStarted = new Promise<void>((resolve) => {
+      markSecond = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string, options?: { onUsage?: (u: AgentUsage) => void; signal?: AbortSignal }) {
+          options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+          const attempt = (attempts.get(prompt) ?? 0) + 1;
+          attempts.set(prompt, attempt);
+          if (prompt === "p0" && attempt <= 2) {
+            (attempt === 1 ? markFirst : markSecond)();
+            await new Promise<void>((_resolve, reject) => {
+              options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+            });
+          }
+          return `${prompt}-done`;
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const fanoutScript = `export const meta = { name: 'fan_gap', description: 'fan-out gap' }
+const xs = await parallel(['p0','p1','p2'].map((p) => () => agent(p, { label: p })))
+return xs`;
+
+    const { runId, promise } = manager.startInBackground(fanoutScript);
+    promise.catch(() => {});
+    await firstStarted;
+    for (let i = 0; i < 2000; i++) {
+      if ((manager.getPersistence().load(runId)?.journal?.length ?? 0) >= 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(manager.pause(runId), true);
+    // Persist replay-completed via a first resume (paused again mid-gap-retry).
+    assert.equal(await manager.resume(runId, { resumeMode: "replay-completed" }), true);
+    await secondStarted;
+    assert.equal(manager.pause(runId), true);
+    assert.equal(manager.getPersistence().load(runId)?.resumeMode, "replay-completed");
+
+    // The tool resume OMITS resumeMode: the run's persisted replay-completed
+    // policy is what will actually execute, and the confirmation must say so.
+    const tool = createWorkflowTool({ cwd, manager });
+    const result = await tool.execute(
+      "t-resume",
+      { script: fanoutScript, resumeFromRunId: runId },
+      undefined,
+      undefined,
+      undefined,
+    );
+    const text = (result.content[0] as { type: "text"; text: string }).text;
+    assert.match(
+      text,
+      /fan-out siblings across a never-completed gap/,
+      "the confirmation describes the effective replay-completed policy",
+    );
+    assert.doesNotMatch(text, /newly inserted agent\(\) call/, "it does not describe the prefix-only policy");
+
+    for (let i = 0; i < 2000 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(manager.getPersistence().load(runId)?.status, "completed");
+    assert.equal(attempts.get("p1"), 1, "the persisted replay-completed policy really did replay p1");
+    assert.equal(attempts.get("p2"), 1, "the persisted replay-completed policy really did replay p2");
+  }),
+);
+
+test(
   "workflow tool: resumeFromRunId pointing at a running run errors clearly",
   withToolTempCwd(async (cwd) => {
     const da = deferredToolAgent();

@@ -116,7 +116,7 @@ const workflowToolSchema = Type.Object({
   resumeMode: Type.Optional(
     Type.Union([Type.Literal("prefix"), Type.Literal("replay-completed")], {
       description:
-        "Replay policy with resumeFromRunId. prefix (default): the first changed/new/never-completed call onward re-runs. replay-completed: completed calls also replay across a never-completed gap within the same fan-out batch (paused fan-out); a changed call still re-runs its suffix. Store/file-passed results are not hash-checked and can replay stale across a gap.",
+        "Replay policy with resumeFromRunId. prefix (default): the first changed/new/never-completed call onward re-runs. replay-completed: completed calls also replay across a never-completed gap when dispatched concurrently with it in one fan-out (paused fan-out); a changed call still re-runs its suffix. Store/file-passed results are not hash-checked and can replay stale across a gap.",
     }),
   ),
 });
@@ -259,7 +259,16 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           throw new Error(resumeFailureText(manager, runId, params.maxAgents));
         }
         return {
-          content: [{ type: "text", text: resumedText(parsed.meta.name, runId, params.resumeMode) }],
+          content: [
+            {
+              type: "text",
+              // The EFFECTIVE policy decides the replay description: an omitted
+              // resumeMode falls back to the run's persisted mode (see
+              // WorkflowManager.resume), so params.resumeMode alone can
+              // misdescribe what the resumed run will actually do.
+              text: resumedText(parsed.meta.name, runId, manager.getRun(runId)?.resumeMode ?? params.resumeMode),
+            },
+          ],
           details: { runId, background: true, resumedFrom: runId },
         };
       }

@@ -49,7 +49,7 @@ export const WORKFLOW_AUTHORING_FROZEN_FILES = [
   },
   {
     path: "skills/workflow-authoring/references/lifecycle.md",
-    sha256: "a62d4de75653e200c92b6d3f5519d15d8be45ab59706f077e7ef84be00e28f2c",
+    sha256: "338514490ad2f2d6f31b41322ceab75b5c4bb746068ee6f08adfb53e18c9ffd1",
   },
   {
     path: "skills/workflow-authoring/references/pattern-selection.md",

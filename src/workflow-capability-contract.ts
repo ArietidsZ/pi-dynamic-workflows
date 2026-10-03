@@ -516,7 +516,7 @@ const capabilities: readonly CapabilityDescriptor[] = [
   toolInput("resumeMode", 'resumeMode?: "prefix" | "replay-completed" = "prefix"', [
     "applies only together with resumeFromRunId",
     "prefix: the first changed, new, or never-completed call and every later call re-run live",
-    "replay-completed: completed calls replay across a never-completed gap within the same fan-out batch; a changed call still re-runs its whole suffix",
+    "replay-completed: completed calls replay across a never-completed gap only when dispatched concurrently with the gap in one fan-out; a changed call still re-runs its whole suffix",
     "an explicit choice persists on the run; later resumes keep it unless overridden",
     "shared-store and filesystem results are not hash-checked and can replay stale across a gap",
   ]),
