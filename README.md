@@ -77,7 +77,7 @@ return await agent(
 
 - **Real parallel orchestration** — fan out up to 16 concurrent and 1000 total subagents from one orchestration script.
 - **Per-agent model routing** — use `small`, `medium`, or `big` tiers, or choose an exact provider/model and thinking level.
-- **Journaled resume** — replay completed agents after interruption without rerunning them or spending their tokens again. The orchestrator can also resume with an **edited script** (`resumeFromRunId`): unchanged `agent()` calls replay from cache and only edited/new ones re-run — so a single bad prompt no longer means paying to re-run the whole workflow.
+- **Journaled resume** — replay completed agents after interruption instead of spending their tokens again. Replay follows the longest-unchanged-prefix rule: the first call that never journaled (or whose script changed) and everything after it re-run live; pass `resumeMode: "replay-completed"` when resuming to also replay completed calls across a never-completed gap (e.g. a `parallel()` fan-out paused mid-flight). The orchestrator can also resume with an **edited script** (`resumeFromRunId`): unchanged `agent()` calls replay from cache and only edited/new ones re-run — so a single bad prompt no longer means paying to re-run the whole workflow.
 - **Git worktree isolation** — parallel agents edit on separate branches with `isolation: "worktree"`. Kept by default for merge; pass `keepWorktree: false` to delete (tests).
 - **Measured usage** — report real tokens and cost from each subagent session; add run, phase, or agent budgets only when you want them. When a provider session ends without reporting usage, the affected totals are heuristic character estimates and UI token surfaces render them with a `~` prefix (e.g. `~640 tok`) — never silently as metered figures. (Script-facing `budget.spent()/remaining()` are raw numbers and cannot carry the marker.)
 - **Visible background runs** — track phases, agents, models, fresh/cache tokens, cost, and live tok/s from the progress panel or `/workflows` navigator.
@@ -118,6 +118,7 @@ The installed extension generates this compact index from its executable capabil
 | agentTimeoutMs | workflow-tool-input | `agentTimeoutMs?: number = configured default or unbounded` | — |
 | tokenBudget | workflow-tool-input | `tokenBudget?: number = configured default or unlimited` | — |
 | resumeFromRunId | workflow-tool-input | `resumeFromRunId?: string` | — |
+| resumeMode | workflow-tool-input | `resumeMode?: "prefix" \| "replay-completed" = "prefix"` | — |
 <!-- END GENERATED SUPPORTED WORKFLOW CAPABILITIES -->
 
 ## Built-in workflows
@@ -300,7 +301,7 @@ The default `workflow` also matches `workflows`; a custom word matches exactly. 
 | Isolated subagent contexts | Fresh in-memory Pi sessions; results remain in variables |
 | Structured outputs | JSON Schema validation with bounded repair |
 | Background runs | Non-blocking run, live panel, and automatic result delivery |
-| Resume | Journaled replay of the unchanged completed prefix, including edit-and-resume with a revised script (`resumeFromRunId`) |
+| Resume | Journaled replay of the unchanged completed prefix, including edit-and-resume with a revised script (`resumeFromRunId`) and an opt-in `replay-completed` mode for fan-outs paused mid-flight |
 | Model selection | Per-agent and per-phase routing across authenticated providers |
 | Ultracode | `/ultracode` or `/effort ultra` |
 | Additional Pi features | Worktree isolation, real cost accounting, deep research, and quality-pattern helpers |
@@ -314,6 +315,8 @@ Workflow scripts run in a Node `vm` sandbox. `Date.now()`, `Math.random()`, `new
 Journal replay — including edit-and-resume via `resumeFromRunId` — matches cached agent results by **positional call index** (the order in which `agent()` calls execute), the same contract Claude Code uses. Editing an `agent()` prompt in place reuses the cache up to that call and re-runs it and everything after. Inserting, removing, or reordering an `agent()` call before others shifts their positions and invalidates the cache from that point on (mismatched calls simply re-run — no crash). To preserve the cached prefix, keep the earlier still-good `agent()` calls unchanged and in the same order.
 
 Only a call that finishes with a real result is journaled — a call whose every attempt ended in a recoverable failure (including one that only ever produced `AGENT_EMPTY_OUTPUT`) is never cached. Resuming such a run with `resumeFromRunId` therefore replays every earlier, already-succeeded call from cache and re-runs only that one call and everything lexically after it — cheap and exactly targeted, not a full re-run of the fleet.
+
+A call interrupted before it could journal (a pause mid-`parallel()`, a usage-limit stop) is a **gap**: under the default prefix rule it ends the replayable prefix, so its completed later siblings re-run live on resume. For fan-outs where that re-spend is unacceptable, resume with `resumeMode: "replay-completed"` (on `workflow`'s `resumeFromRunId` call or `workflow_control`'s `resume` action): completed calls replay across gaps, while a changed call still re-runs its whole suffix. Results that flowed through the shared store rather than prompts can replay stale values across a re-run gap — no hash observes store reads — so keep the default when agents coordinate through the store across the gap.
 
 ## Upgrading to 3.0
 

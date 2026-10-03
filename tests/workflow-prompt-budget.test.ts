@@ -58,7 +58,11 @@ const RENDERED_PROMPT_BUDGET_BYTES = 800;
 // instead. The exact wording increases the measured definition from 4,276
 // to 4,392 bytes (+116), and the accepted ceiling moves with it, from
 // 4,283 to 4,392.
-const TOOL_DEFINITION_BUDGET_BYTES = 4_392;
+//
+// #231 adds the optional resumeMode parameter (the replay-completed
+// journal policy for runs paused mid-fan-out), increasing the measured
+// definition from 4,392 to 4,751 bytes (+359); the ceiling moves with it.
+const TOOL_DEFINITION_BUDGET_BYTES = 4_751;
 
 test("rendered workflow prompt contribution stays within its accepted size", async () => {
   await withRenderedWorkflow(async ({ systemPrompt, promptLines }) => {

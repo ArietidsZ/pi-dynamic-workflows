@@ -28,6 +28,8 @@ Resume replays only the longest unchanged prefix of journaled calls. Once one ca
 
 Only a call that finishes with a real result is journaled. A call whose every attempt was recoverable (including one that only ever produced `AGENT_EMPTY_OUTPUT`) contributes no journal entry, so resuming that run reruns exactly that call and everything lexically after it live; the earlier, already-succeeded prefix still replays from cache.
 
+A call interrupted before it could journal (a pause mid-fan-out, a usage-limit stop) is likewise a gap that ends the replayable prefix. A host resume may opt into `resumeMode: "replay-completed"`: completed calls then replay across such gaps until the first changed call, whose suffix still executes live. No hash observes shared-store reads, so results that flowed through the store rather than prompts can replay stale across a re-run gap — pass per-item data through prompt/result values when a workflow may be resumed this way.
+
 The runtime blocks common accidental nondeterminism, but this is not a security boundary. Pass timestamps, randomness, and external decisions through `args`.
 
 ## Nesting and shared state

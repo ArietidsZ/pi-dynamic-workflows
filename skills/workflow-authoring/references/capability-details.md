@@ -326,6 +326,16 @@ Every exact fact below is projected from the installed extension's capability co
 - Constraint: unchanged positional agent calls replay from cache until the first changed or inserted call
 - Constraint: always runs in the background
 
+<a id="tool-input-resumemode"></a>
+## resumeMode
+
+- Classification: `workflow-tool-input`
+- Support: `supported`
+- Signature: `resumeMode?: "prefix" \| "replay-completed" = "prefix"`
+- Constraint: applies only together with resumeFromRunId
+- Constraint: prefix: the first changed, new, or never-completed call and every later call re-run live
+- Constraint: replay-completed: completed calls after a never-completed gap replay from cache until the first changed call, whose suffix still re-runs
+
 <a id="metadata"></a>
 ## export const meta
 

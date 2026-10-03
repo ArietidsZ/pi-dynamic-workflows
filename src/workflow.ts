@@ -250,6 +250,20 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   resumeJournal?: Map<string, JournalEntry>;
   /** Resume: the run being resumed (informational; enables resume mode). */
   resumeFromRunId?: string;
+  /**
+   * Journal replay policy for a resumed run. "prefix" (default): longest-
+   * unchanged-prefix — the first call that misses the journal (changed, new,
+   * or never completed) and every later call run live. "replay-completed": a
+   * never-completed gap (no journal entry — e.g. a call paused mid-flight
+   * inside a parallel() fan-out) no longer forces its completed successors to
+   * re-run; every call whose hash still matches its journal entry replays up
+   * to the first CHANGED call, which still invalidates its whole suffix in
+   * both modes. Opt in per resume when re-spending completed parallel
+   * siblings is worse than the caveat: dependencies that flow through the
+   * shared store (not prompts) can replay stale values across a re-run gap,
+   * because no hash observes store reads.
+   */
+  resumeMode?: "prefix" | "replay-completed";
   /** Called after each live agent completes so the caller can persist the journal. */
   onAgentJournal?: (entry: JournalEntry) => void;
   /** Active durable checkpoint response supplied by WorkflowManager.resume(). */
@@ -501,11 +515,25 @@ interface RuntimeState {
   /** Monotonic, assigned at lexical agent() call time — the stable resume key. */
   callSeq: number;
   /**
-   * Index of the first call that missed the resume journal (changed or new).
-   * Longest-unchanged-prefix resume: a cached result is replayed only while
-   * callIndex < firstMiss; once a call misses, it AND everything after run live.
+   * Index of the first call that missed the resume journal (changed, new, or
+   * never completed). Longest-unchanged-prefix resume: a cached result is
+   * replayed only while callIndex < firstMiss; once a call misses, it AND
+   * everything after run live.
    */
   firstMiss: number;
+  /**
+   * Index of the first call whose journal entry EXISTS but is unusable (hash
+   * changed, or an unusable cached result such as empty output) — the edit
+   * boundary. Differs from firstMiss only at a gap (no journal entry at all:
+   * the call never completed, e.g. paused mid-flight), which pins firstMiss
+   * but not firstEdit. Only "replay-completed" resume mode reads this field:
+   * there a completed call after a gap still replays (callIndex < firstEdit),
+   * while a changed call invalidates its whole suffix exactly like prefix
+   * mode. A positional script edit (insert/remove/reorder) still surfaces as
+   * an EXISTING entry with a mismatched hash at the shifted indexes, i.e. as
+   * an edit — pure gaps only ever mean "nothing completed at this position".
+   */
+  firstEdit: number;
 }
 
 type AnyNode = Node & { [key: string]: any; start: number; end: number };
@@ -607,6 +635,21 @@ export async function runWorkflow<T = unknown>(
     ),
     callSeq: 0,
     firstMiss: Number.POSITIVE_INFINITY,
+    firstEdit: Number.POSITIVE_INFINITY,
+  };
+
+  // Replay boundary + miss bookkeeping, shared by the agent() and checkpoint()
+  // replay sites below so "prefix" and "replay-completed" stay consistent
+  // across both. The boundary is the ONLY thing the mode changes: replay is
+  // free (no usage commits), so post-gap replays cost nothing either way.
+  const journalReplayBoundary = () => (options.resumeMode === "replay-completed" ? state.firstEdit : state.firstMiss);
+  const noteJournalMiss = (missedIndex: number, entry: JournalEntry | null | undefined) => {
+    state.firstMiss = Math.min(state.firstMiss, missedIndex);
+    // An entry that EXISTS but is unusable (changed hash, empty cached result)
+    // is an edit: its whole suffix runs live in every mode. A gap (no entry —
+    // the call never completed) only ends the unchanged prefix;
+    // "replay-completed" mode lets later completed calls replay across it.
+    if (entry != null) state.firstEdit = Math.min(state.firstEdit, missedIndex);
   };
 
   const agentRunner = options.agent ?? new WorkflowAgent(options);
@@ -924,11 +967,14 @@ export async function runWorkflow<T = unknown>(
     // calls throw.)
     shared.agentCount++;
     const label = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount);
-    // Longest-unchanged-prefix resume: replay a cached result only while the
-    // prefix is still intact — this call's index is before the first changed/new
-    // call. Once any call misses, it AND everything after it run live (matching
-    // Claude Code's contract), so an edited upstream call never leaves stale
-    // downstream results served from the journal.
+    // Resume replay: a cached result replays only while this call's index is
+    // before the mode's replay boundary (see journalReplayBoundary). "prefix"
+    // mode (default): the boundary is the first miss of ANY kind — once a call
+    // misses, it AND everything after run live (matching Claude Code's
+    // contract), so an edited upstream call never leaves stale downstream
+    // results served from the journal. "replay-completed" mode: the boundary
+    // is the first EDIT — a never-completed gap no longer forces completed
+    // later calls to re-run.
     // Namespaced the same way as SharedStore's deltaKey (deltaKey IS this
     // exact `${runId}:${callIndex}` string) so a nested workflow()'s
     // callIndex-0 can never accidentally replay the parent's callIndex-0
@@ -937,7 +983,7 @@ export async function runWorkflow<T = unknown>(
     const cached = agentOptions.thread ? undefined : options.resumeJournal?.get(deltaKey);
     const hashMatches = cached != null && cached.hash === callHash;
     const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
-    if (!shared.resumeBarrierReached && hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
+    if (!shared.resumeBarrierReached && hashMatches && !cachedEmptyOutput && callIndex < journalReplayBoundary()) {
       // Replay preserves the journaled model and historical session identity.
       const replayModel = cached.model ?? displayModel;
       options.onAgentStart?.({
@@ -962,10 +1008,11 @@ export async function runWorkflow<T = unknown>(
       if (cached.storeDelta) store.applyDelta(cached.storeDelta);
       return cached.result;
     }
-    // A genuine miss (no journal entry, or the hash changed) marks where the
-    // unchanged prefix ends; this call and every later one then run live.
+    // A genuine miss (no journal entry, or the hash changed, or an unusable
+    // cached result) marks where replay ends for this mode — see
+    // noteJournalMiss for the gap-vs-edit distinction.
     if (!hashMatches || cachedEmptyOutput) {
-      state.firstMiss = Math.min(state.firstMiss, callIndex);
+      noteJournalMiss(callIndex, cached);
     }
 
     // Budget gates, deliberately AFTER the replay lookup: a journaled cache hit
@@ -1408,23 +1455,29 @@ export async function runWorkflow<T = unknown>(
     options.onRuntimeEvent?.({ type: "workflow", stage: "start", name: workflowName, args: childArgs });
     try {
       // Propagate the resumeJournal into the child frame ONLY while the
-      // parent's own longest-unchanged-prefix is still intact at the moment
-      // of this workflow() call (state.firstMiss === Infinity, i.e. every
-      // parent agent()/checkpoint() call BEFORE this one was a cache hit).
-      // This is namespacing-safe (see JournalEntry.runId) but namespacing
-      // alone is NOT sufficient: SharedStore content itself is not part of
+      // parent's own replay boundary is still intact at the moment of this
+      // workflow() call. In "prefix" mode that boundary is the first miss of
+      // any kind (state.firstMiss === Infinity, i.e. every parent
+      // agent()/checkpoint() call BEFORE this one was a cache hit). In
+      // "replay-completed" mode it is the first EDIT (state.firstEdit): a
+      // never-completed gap wrote nothing in the original run, so the child's
+      // journaled entries — also computed without any writes from that call —
+      // stay as valid as they are for the parent's own post-gap calls.
+      // Namespacing alone (see JournalEntry.runId) is NOT sufficient for the
+      // edit case: SharedStore content itself is not part of
       // any call's hash, so a cached child result was computed against
       // whatever store state the UPSTREAM parent calls had written at the
-      // time it originally ran live. If an upstream parent call misses
-      // (edited script) and re-runs live, it may write different store
+      // time it originally ran live. If an upstream parent call is edited and
+      // re-runs live, it may write different store
       // values than it did originally — a child cached under the OLD store
       // state would then be replaying a result that's stale with respect to
       // the NEW live state, even though the child's own hash still matches.
-      // The prefix contract already treats "this call sits after a miss" as
-      // "must run live" for calls within one frame; a nested workflow() is
-      // no exception; once anything upstream in the parent has missed, cut
+      // Once anything upstream in the parent has been edited, cut
       // the child off from the journal entirely so it runs fully live.
-      const prefixIntact = state.firstMiss === Number.POSITIVE_INFINITY;
+      const prefixIntact =
+        options.resumeMode === "replay-completed"
+          ? state.firstEdit === Number.POSITIVE_INFINITY
+          : state.firstMiss === Number.POSITIVE_INFINITY;
       const child = await workflowNestingScope.run(nestingDepth + 1, () =>
         runWorkflow(childScript, {
           ...options,
@@ -1685,14 +1738,14 @@ export async function runWorkflow<T = unknown>(
       !shared.resumeBarrierReached &&
       cached != null &&
       cached.hash === callHash &&
-      callIndex < state.firstMiss &&
+      callIndex < journalReplayBoundary() &&
       !replayingActiveCheckpoint
     ) {
       shared.agentCount++;
       return cached.result;
     }
     if (cached == null || cached.hash !== callHash) {
-      state.firstMiss = Math.min(state.firstMiss, callIndex);
+      noteJournalMiss(callIndex, cached);
     }
     shared.agentCount++;
 

@@ -113,6 +113,12 @@ const workflowToolSchema = Type.Object({
       ].join(" "),
     }),
   ),
+  resumeMode: Type.Optional(
+    Type.Union([Type.Literal("prefix"), Type.Literal("replay-completed")], {
+      description:
+        "Replay policy with resumeFromRunId. prefix (default): the first changed/new/never-completed call onward re-runs. replay-completed: completed calls also replay across a never-completed gap (paused fan-out); a changed call still re-runs its suffix.",
+    }),
+  ),
 });
 
 export type WorkflowToolInput = {
@@ -126,6 +132,7 @@ export type WorkflowToolInput = {
   agentTimeoutMs?: number;
   tokenBudget?: number;
   resumeFromRunId?: string;
+  resumeMode?: "prefix" | "replay-completed";
 };
 
 export interface WorkflowToolOptions {
@@ -235,6 +242,9 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       // replay from the prior run's journal; the first edited/new call and
       // everything after it re-run live. Always background (the resumed run is
       // detached and its result is delivered back into the conversation).
+      if (params.resumeMode !== undefined && !params.resumeFromRunId) {
+        throw new Error("workflow: `resumeMode` only applies together with `resumeFromRunId`.");
+      }
       if (params.resumeFromRunId) {
         const runId = params.resumeFromRunId;
         const resumed = await manager.resume(runId, {
@@ -243,6 +253,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           // Explicit raise only — resume keeps the start-time cap unless the
           // caller passes a higher maxAgents (see WorkflowManager.resume, #146).
           maxAgents: params.maxAgents,
+          resumeMode: params.resumeMode,
         });
         if (!resumed) {
           throw new Error(resumeFailureText(manager, runId, params.maxAgents));

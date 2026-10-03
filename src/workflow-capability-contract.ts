@@ -513,6 +513,11 @@ const capabilities: readonly CapabilityDescriptor[] = [
     "unchanged positional agent calls replay from cache until the first changed or inserted call",
     "always runs in the background",
   ]),
+  toolInput("resumeMode", 'resumeMode?: "prefix" | "replay-completed" = "prefix"', [
+    "applies only together with resumeFromRunId",
+    "prefix: the first changed, new, or never-completed call and every later call re-run live",
+    "replay-completed: completed calls after a never-completed gap replay from cache until the first changed call, whose suffix still re-runs",
+  ]),
   {
     id: "workflow.script.metadata",
     label: "export const meta",

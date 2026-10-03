@@ -258,6 +258,12 @@ export interface ExecOptions {
   resumeJournal?: Map<string, JournalEntry>;
   /** Durable checkpoint response being replayed by this execution. */
   resumeCheckpoint?: WorkflowCheckpoint;
+  /**
+   * Journal replay policy for a resumed execution — see
+   * WorkflowRunOptions.resumeMode in workflow.ts. Per-execution (not persisted):
+   * each resume() call picks; omit keeps "prefix".
+   */
+  resumeMode?: "prefix" | "replay-completed";
 
   /** Cap on total agents for this run. */
   maxAgents?: number;
@@ -318,6 +324,14 @@ export interface WorkflowResumeOptions {
   args?: unknown;
   maxAgents?: number;
   checkpointId?: string;
+  /**
+   * "replay-completed" opts this resume into replaying completed journaled
+   * calls across never-completed gaps (e.g. a parallel() fan-out paused
+   * mid-flight), instead of re-running every call after the first gap. A
+   * changed call still re-runs its whole suffix. Omit keeps "prefix". See
+   * WorkflowRunOptions.resumeMode in workflow.ts for the store-staleness caveat.
+   */
+  resumeMode?: "prefix" | "replay-completed";
 }
 
 export interface WorkflowManagerOptions {
@@ -869,6 +883,7 @@ export class WorkflowManager extends EventEmitter {
     const {
       resumeJournal,
       resumeCheckpoint,
+      resumeMode,
       maxAgents,
       agentTimeoutMs,
       externalSignal,
@@ -970,6 +985,7 @@ export class WorkflowManager extends EventEmitter {
         loadSavedWorkflow: this.loadSavedWorkflow,
         resumeJournal,
         resumeFromRunId: resumeJournal ? managed.runId : undefined,
+        resumeMode,
         resumeCheckpoint,
         onWorkflowCheckpoint: (checkpoint) => {
           const previousCheckpoint = managed.checkpoint;
@@ -2158,6 +2174,7 @@ export class WorkflowManager extends EventEmitter {
     const execution = this.executeRun(managed, script, args, {
       resumeJournal,
       resumeCheckpoint: resumeCheckpoint?.status === "resuming" ? resumeCheckpoint : undefined,
+      resumeMode: opts?.resumeMode,
       initialTokenUsage: priorTokenUsage,
       // Adopt the persisted phase sub-budget baselines so a phase ceiling
       // holds cumulatively across this resume (audit2 #4).
