@@ -2536,6 +2536,71 @@ return { n, c }`;
   assert.equal(cCalls, 1, "the child's sweep-deferred gap must re-run the parent's post-child call live");
 });
 
+test("a deferred child dispatch never races ahead of the parent's post-child call outside a replay (#231 R12)", async () => {
+  // Base-runtime ordering contract: awaiting a workflow() child resumes the
+  // parent on the child's own settlement microtask — any wrapper that adds a
+  // tick (a .finally()/.then() on the child promise) lets a microtask-deferred
+  // dispatch inside the child run FIRST, which is result-visible when the
+  // parent's post-child call observes that dispatch's side effect. The gate
+  // frame's post-child call (#231 R12 F1). The gate below releases X after
+  // two promise-adoption hops — calibrated so it lands in the one-tick window
+  // between the base-timing parent resume (C wins: "c-sees-unset") and a
+  // +1-tick resume (X wins: "c-sees-set"); a shorter chain fires before even
+  // the base resume and cannot discriminate. Prefix fresh, a fresh start that
+  // merely DECLARES replay-completed, and a prefix resume must all exhibit
+  // the base order — only an actual replay-completed resume may tick.
+  const child = `export const meta = { name: 'kidTick', description: 'k' }
+let release;
+const gate = new Promise((r) => { release = r; });
+const p = (async () => { await gate; const x = await agent('X'); return x; })();
+let c = Promise.resolve();
+c = c.then(() => Promise.resolve());
+c = c.then(() => Promise.resolve());
+c.then(() => { release(); });
+return 'kid-done'`;
+  const parent = `export const meta = { name: 'parTick', description: 'p' }
+const n = await workflow('kidTick')
+const c = await agent('C')
+return { n, c }`;
+
+  const scenario = async (extra: Record<string, unknown>, runId: string) => {
+    let side = "unset";
+    const events: string[] = [];
+    const result = await runWorkflow(parent, {
+      agent: {
+        async run(prompt: string) {
+          if (prompt === "X") {
+            side = "set";
+            events.push("X");
+            return "x-done";
+          }
+          events.push("C");
+          return `c-sees-${side}`;
+        },
+      },
+      persistLogs: false,
+      runId,
+      loadSavedWorkflow: (name) => (name === "kidTick" ? child : undefined),
+      ...extra,
+    });
+    return { c: result.result.c, events };
+  };
+
+  for (const [label, extra] of [
+    ["prefix fresh", {}],
+    ["declared fresh", { resumeMode: "replay-completed" }],
+    ["prefix resume", { resumeJournal: journalMap([]), resumeMode: "prefix" }],
+  ] as const) {
+    const { c, events } = await scenario(extra, `r12-tick-${label}`);
+    assert.equal(
+      c,
+      "c-sees-unset",
+      `${label}: the parent's post-child call must run before the deferred child dispatch`,
+    );
+    assert.deepEqual(events.slice(0, 1), ["C"], `${label}: C must dispatch first`);
+  }
+});
+
 test("an unusable cached entry (empty output) is an edit, not a gap, in replay-completed mode", async () => {
   // Defensive branch: organic empty output is never journaled, but a legacy or
   // hand-edited journal CAN hold an unusable entry. It must pin firstEdit

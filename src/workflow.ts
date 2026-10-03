@@ -1659,55 +1659,74 @@ export async function runWorkflow<T = unknown>(
       // signal would also fire for a concurrent SIBLING frame's misses,
       // forcing this child's clean post-return calls live (#231 R5 F1).
       let childOwnMisses = 0;
-      const child = await workflowNestingScope
-        .run(nestingDepth + 1, () =>
-          runWorkflow(childScript, {
-            ...options,
-            // After ...options so this frame's count is exact: the hook is
-            // scoped to the frame it is passed to, so the wrapper REPLACES any
-            // outer hook rather than chaining into it (a top-level hook must
-            // not fire for child-frame misses, #231 R6).
-            onJournalMiss: () => {
-              childOwnMisses++;
-            },
-            args: childArgs,
-            sharedRuntime: shared,
-            // Propagate the parent's store so nested agents share the same key-value space.
-            sharedStore: store,
-            resumeJournal: prefixIntact ? options.resumeJournal : undefined,
-            resumeFromRunId: undefined,
-            // Reuse the same runner so named threads span parent/child frames but
-            // still die with this one top-level runWorkflow invocation.
-            agent: agentRunner,
-            // shared.nestedCallSeq, not shared.depth — see its doc comment: depth
-            // returns to 0 between sequential sibling calls, which would otherwise
-            // mint the same child runId (and hence colliding deltaKeys/event ids)
-            // for two different children.
-            runId: `${runId}-nested${++shared.nestedCallSeq}`,
-            // The registry is snapshotted ONCE per run (:500): forward the
-            // already-loaded registry so a mid-run .md edit can't change
-            // agentDefinitionKey for nested-frame calls only (those journal
-            // entries would cache-miss on resume, nondeterministically).
-            agentRegistry,
-            persistLogs: false,
-          }),
-        )
-        .finally(() => {
-          // A child that re-ran ANY call live across an internal gap or edit
-          // may have changed the store/return values the rest of THIS frame
-          // depends on, and this frame's own boundary never saw the child's
-          // per-frame misses. Calls dispatched after the child returns are
-          // its sequential downstream — advancing this frame's edit boundary
-          // forces them live instead of replaying results computed against
-          // the old child state. Same-window siblings already made their
-          // replay decision synchronously at dispatch, before the child could
-          // have produced anything, so they are unaffected. Prefix mode is
-          // deliberately untouched: its per-frame firstMiss has always been
-          // one-way (constraint: default behavior byte-for-byte unchanged).
-          if (resolvedResumeMode === "replay-completed" && childOwnMisses > 0) {
-            state.firstEdit = Math.min(state.firstEdit, state.callSeq);
-          }
-        });
+      const childRun = workflowNestingScope.run(nestingDepth + 1, () =>
+        runWorkflow(childScript, {
+          ...options,
+          // After ...options so this frame's count is exact: the hook is
+          // scoped to the frame it is passed to, so the wrapper REPLACES any
+          // outer hook rather than chaining into it (a top-level hook must
+          // not fire for child-frame misses, #231 R6).
+          onJournalMiss: () => {
+            childOwnMisses++;
+          },
+          args: childArgs,
+          sharedRuntime: shared,
+          // Propagate the parent's store so nested agents share the same key-value space.
+          sharedStore: store,
+          resumeJournal: prefixIntact ? options.resumeJournal : undefined,
+          resumeFromRunId: undefined,
+          // Reuse the same runner so named threads span parent/child frames but
+          // still die with this one top-level runWorkflow invocation.
+          agent: agentRunner,
+          // shared.nestedCallSeq, not shared.depth — see its doc comment: depth
+          // returns to 0 between sequential sibling calls, which would otherwise
+          // mint the same child runId (and hence colliding deltaKeys/event ids)
+          // for two different children.
+          runId: `${runId}-nested${++shared.nestedCallSeq}`,
+          // The registry is snapshotted ONCE per run (:500): forward the
+          // already-loaded registry so a mid-run .md edit can't change
+          // agentDefinitionKey for nested-frame calls only (those journal
+          // entries would cache-miss on resume, nondeterministically).
+          agentRegistry,
+          persistLogs: false,
+        }),
+      );
+      // A child that re-ran ANY call live across an internal gap or edit may
+      // have changed the store/return values the rest of THIS frame depends
+      // on, and this frame's own boundary never saw the child's per-frame
+      // misses. Calls dispatched after the child returns are its sequential
+      // downstream — advancing this frame's edit boundary forces them live
+      // instead of replaying results computed against the old child state.
+      // Same-window siblings already made their replay decision synchronously
+      // at dispatch, before the child could have produced anything, so they
+      // are unaffected.
+      //
+      // The advance rides a .then pair ONLY when this frame can actually
+      // replay (replay-completed with a journal): the settlement handler adds
+      // one microtask tick between the child settling and this frame
+      // resuming, and that tick is itself observable — it flips the race
+      // between a microtask-deferred dispatch inside the child and this
+      // frame's post-child call (#231 R12 F1). Prefix — and a fresh start
+      // that merely DECLARED replay-completed for its future resumes — must
+      // await the raw child promise exactly as the base runtime did: default
+      // behavior byte-for-byte unchanged, and a start-time declaration must
+      // not change the live execution.
+      const advanceForChildMisses = () => {
+        if (childOwnMisses > 0) state.firstEdit = Math.min(state.firstEdit, state.callSeq);
+      };
+      const child =
+        resolvedResumeMode === "replay-completed" && options.resumeJournal !== undefined
+          ? await childRun.then(
+              (childResult) => {
+                advanceForChildMisses();
+                return childResult;
+              },
+              (error: unknown) => {
+                advanceForChildMisses();
+                throw error;
+              },
+            )
+          : await childRun;
       return child.result;
     } finally {
       options.onRuntimeEvent?.({ type: "workflow", stage: "end", name: workflowName, args: childArgs });
