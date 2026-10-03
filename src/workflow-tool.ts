@@ -496,8 +496,9 @@ export function resumedText(name: string, runId: string, resumeMode?: WorkflowRe
       ? [
           "Unchanged completed agent() calls replay from that run's journal (cache) — including",
           "completed fan-out siblings across a never-completed gap; the gap still re-runs its",
-          "sequential downstream (calls after an await, workflow() children included), and the",
-          "first edited call — and everything after it — re-runs live.",
+          "sequential downstream (calls after an await — workflow() children included — and",
+          "everything later in its frame), and the first edited call — and everything after",
+          "it — re-runs live.",
         ]
       : [
           "Unchanged agent() calls replay from that run's journal (cache); the first",

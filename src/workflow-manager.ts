@@ -286,9 +286,11 @@ export interface ExecOptions {
   /** Host signal (e.g. tool/Esc) that should abort this run when fired. */
   externalSignal?: AbortSignal;
   /**
-   * Grace (ms) for the terminal drain once this run's abort has fired
-   * (default 10_000; Infinity = unbounded). Not frozen/persisted — a host
-   * reliability knob, not run semantics. See WorkflowRunOptions.drainAbortGraceMs.
+   * Grace (ms) bounding this run's drains (default 10_000; Infinity =
+   * unbounded): the top-level terminal drain once the run's abort has fired,
+   * and a nested frame's replay quiescence drain for its whole lifetime. Not
+   * frozen/persisted — a host reliability knob, not run semantics. See
+   * WorkflowRunOptions.drainAbortGraceMs.
    */
   drainAbortGraceMs?: number;
   /** Called with the live snapshot on every progress event. */
@@ -349,9 +351,9 @@ export interface WorkflowResumeOptions {
    */
   resumeMode?: WorkflowResumeMode;
   /**
-   * Grace (ms) for this execution's drains once its abort has fired (default
-   * 10_000; Infinity = unbounded). The same per-execution host reliability
-   * knob as ExecOptions.drainAbortGraceMs — not persisted.
+   * Grace (ms) bounding this execution's drains (default 10_000; Infinity =
+   * unbounded). The same per-execution host reliability knob as
+   * ExecOptions.drainAbortGraceMs — not persisted.
    */
   drainAbortGraceMs?: number;
 }

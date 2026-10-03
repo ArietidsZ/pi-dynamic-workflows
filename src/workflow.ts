@@ -232,19 +232,27 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   /** Timeout per agent in milliseconds. null/omitted means no hard timeout. */
   agentTimeoutMs?: number | null;
   /**
-   * Grace period (ms) for the terminal drain once this run is ABORT-SIGNALED
-   * (external abort or the run-fatal seal). A durable checkpoint suspension
-   * alone does not abort its paid siblings. Agents are signaled at abort,
-   * but the signal is cooperative — a signal-ignoring runner would otherwise
-   * wedge the drain, and with it the run's terminal transition, forever
-   * (audit2 #3). After the grace expires the drain stops waiting: the store is
-   * disposed below (late writes re-populate a store nobody reads), no journal
-   * can follow (the completion path's abort check precedes journaling), and
-   * the manager's persist/emit paths are staleness-gated.
+   * Grace period (ms) bounding two different waits:
    *
-   * Does NOT apply to the SUCCESS drain, which waits unbounded — those results
-   * are still wanted. Default 10_000; Infinity restores unbounded waiting for
-   * aborted runs too. Finite values in [1, 2^31-1] are rounded down; invalid
+   * - The TOP-LEVEL terminal drain, once this run is ABORT-SIGNALED (external
+   *   abort or the run-fatal seal). A durable checkpoint suspension alone
+   *   does not abort its paid siblings. Agents are signaled at abort,
+   *   but the signal is cooperative — a signal-ignoring runner would otherwise
+   *   wedge the drain, and with it the run's terminal transition, forever
+   *   (audit2 #3). After the grace expires the drain stops waiting: the store is
+   *   disposed below (late writes re-populate a store nobody reads), no journal
+   *   can follow (the completion path's abort check precedes journaling), and
+   *   the manager's persist/emit paths are staleness-gated.
+   * - A NESTED frame's replay quiescence drain, for its whole lifetime —
+   *   success path included, abort or not (#231 R8). That drain's only other
+   *   release seals downstream of whatever error the drain could be blocking,
+   *   so an unbounded wait could wedge the run; the cost is that a call
+   *   outliving the grace loses late-miss propagation to the parent's
+   *   post-child boundary.
+   *
+   * The top-level SUCCESS drain is NOT bounded — those results are still
+   * wanted. Default 10_000; Infinity restores unbounded waiting everywhere.
+   * Finite values in [1, 2^31-1] are rounded down; invalid
    * values (including NaN, 0, negatives, and overflow) use the default.
    */
   drainAbortGraceMs?: number;
@@ -713,8 +721,17 @@ export async function runWorkflow<T = unknown>(
   // serialize nested frames — an observable live-execution change that a
   // start-time policy declaration must not cause (#231 R8 F3). Nested frames
   // inherit the journal only while replay is intact (see workflowFn), which is
-  // exactly when their late misses need the drain.
-  const replayQuiescenceEnabled = resolvedResumeMode === "replay-completed" && options.resumeJournal !== undefined;
+  // exactly when their late misses need the drain. The same holds per frame:
+  // with zero journaled entries of its own (a run paused before this frame
+  // journaled anything), every call notes its gap at dispatch, so the frame's
+  // FIRST dispatch already advances the parent's post-child boundary and
+  // draining could only ever serialize the fan-out (#231 R9 F1).
+  const replayQuiescenceEnabled = (() => {
+    if (resolvedResumeMode !== "replay-completed" || options.resumeJournal === undefined) return false;
+    const framePrefix = `${runId}:`;
+    for (const key of options.resumeJournal.keys()) if (key.startsWith(framePrefix)) return true;
+    return false;
+  })();
 
   // Replay eligibility + miss bookkeeping, shared by the agent() and
   // checkpoint() replay sites below so both modes stay consistent across the

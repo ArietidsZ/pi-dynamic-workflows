@@ -891,18 +891,22 @@ test(
     // pending forever — pause() reports "paused" but the execution never
     // settles, and resume() then refuses at the settle guard: the run wedges.
     //
-    // The drain only engages on an actual replay (a fresh start has no
-    // journal — #231 R8), so the pause must land on a RESUMED execution: run
-    // 1 is paused with HANG in flight (never journaled — a gap), and the
-    // resume re-runs that gap live inside the replayed child frame.
+    // The drain only engages on an actual replay with something to replay
+    // (a fresh start has no journal — #231 R8; a frame with zero journaled
+    // entries of its own engages nothing — #231 R9), so the pause must land
+    // on a RESUMED execution: run 1 is paused with HANG in flight (never
+    // journaled — a gap) next to a journaled seed call, and the resume
+    // re-runs that gap live inside the replayed child frame.
     const child = `export const meta = { name: 'kidHang', description: 'k' }
 const p = agent('HANG')
+const k = await agent('K-SEED')
 return 'kid-done'`;
     const script = `export const meta = { name: 'parHang', description: 'p' }
 const n = await workflow('kidHang')
 return n`;
     let hangAttempts = 0;
     let secondHangStarted = false;
+    let kSeedDone = false;
     const manager = new WorkflowManager({
       cwd,
       loadSavedWorkflow: (name: string) => (name === "kidHang" ? child : undefined),
@@ -914,11 +918,14 @@ return n`;
             if (attempt === 2) secondHangStarted = true;
             if (attempt <= 2) return await new Promise((_resolve, _reject) => {});
           }
+          if (prompt === "K-SEED") kSeedDone = true;
           return `${prompt}-done`;
         },
       },
     });
     manager.on("error", () => {});
+    const logs: string[] = [];
+    manager.on("log", ({ message }: { message: string }) => logs.push(message));
 
     // Run 1: the child script returns with HANG in flight; the top-level
     // success drain holds the run "running" until the pause abandons it.
@@ -927,8 +934,15 @@ return n`;
       drainAbortGraceMs: 100,
     });
     promise.catch(() => {});
-    for (let i = 0; i < 2000 && hangAttempts < 1; i++) await new Promise((resolve) => setTimeout(resolve, 1));
+    for (let i = 0; i < 2000 && (hangAttempts < 1 || !kSeedDone); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
     assert.ok(hangAttempts >= 1, "the first hung call is in flight before the pause");
+    assert.ok(kSeedDone, "the seed call completed before the pause");
+    // Let the journal write land: pausing before K-SEED is journaled would
+    // leave the child frame with zero entries, disengaging the drain (#231 R9)
+    // and making the abort-wake assertion below vacuous.
+    await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(manager.pause(runId), true);
     for (let i = 0; i < 2000 && manager.getPersistence().load(runId)?.status !== "paused"; i++) {
       await new Promise((resolve) => setTimeout(resolve, 1));
@@ -964,6 +978,11 @@ return n`;
 
     assert.equal(manager.getPersistence().load(runId)?.status, "completed");
     assert.equal(hangAttempts, 3, "the never-journaled gap call re-ran on each resume and completed");
+    assert.equal(
+      logs.some((message) => message.includes("nested frame drain abandoned")),
+      false,
+      "the abort, not the grace, must release the nested drain (#231 R9: the grace alone would settle within the guard)",
+    );
   }),
 );
 
@@ -979,6 +998,7 @@ test(
     // refuses — the usage-limit recovery path can never fire.
     const child = `export const meta = { name: 'kidLimit', description: 'k' }
 const p = agent('HANG')
+const k = await agent('K-SEED')
 const c = await agent('LIMIT')
 return c`;
     const script = `export const meta = { name: 'parLimit', description: 'p' }
@@ -1011,9 +1031,9 @@ return n`;
     });
     manager.on("error", () => {});
 
-    // Run 1: LIMIT completes empty (never journaled — a gap), HANG stays in
-    // flight; the top-level success drain holds the run "running" until the
-    // pause abandons it.
+    // Run 1: LIMIT completes empty (never journaled — a gap) next to a
+    // journaled seed call, HANG stays in flight; the top-level success drain
+    // holds the run "running" until the pause abandons it.
     const { runId, promise } = manager.startInBackground(script, undefined, {
       resumeMode: "replay-completed",
       drainAbortGraceMs: 100,

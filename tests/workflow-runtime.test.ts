@@ -2240,12 +2240,15 @@ test("an aborted nested drain wakes instead of waiting out a signal-ignoring cal
   // frame forever. The drain must race the abort like the top-level drain
   // does (audit2 #3) and let the run settle.
   //
-  // The drain only engages on an actual replay (a fresh run has no journal —
-  // #231 R8), so the scenario resumes a run whose first execution left HANG
-  // unjournaled (empty results are never journaled), making it a live gap
-  // call inside the replayed child frame.
+  // The drain only engages on an actual replay with something to replay (a
+  // fresh run has no journal — #231 R8; a frame with zero journaled entries
+  // of its own engages nothing — #231 R9), so the scenario resumes a run
+  // whose first execution left HANG unjournaled (empty results are never
+  // journaled) next to a journaled seed call, making HANG a live gap call
+  // inside the replayed child frame.
   const child = `export const meta = { name: 'kidHang', description: 'k' }
 const p = agent('HANG')
+const k = await agent('K-SEED')
 return 'kid-done'`;
   const parent = `export const meta = { name: 'parHang', description: 'p' }
 const n = await workflow('kidHang')
@@ -2267,6 +2270,7 @@ return { n, c }`;
 
   const controller = new AbortController();
   let hangStarted = false;
+  const logs: string[] = [];
   const run = runWorkflow(parent, {
     agent: {
       async run(prompt: string) {
@@ -2284,6 +2288,7 @@ return { n, c }`;
     signal: controller.signal,
     drainAbortGraceMs: 100,
     resumeMode: "replay-completed",
+    onLog: (message) => logs.push(message),
   });
 
   for (let i = 0; i < 200 && !hangStarted; i++) await new Promise((resolve) => setTimeout(resolve, 5));
@@ -2302,6 +2307,11 @@ return { n, c }`;
     new Promise((resolve) => setTimeout(() => resolve("wedged"), 2_000)),
   ]);
   assert.equal(outcome, "settled", "the aborted nested drain must wake; the run must settle near the abort grace");
+  assert.equal(
+    logs.some((message) => message.includes("nested frame drain abandoned")),
+    false,
+    "the abort, not the grace, must release the nested drain (#231 R9: the grace alone would settle within the watchdog)",
+  );
 });
 
 test("a non-recoverable error settles a replay-completed resume despite a hung sibling in the child frame (#231 R8)", async () => {
@@ -2314,6 +2324,7 @@ test("a non-recoverable error settles a replay-completed resume despite a hung s
   // top-level drain.
   const child = `export const meta = { name: 'kidLimit', description: 'k' }
 const p = agent('HANG')
+const k = await agent('K-SEED')
 const c = await agent('LIMIT')
 return c`;
   const parent = `export const meta = { name: 'parLimit', description: 'p' }
@@ -2322,12 +2333,16 @@ const after = await agent('AFTER')
 return { n, after }`;
 
   // Run 1 leaves HANG and LIMIT unjournaled (empty results are never
-  // journaled), so the resume re-runs both live inside the replayed child.
+  // journaled) next to a journaled seed call, so the resume re-runs both live
+  // inside the replayed child frame (a frame with zero journaled entries of
+  // its own would not engage the drain at all — #231 R9).
   const journal: JournalEntry[] = [];
   await runWorkflow(parent, {
     agent: {
       async run(prompt: string) {
-        return prompt === "AFTER" ? "after-done" : "";
+        if (prompt === "AFTER") return "after-done";
+        if (prompt === "K-SEED") return "k-seed-done";
+        return "";
       },
     },
     persistLogs: false,
