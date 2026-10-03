@@ -2122,32 +2122,52 @@ export async function runWorkflow<T = unknown>(
     throw error;
   } finally {
     // Replay-completed only: a nested frame must reach quiescence before
-    // resolving, so every journal miss it will ever note is committed BEFORE
-    // workflowFn's post-child finally reads the frame's miss count — an
+    // resolving, so every journal miss its in-flight agent() calls — and the
+    // replay continuations they unblock — will ever note is committed BEFORE
+    // workflowFn's post-child finally reads the frame's miss count. An
     // un-awaited fan-out in the child can otherwise dispatch a call after the
     // child script returned, note its gap/edit too late, and leave the
     // parent's post-return calls replaying stale results (#231 R6). Loop
     // because a settling call can schedule further work. Un-awaited success
     // waits indefinitely (those results are wanted — same stance as the
-    // top-level drain); once aborted the wait stops here — the calls are
-    // abort-linked, the run's outcome is already decided, and the top-level
-    // drain still gives them its grace period. Prefix mode deliberately never
-    // waits: its one-way frame boundary is byte-for-byte base behavior.
+    // top-level drain). The wait MUST wake the moment the run aborts (either
+    // source — the same two isAborted reads): allSettled on a signal-ignoring
+    // call never settles, and isAborted() is only re-read between iterations,
+    // so an unraced wait would wedge pause/stop on the child frame forever
+    // (#231 R7). No grace period here: once aborted no further dispatches
+    // happen, so waiting buys nothing — the top-level drain still gives the
+    // same calls its grace. Prefix mode deliberately never waits: its one-way
+    // frame boundary is byte-for-byte base behavior.
     if (!isTopLevelRun && resolvedResumeMode === "replay-completed") {
-      while (!isAborted()) {
-        if (state.inFlight.size > 0) {
-          await Promise.allSettled(Array.from(state.inFlight));
-          continue;
+      let wakeAbort: () => void = () => {};
+      const abortWake = new Promise<void>((resolve) => {
+        wakeAbort = resolve;
+      });
+      const externalWake = () => wakeAbort();
+      const fatalWake = () => wakeAbort();
+      options.signal?.addEventListener("abort", externalWake, { once: true });
+      shared.runFatalController.signal.addEventListener("abort", fatalWake, { once: true });
+      try {
+        while (!isAborted()) {
+          if (state.inFlight.size > 0) {
+            // Safe to race unconditionally: the loop guard keeps an
+            // already-aborted drain from spinning on a resolved abortWake.
+            await Promise.race([Promise.allSettled(Array.from(state.inFlight)), abortWake]);
+            continue;
+          }
+          // The set is empty, but a replay chain can still be mid-microtask: a
+          // replayed call settles several hops before the script continuation
+          // it unblocks dispatches the frame's next call (possibly a gap/edit
+          // miss). One macrotask flushes every pending microtask-only chain;
+          // anything dispatched afterwards is registered and caught by the
+          // re-check. Work scheduled off a live call is covered because the
+          // call itself was awaited above.
+          await new Promise((resolve) => setTimeout(resolve, 0));
+          if (state.inFlight.size === 0) break;
         }
-        // The set is empty, but a replay chain can still be mid-microtask: a
-        // replayed call settles several hops before the script continuation
-        // it unblocks dispatches the frame's next call (possibly a gap/edit
-        // miss). One macrotask flushes every pending microtask-only chain;
-        // anything dispatched afterwards is registered and caught by the
-        // re-check. Work scheduled off a live call is covered because the
-        // call itself was awaited above.
-        await new Promise((resolve) => setTimeout(resolve, 0));
-        if (state.inFlight.size === 0) break;
+      } finally {
+        options.signal?.removeEventListener("abort", externalWake);
+        shared.runFatalController.signal.removeEventListener("abort", fatalWake);
       }
     }
     // Only the top-level frame drains/disposes (see isTopLevelRun) — a nested

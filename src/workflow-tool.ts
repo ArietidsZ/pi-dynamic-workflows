@@ -116,7 +116,7 @@ const workflowToolSchema = Type.Object({
   resumeMode: Type.Optional(
     Type.Union([Type.Literal("prefix"), Type.Literal("replay-completed")], {
       description:
-        "Replay policy with resumeFromRunId. prefix (default): the first changed/new/never-completed call onward re-runs. replay-completed: completed calls also replay across a never-completed gap when dispatched concurrently with it in one fan-out (paused fan-out); calls after an await and calls in a nested workflow() frame count as sequential relative to the gap and still re-run; a changed call still re-runs its suffix. The choice persists on the run: later resumes keep it unless overridden. Store/file-passed results are not hash-checked and can replay stale across a gap.",
+        "Replay policy with resumeFromRunId. prefix (default): the first changed/new/never-completed call onward re-runs. replay-completed: completed calls also replay across a never-completed gap when dispatched concurrently with it in one fan-out (paused fan-out); calls made after an await (workflow() children included) are sequential and still re-run — a workflow() call in the gap's own window keeps its child journal; a changed call still re-runs its suffix. The choice persists on the run: later resumes keep it unless overridden. Store/file-passed results are not hash-checked and can replay stale across a gap.",
     }),
   ),
 });
@@ -496,8 +496,9 @@ export function resumedText(name: string, runId: string, resumeMode?: WorkflowRe
       ? [
           "Unchanged completed agent() calls replay from that run's journal (cache) — including",
           "completed fan-out siblings across a never-completed gap; the gap still re-runs its",
-          "sequential downstream (calls after an await, nested workflow frames, everything",
-          "later in its frame), and the first edited call — and everything after it — re-runs live.",
+          "sequential downstream (calls after an await — workflow() children included — and",
+          "everything later in its frame), and the first edited call — and everything after",
+          "it — re-runs live.",
         ]
       : [
           "Unchanged agent() calls replay from that run's journal (cache); the first",

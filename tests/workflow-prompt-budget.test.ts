@@ -75,7 +75,11 @@ const RENDERED_PROMPT_BUDGET_BYTES = 800;
 // nested frames) and the persists-on-the-run sentence to the resumeMode
 // description, increasing the measured definition from 4,902 to 5,093
 // bytes (+191); the ceiling moves with it.
-const TOOL_DEFINITION_BUDGET_BYTES = 5_093;
+// #231 R7 corrected that rule: a workflow() call dispatched in the gap's
+// own window is a same-window sibling whose child journal replays — only
+// post-await workflow() calls are sequential — increasing the measured
+// definition from 5,093 to 5,135 bytes (+42); the ceiling moves with it.
+const TOOL_DEFINITION_BUDGET_BYTES = 5_135;
 
 test("rendered workflow prompt contribution stays within its accepted size", async () => {
   await withRenderedWorkflow(async ({ systemPrompt, promptLines }) => {

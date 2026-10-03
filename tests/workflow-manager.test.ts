@@ -884,6 +884,70 @@ test(
 );
 
 test(
+  "pause + resume recover a replay-completed run whose child frame has a signal-ignoring call in flight (#231 R7)",
+  withTempCwd(async (cwd) => {
+    // The nested quiescence drain must WAKE on abort: a child returning with
+    // an un-awaited, signal-ignoring call in flight otherwise holds executeRun
+    // pending forever — pause() reports "paused" but the execution never
+    // settles, and resume() then refuses at the settle guard: the run wedges.
+    const child = `export const meta = { name: 'kidHang', description: 'k' }
+const p = agent('HANG')
+return 'kid-done'`;
+    const script = `export const meta = { name: 'parHang', description: 'p' }
+const n = await workflow('kidHang')
+return n`;
+    let hangStarted = false;
+    let hangAttempts = 0;
+    const manager = new WorkflowManager({
+      cwd,
+      loadSavedWorkflow: (name: string) => (name === "kidHang" ? child : undefined),
+      agent: {
+        async run(prompt, options) {
+          options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+          if (prompt === "HANG" && hangAttempts++ === 0) {
+            hangStarted = true;
+            return await new Promise((_resolve, _reject) => {});
+          }
+          return `${prompt}-done`;
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    const { runId, promise } = manager.startInBackground(script, undefined, {
+      resumeMode: "replay-completed",
+      drainAbortGraceMs: 100,
+    });
+    promise.catch(() => {});
+    for (let i = 0; i < 2000 && !hangStarted; i++) await new Promise((resolve) => setTimeout(resolve, 1));
+    assert.ok(hangStarted, "the signal-ignoring call is in flight before the pause");
+    // Let the child frame reach its drain and block in it — pausing earlier
+    // would skip the drain loop entirely and prove nothing about the wake.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    assert.equal(manager.pause(runId), true);
+    // Pre-fix wedge signal: resume() times out the settle guard (10s in
+    // production; shrunk here) and returns false.
+    _setPausedExecutionSettleTimeoutForTests(2_000);
+    try {
+      assert.equal(
+        await manager.resume(runId),
+        true,
+        "the aborted nested drain must let the execution settle so resume can proceed",
+      );
+    } finally {
+      _setPausedExecutionSettleTimeoutForTests(undefined);
+    }
+    for (let i = 0; i < 2000 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+
+    assert.equal(manager.getPersistence().load(runId)?.status, "completed");
+    assert.equal(hangAttempts, 2, "the never-journaled gap call re-ran on resume and completed");
+  }),
+);
+
+test(
   "resume keeps historical agent session metadata when the edited script fails to parse (#206)",
   withTempCwd(async (cwd) => {
     const agent = fakeAgent();

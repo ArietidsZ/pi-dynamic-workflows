@@ -2231,6 +2231,60 @@ return { n, c }`;
   );
 });
 
+test("an aborted nested drain wakes instead of waiting out a signal-ignoring call (#231 R7)", async () => {
+  // The child returns with an un-awaited, never-settling call in flight. Under
+  // replay-completed the frame's quiescence drain awaits it — but allSettled
+  // on a signal-ignoring call never resolves, and isAborted() is only re-read
+  // between iterations, so without an abort wake the drain (and therefore
+  // pause/stop, which route through the run's abort) wedges on the child
+  // frame forever. The drain must race the abort like the top-level drain
+  // does (audit2 #3) and let the run settle.
+  const child = `export const meta = { name: 'kidHang', description: 'k' }
+const p = agent('HANG')
+return 'kid-done'`;
+  const parent = `export const meta = { name: 'parHang', description: 'p' }
+const n = await workflow('kidHang')
+const c = await agent('parent-c')
+return { n, c }`;
+
+  const controller = new AbortController();
+  let hangStarted = false;
+  const run = runWorkflow(parent, {
+    agent: {
+      async run(prompt: string) {
+        if (prompt === "HANG") {
+          hangStarted = true;
+          return await new Promise((_resolve, _reject) => {});
+        }
+        return `r:${prompt}`;
+      },
+    },
+    persistLogs: false,
+    runId: "r7-hang",
+    loadSavedWorkflow: (name) => (name === "kidHang" ? child : undefined),
+    signal: controller.signal,
+    drainAbortGraceMs: 100,
+    resumeMode: "replay-completed",
+  });
+
+  for (let i = 0; i < 200 && !hangStarted; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.ok(hangStarted, "the hung call is in flight before the abort");
+  // Let the child frame reach its drain and block in it — aborting earlier
+  // would skip the drain loop entirely and prove nothing about the wake.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  controller.abort();
+
+  const outcome = await Promise.race([
+    // Rejection (aborted run) still means the run SETTLED.
+    run.then(
+      () => "settled",
+      () => "settled",
+    ),
+    new Promise((resolve) => setTimeout(() => resolve("wedged"), 2_000)),
+  ]);
+  assert.equal(outcome, "settled", "the aborted nested drain must wake; the run must settle near the abort grace");
+});
+
 test("an unusable cached entry (empty output) is an edit, not a gap, in replay-completed mode", async () => {
   // Defensive branch: organic empty output is never journaled, but a legacy or
   // hand-edited journal CAN hold an unusable entry. It must pin firstEdit
