@@ -2239,6 +2239,27 @@ export async function runWorkflow<T = unknown>(
         options.signal?.removeEventListener("abort", externalWake);
         shared.runFatalController.signal.removeEventListener("abort", fatalWake);
       }
+    } else if (!isTopLevelRun && resolvedResumeMode === "replay-completed" && options.resumeJournal !== undefined) {
+      // Zero-entry frame (replayQuiescenceEnabled is false because the journal
+      // has no keys for this frame): every call here is a gap noted
+      // SYNCHRONOUSLY at dispatch (noteJournalMiss precedes the limiter), so
+      // pre-existing in-flight calls already advanced the parent's post-child
+      // boundary and waiting for them would only serialize the fan-out (#231
+      // R9 F1). But the frame's FIRST dispatch can itself be deferred past
+      // this finally — an un-awaited `(async () => { await gate; await agent(...)
+      // })()` whose gate resolves on a microtask chain — and then nothing has
+      // noted a miss when the parent's post-child finally reads this frame's
+      // count: the parent's calls replay stale, the exact R6 defect (#231 R11
+      // F1). One macrotask flushes every pending microtask-only chain, so any
+      // such deferred first dispatch happens — and notes its gap — before the
+      // parent reads. A dispatch deferred behind a real timer/I-O is out of
+      // scope for any bounded drain, exactly as in the full drain above. And
+      // unlike an entry-having frame, nothing here can note a miss LATE (no
+      // call replays, so no replay continuation exists to dispatch a gap after
+      // its root settled) — a call reached within the sweep notes its gap at
+      // dispatch, so the sweep never waits for a settlement and needs no
+      // abort/grace race.
+      await new Promise((resolve) => setTimeout(resolve, 0));
     }
     // Only the top-level frame drains/disposes (see isTopLevelRun) — a nested
     // workflow()'s in-flight agents are still tracked in this SAME shared set

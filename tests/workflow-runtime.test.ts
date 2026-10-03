@@ -2486,6 +2486,56 @@ return { n, c }`;
   }
 });
 
+test("a deferred first dispatch in a zero-entry child frame still advances the parent's boundary (#231 R11)", async () => {
+  // The per-frame gate disengages the full drain when the child frame has no
+  // journaled entries — but the frame's FIRST dispatch can be deferred past
+  // the frame's return by a microtask bootstrap (here a gate released by a
+  // 2-hop promise chain). Without the one-macrotask sweep, nothing has noted
+  // a miss when the parent's post-child finally reads the frame's count, and
+  // the parent's call replays stale — the R6 defect.
+  const child = `export const meta = { name: 'kidLate11', description: 'k' }
+let release;
+const gate = new Promise((r) => { release = r; });
+const p = (async () => { await gate; const x = await agent('X'); return x; })();
+Promise.resolve().then(() => Promise.resolve()).then(() => { release(); });
+return 'kid-done'`;
+  const parent = `export const meta = { name: 'parLate11', description: 'p' }
+const n = await workflow('kidLate11')
+const c = await agent('C')
+return { n, c }`;
+
+  // X's empty result is never journaled, so the child frame ends run 1 with
+  // zero entries of its own; only the parent's C is journaled.
+  const journal: JournalEntry[] = [];
+  await runWorkflow(parent, {
+    agent: {
+      async run(prompt: string) {
+        return prompt === "X" ? "" : `r:${prompt}`;
+      },
+    },
+    persistLogs: false,
+    runId: "r11-late",
+    loadSavedWorkflow: (name) => (name === "kidLate11" ? child : undefined),
+    onAgentJournal: (e) => journal.push(e),
+  });
+
+  let cCalls = 0;
+  await runWorkflow(parent, {
+    agent: {
+      async run(prompt: string) {
+        if (prompt === "C") cCalls++;
+        return `r:${prompt}`;
+      },
+    },
+    persistLogs: false,
+    runId: "r11-late",
+    loadSavedWorkflow: (name) => (name === "kidLate11" ? child : undefined),
+    resumeJournal: journalMap(journal),
+    resumeMode: "replay-completed",
+  });
+  assert.equal(cCalls, 1, "the child's sweep-deferred gap must re-run the parent's post-child call live");
+});
+
 test("an unusable cached entry (empty output) is an edit, not a gap, in replay-completed mode", async () => {
   // Defensive branch: organic empty output is never journaled, but a legacy or
   // hand-edited journal CAN hold an unusable entry. It must pin firstEdit

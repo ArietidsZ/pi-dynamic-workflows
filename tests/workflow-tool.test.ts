@@ -8,7 +8,12 @@ import { BUILTIN_WORKFLOW_NAMES } from "../src/builtin-workflows.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { createWorkflowStorage } from "../src/workflow-saved.js";
-import { backgroundStartedText, createWorkflowTool, WORKFLOW_GATE_GUIDELINE } from "../src/workflow-tool.js";
+import {
+  backgroundStartedText,
+  createWorkflowTool,
+  resumedText,
+  WORKFLOW_GATE_GUIDELINE,
+} from "../src/workflow-tool.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 /** Minimal fake ModelRegistry, matching the shape used by workflow manager tests. */
@@ -792,3 +797,19 @@ return 'unreachable'`;
     assert.ok(updates.length >= 1, "the pending coalesced frame was flushed (rendered) on the error path");
   }),
 );
+
+test("resumedText states the same-window workflow() caveat and no gap absolutes (#231 R11)", () => {
+  // The replay-completed result text is the only model-facing surface that
+  // describes the resume outcome for THIS run; it must match the schema's
+  // dispatch-timing rule (and must not re-grow the removed absolutes — R9's
+  // silent revert went undetected precisely because no test pinned the text).
+  const text = resumedText("wf", "run-1", "replay-completed");
+  assert.ok(
+    text.includes("dispatched in the gap's own window replays with its child journal"),
+    "the same-window workflow() replay caveat is stated",
+  );
+  assert.equal(text.includes("everything later in its frame"), false);
+  assert.equal(text.includes("everything after a top-level gap"), false);
+  const prefix = resumedText("wf", "run-1", "prefix");
+  assert.ok(prefix.includes("re-runs live."), "the prefix variant still renders");
+});
