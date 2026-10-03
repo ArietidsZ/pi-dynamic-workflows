@@ -348,6 +348,12 @@ export interface WorkflowResumeOptions {
    * workflow.ts for the batch scoping and store-staleness caveat.
    */
   resumeMode?: WorkflowResumeMode;
+  /**
+   * Grace (ms) for this execution's drains once its abort has fired (default
+   * 10_000; Infinity = unbounded). The same per-execution host reliability
+   * knob as ExecOptions.drainAbortGraceMs — not persisted.
+   */
+  drainAbortGraceMs?: number;
 }
 
 export interface WorkflowManagerOptions {
@@ -2214,6 +2220,9 @@ export class WorkflowManager extends EventEmitter {
       resumeJournal,
       resumeCheckpoint: resumeCheckpoint?.status === "resuming" ? resumeCheckpoint : undefined,
       resumeMode: managed.resumeMode,
+      // Per-execution host knob (see WorkflowResumeOptions); undefined falls
+      // back to runWorkflow's default grace.
+      drainAbortGraceMs: opts?.drainAbortGraceMs,
       initialTokenUsage: priorTokenUsage,
       // Adopt the persisted phase sub-budget baselines so a phase ceiling
       // holds cumulatively across this resume (audit2 #4).

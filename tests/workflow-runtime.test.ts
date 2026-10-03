@@ -2239,6 +2239,11 @@ test("an aborted nested drain wakes instead of waiting out a signal-ignoring cal
   // pause/stop, which route through the run's abort) wedges on the child
   // frame forever. The drain must race the abort like the top-level drain
   // does (audit2 #3) and let the run settle.
+  //
+  // The drain only engages on an actual replay (a fresh run has no journal —
+  // #231 R8), so the scenario resumes a run whose first execution left HANG
+  // unjournaled (empty results are never journaled), making it a live gap
+  // call inside the replayed child frame.
   const child = `export const meta = { name: 'kidHang', description: 'k' }
 const p = agent('HANG')
 return 'kid-done'`;
@@ -2246,6 +2251,19 @@ return 'kid-done'`;
 const n = await workflow('kidHang')
 const c = await agent('parent-c')
 return { n, c }`;
+
+  const journal: JournalEntry[] = [];
+  await runWorkflow(parent, {
+    agent: {
+      async run(prompt: string) {
+        return prompt === "HANG" ? "" : `r:${prompt}`;
+      },
+    },
+    persistLogs: false,
+    runId: "r7-hang",
+    loadSavedWorkflow: (name) => (name === "kidHang" ? child : undefined),
+    onAgentJournal: (e) => journal.push(e),
+  });
 
   const controller = new AbortController();
   let hangStarted = false;
@@ -2262,6 +2280,7 @@ return { n, c }`;
     persistLogs: false,
     runId: "r7-hang",
     loadSavedWorkflow: (name) => (name === "kidHang" ? child : undefined),
+    resumeJournal: journalMap(journal),
     signal: controller.signal,
     drainAbortGraceMs: 100,
     resumeMode: "replay-completed",
@@ -2283,6 +2302,111 @@ return { n, c }`;
     new Promise((resolve) => setTimeout(() => resolve("wedged"), 2_000)),
   ]);
   assert.equal(outcome, "settled", "the aborted nested drain must wake; the run must settle near the abort grace");
+});
+
+test("a non-recoverable error settles a replay-completed resume despite a hung sibling in the child frame (#231 R8)", async () => {
+  // The nested quiescence drain's only release besides the calls settling is
+  // the run-fatal abort — which seals in the TOP-LEVEL catch, downstream of
+  // whatever error the drain could be blocking. An unbounded drain would hold
+  // that error path hostage forever: LIMIT's usage-limit failure can never
+  // reach the catch that would abort HANG, so the run never settles. The
+  // drain must abandon its wait after the abort grace, exactly like the
+  // top-level drain.
+  const child = `export const meta = { name: 'kidLimit', description: 'k' }
+const p = agent('HANG')
+const c = await agent('LIMIT')
+return c`;
+  const parent = `export const meta = { name: 'parLimit', description: 'p' }
+const n = await workflow('kidLimit')
+const after = await agent('AFTER')
+return { n, after }`;
+
+  // Run 1 leaves HANG and LIMIT unjournaled (empty results are never
+  // journaled), so the resume re-runs both live inside the replayed child.
+  const journal: JournalEntry[] = [];
+  await runWorkflow(parent, {
+    agent: {
+      async run(prompt: string) {
+        return prompt === "AFTER" ? "after-done" : "";
+      },
+    },
+    persistLogs: false,
+    runId: "r8-drain-grace",
+    loadSavedWorkflow: (name) => (name === "kidLimit" ? child : undefined),
+    onAgentJournal: (e) => journal.push(e),
+  });
+
+  const run = runWorkflow(parent, {
+    agent: {
+      async run(prompt: string) {
+        if (prompt === "HANG") return await new Promise((_resolve, _reject) => {});
+        if (prompt === "LIMIT") {
+          throw new WorkflowError("upstream 429: usage limit reached", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+            recoverable: false,
+          });
+        }
+        return `r:${prompt}`;
+      },
+    },
+    persistLogs: false,
+    runId: "r8-drain-grace",
+    loadSavedWorkflow: (name) => (name === "kidLimit" ? child : undefined),
+    resumeJournal: journalMap(journal),
+    resumeMode: "replay-completed",
+    drainAbortGraceMs: 100,
+  });
+
+  const outcome = await Promise.race([
+    run.then(
+      () => "completed",
+      (error: unknown) => `failed:${String((error as Error)?.message ?? error)}`,
+    ),
+    new Promise((resolve) => setTimeout(() => resolve("wedged"), 2_000)),
+  ]);
+  assert.match(
+    String(outcome),
+    /failed:.*usage limit/,
+    "the grace-bound drain must abandon HANG and let the usage-limit error settle the run",
+  );
+});
+
+test("a start-time resumeMode declaration does not change live nested-frame execution (#231 R8)", async () => {
+  // resumeMode on a START is a policy declaration for the run's FUTURE
+  // resumes — the start execution has no journal, so the nested quiescence
+  // drain must stay disengaged. Engaging it would serialize the child's
+  // un-awaited work before the parent's post-child calls — an observable
+  // live-execution change a start-time declaration must not cause (and a
+  // byte-for-byte prefix parity break).
+  const child = `export const meta = { name: 'kidSide', description: 'k' }
+const p = agent('SIDE')
+return 'kid-done'`;
+  const parent = `export const meta = { name: 'parSide', description: 'p' }
+const n = await workflow('kidSide')
+const c = await agent('C')
+return { n, c }`;
+
+  let side = "unset";
+  const res = await runWorkflow(parent, {
+    agent: {
+      async run(prompt: string) {
+        if (prompt === "SIDE") {
+          await new Promise((resolve) => setTimeout(resolve, 30));
+          side = "set";
+          return "side-done";
+        }
+        return `c-sees-${side}`;
+      },
+    },
+    persistLogs: false,
+    runId: "r8-fresh-declared",
+    loadSavedWorkflow: (name) => (name === "kidSide" ? child : undefined),
+    resumeMode: "replay-completed",
+  });
+  assert.equal(
+    res.result.c,
+    "c-sees-unset",
+    "a fresh run has no journal: the drain must not delay the parent's post-child calls",
+  );
 });
 
 test("an unusable cached entry (empty output) is an edit, not a gap, in replay-completed mode", async () => {

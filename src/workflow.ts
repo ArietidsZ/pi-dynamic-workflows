@@ -707,6 +707,15 @@ export async function runWorkflow<T = unknown>(
     options.onLog?.(`ignoring invalid resumeMode (${JSON.stringify(requestedResumeMode)}); using "prefix"`);
   }
 
+  // The nested-frame quiescence machinery (frame-scoped in-flight registration
+  // + the drain in the finally below) exists only for an actual REPLAY: a
+  // fresh run has no journal, notes no misses, and draining would merely
+  // serialize nested frames — an observable live-execution change that a
+  // start-time policy declaration must not cause (#231 R8 F3). Nested frames
+  // inherit the journal only while replay is intact (see workflowFn), which is
+  // exactly when their late misses need the drain.
+  const replayQuiescenceEnabled = resolvedResumeMode === "replay-completed" && options.resumeJournal !== undefined;
+
   // Replay eligibility + miss bookkeeping, shared by the agent() and
   // checkpoint() replay sites below so both modes stay consistent across the
   // two. "prefix" (default): replay while index < firstMiss — the first miss
@@ -953,9 +962,10 @@ export async function runWorkflow<T = unknown>(
     // drain in the finally below) — this is what stops a forgotten `await`
     // from letting an agent mutate state after the run is torn down. The
     // frame-scoped set additionally lets a NESTED frame reach quiescence
-    // before resolving (replay-completed only — see the finally below).
+    // before resolving (actual replays only — see replayQuiescenceEnabled and
+    // the finally below).
     shared.inFlight.add(call);
-    if (resolvedResumeMode === "replay-completed") state.inFlight.add(call);
+    if (replayQuiescenceEnabled) state.inFlight.add(call);
     // Attaching a handler here (independent of whatever the script itself does
     // with the returned promise) also means an un-awaited call's eventual
     // rejection never becomes a process-crashing unhandled rejection.
@@ -2121,38 +2131,79 @@ export async function runWorkflow<T = unknown>(
     }
     throw error;
   } finally {
-    // Replay-completed only: a nested frame must reach quiescence before
-    // resolving, so every journal miss its in-flight agent() calls — and the
-    // replay continuations they unblock — will ever note is committed BEFORE
-    // workflowFn's post-child finally reads the frame's miss count. An
-    // un-awaited fan-out in the child can otherwise dispatch a call after the
-    // child script returned, note its gap/edit too late, and leave the
-    // parent's post-return calls replaying stale results (#231 R6). Loop
-    // because a settling call can schedule further work. Un-awaited success
-    // waits indefinitely (those results are wanted — same stance as the
-    // top-level drain). The wait MUST wake the moment the run aborts (either
-    // source — the same two isAborted reads): allSettled on a signal-ignoring
-    // call never settles, and isAborted() is only re-read between iterations,
-    // so an unraced wait would wedge pause/stop on the child frame forever
-    // (#231 R7). No grace period here: once aborted no further dispatches
-    // happen, so waiting buys nothing — the top-level drain still gives the
-    // same calls its grace. Prefix mode deliberately never waits: its one-way
-    // frame boundary is byte-for-byte base behavior.
-    if (!isTopLevelRun && resolvedResumeMode === "replay-completed") {
+    // Grace applied by BOTH drains below (the nested quiescence drain and the
+    // top-level terminal drain). Normalized once: NaN/0/negative/overflow →
+    // the 10s default; Infinity = unbounded.
+    const graceOption = options.drainAbortGraceMs;
+    const drainAbortGraceMs =
+      graceOption === undefined
+        ? 10_000
+        : graceOption === Number.POSITIVE_INFINITY
+          ? Number.POSITIVE_INFINITY
+          : typeof graceOption === "number" && graceOption >= 1 && graceOption <= 2_147_483_647
+            ? Math.floor(graceOption)
+            : 10_000;
+    // Replay only (see replayQuiescenceEnabled): a nested frame must reach
+    // quiescence before resolving, so every journal miss its in-flight agent()
+    // calls — and the replay continuations they unblock — will ever note is
+    // committed BEFORE workflowFn's post-child finally reads the frame's miss
+    // count. An un-awaited fan-out in the child can otherwise dispatch a call
+    // after the child script returned, note its gap/edit too late, and leave
+    // the parent's post-return calls replaying stale results (#231 R6). Loop
+    // because a settling call can schedule further work.
+    //
+    // Two independent bounds keep the wait from wedging the run. (1) The abort
+    // wake (R7): allSettled on a signal-ignoring call never settles, and
+    // isAborted() is only re-read between iterations — the race makes
+    // pause/stop unwind the frame promptly (no nested grace period: once
+    // aborted no further dispatches happen, and the top-level drain still
+    // gives the same calls its grace). (2) The drain-lifetime grace (R8): the
+    // only OTHER release is shared.runFatalController, and it seals in the
+    // top-level catch — DOWNSTREAM of whatever error this drain could be
+    // blocking (a usage limit thrown by a sibling of the hung call, a later
+    // parent failure). An unbounded wait would hold that error path hostage
+    // forever: run never settles, manager keeps it "running", resume()
+    // refuses. The grace abandons the wait with the same semantics the
+    // top-level drain applies post-abort: a call that outlives the grace can
+    // no longer propagate a late miss (the loss window is "> grace", not
+    // forever). Infinity opts out, restoring the unbounded R6 guarantee.
+    // Prefix mode deliberately never waits: its one-way frame boundary is
+    // byte-for-byte base behavior.
+    if (!isTopLevelRun && replayQuiescenceEnabled) {
       let wakeAbort: () => void = () => {};
-      const abortWake = new Promise<void>((resolve) => {
-        wakeAbort = resolve;
+      const abortWake = new Promise<"aborted">((resolve) => {
+        wakeAbort = () => resolve("aborted");
       });
       const externalWake = () => wakeAbort();
       const fatalWake = () => wakeAbort();
       options.signal?.addEventListener("abort", externalWake, { once: true });
       shared.runFatalController.signal.addEventListener("abort", fatalWake, { once: true });
+      // Deliberately ref'd (no unref), like the top-level drain's grace timer:
+      // when the only pending work is this drain and a hung, handle-less call,
+      // the timer is what keeps the process alive to fire.
+      let graceTimer: ReturnType<typeof setTimeout> | undefined;
+      const graceWake =
+        drainAbortGraceMs === Number.POSITIVE_INFINITY
+          ? new Promise<"grace">(() => {})
+          : new Promise<"grace">((resolve) => {
+              graceTimer = setTimeout(() => resolve("grace"), drainAbortGraceMs);
+            });
       try {
         while (!isAborted()) {
           if (state.inFlight.size > 0) {
             // Safe to race unconditionally: the loop guard keeps an
             // already-aborted drain from spinning on a resolved abortWake.
-            await Promise.race([Promise.allSettled(Array.from(state.inFlight)), abortWake]);
+            const winner = await Promise.race([
+              Promise.allSettled(Array.from(state.inFlight)).then(() => "settled" as const),
+              abortWake,
+              graceWake,
+            ]);
+            if (winner === "grace") {
+              log(
+                `nested frame drain abandoned ${state.inFlight.size} in-flight agent() call(s) after ${drainAbortGraceMs}ms; any miss they would note arrives too late for the parent's post-child boundary`,
+              );
+              break;
+            }
             continue;
           }
           // The set is empty, but a replay chain can still be mid-microtask: a
@@ -2161,11 +2212,13 @@ export async function runWorkflow<T = unknown>(
           // miss). One macrotask flushes every pending microtask-only chain;
           // anything dispatched afterwards is registered and caught by the
           // re-check. Work scheduled off a live call is covered because the
-          // call itself was awaited above.
+          // call itself was awaited above. If the grace fires during the
+          // yield, the next iteration's race resolves it immediately.
           await new Promise((resolve) => setTimeout(resolve, 0));
           if (state.inFlight.size === 0) break;
         }
       } finally {
+        if (graceTimer) clearTimeout(graceTimer);
         options.signal?.removeEventListener("abort", externalWake);
         shared.runFatalController.signal.removeEventListener("abort", fatalWake);
       }
@@ -2195,15 +2248,6 @@ export async function runWorkflow<T = unknown>(
       if (shared.inFlight.size > 0) {
         log(`waiting for ${shared.inFlight.size} outstanding agent() call(s) to settle before this run completes`);
       }
-      const graceOption = options.drainAbortGraceMs;
-      const drainAbortGraceMs =
-        graceOption === undefined
-          ? 10_000
-          : graceOption === Number.POSITIVE_INFINITY
-            ? Number.POSITIVE_INFINITY
-            : typeof graceOption === "number" && graceOption >= 1 && graceOption <= 2_147_483_647
-              ? Math.floor(graceOption)
-              : 10_000; // NaN/0/negative/overflow → default
       // Wakes the drain loop the moment the run aborts (either source), so a
       // drain that started un-aborted re-enters promptly and the grace clock
       // starts instead of blocking on allSettled forever.

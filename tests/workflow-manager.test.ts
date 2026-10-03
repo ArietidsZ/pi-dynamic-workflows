@@ -890,23 +890,29 @@ test(
     // an un-awaited, signal-ignoring call in flight otherwise holds executeRun
     // pending forever — pause() reports "paused" but the execution never
     // settles, and resume() then refuses at the settle guard: the run wedges.
+    //
+    // The drain only engages on an actual replay (a fresh start has no
+    // journal — #231 R8), so the pause must land on a RESUMED execution: run
+    // 1 is paused with HANG in flight (never journaled — a gap), and the
+    // resume re-runs that gap live inside the replayed child frame.
     const child = `export const meta = { name: 'kidHang', description: 'k' }
 const p = agent('HANG')
 return 'kid-done'`;
     const script = `export const meta = { name: 'parHang', description: 'p' }
 const n = await workflow('kidHang')
 return n`;
-    let hangStarted = false;
     let hangAttempts = 0;
+    let secondHangStarted = false;
     const manager = new WorkflowManager({
       cwd,
       loadSavedWorkflow: (name: string) => (name === "kidHang" ? child : undefined),
       agent: {
         async run(prompt, options) {
           options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
-          if (prompt === "HANG" && hangAttempts++ === 0) {
-            hangStarted = true;
-            return await new Promise((_resolve, _reject) => {});
+          if (prompt === "HANG") {
+            const attempt = ++hangAttempts;
+            if (attempt === 2) secondHangStarted = true;
+            if (attempt <= 2) return await new Promise((_resolve, _reject) => {});
           }
           return `${prompt}-done`;
         },
@@ -914,13 +920,27 @@ return n`;
     });
     manager.on("error", () => {});
 
+    // Run 1: the child script returns with HANG in flight; the top-level
+    // success drain holds the run "running" until the pause abandons it.
     const { runId, promise } = manager.startInBackground(script, undefined, {
       resumeMode: "replay-completed",
       drainAbortGraceMs: 100,
     });
     promise.catch(() => {});
-    for (let i = 0; i < 2000 && !hangStarted; i++) await new Promise((resolve) => setTimeout(resolve, 1));
-    assert.ok(hangStarted, "the signal-ignoring call is in flight before the pause");
+    for (let i = 0; i < 2000 && hangAttempts < 1; i++) await new Promise((resolve) => setTimeout(resolve, 1));
+    assert.ok(hangAttempts >= 1, "the first hung call is in flight before the pause");
+    assert.equal(manager.pause(runId), true);
+    for (let i = 0; i < 2000 && manager.getPersistence().load(runId)?.status !== "paused"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(manager.getPersistence().load(runId)?.status, "paused");
+
+    // Resume: the HANG gap re-runs live inside the replayed child frame, and
+    // the frame's quiescence drain blocks on it. Pausing THAT execution is
+    // what must wake the drain.
+    assert.equal(await manager.resume(runId, { drainAbortGraceMs: 100 }), true);
+    for (let i = 0; i < 2000 && !secondHangStarted; i++) await new Promise((resolve) => setTimeout(resolve, 1));
+    assert.ok(secondHangStarted, "the signal-ignoring call is in flight before the pause");
     // Let the child frame reach its drain and block in it — pausing earlier
     // would skip the drain loop entirely and prove nothing about the wake.
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -931,7 +951,7 @@ return n`;
     _setPausedExecutionSettleTimeoutForTests(2_000);
     try {
       assert.equal(
-        await manager.resume(runId),
+        await manager.resume(runId, { drainAbortGraceMs: 100 }),
         true,
         "the aborted nested drain must let the execution settle so resume can proceed",
       );
@@ -943,7 +963,93 @@ return n`;
     }
 
     assert.equal(manager.getPersistence().load(runId)?.status, "completed");
-    assert.equal(hangAttempts, 2, "the never-journaled gap call re-ran on resume and completed");
+    assert.equal(hangAttempts, 3, "the never-journaled gap call re-ran on each resume and completed");
+  }),
+);
+
+test(
+  "a non-recoverable error pauses a replay-completed resume despite a hung sibling in the child frame (#231 R8)",
+  withTempCwd(async (cwd) => {
+    // Manager-level view of the nested-drain grace bound: the resumed
+    // execution re-runs two gap calls — HANG (never settles) and LIMIT
+    // (throws a non-recoverable usage-limit error). Without a grace bound the
+    // child frame's quiescence drain waits on HANG BEHIND the error, the
+    // error never reaches the top-level catch that would abort HANG, the
+    // execution never settles, the run stays "running" forever, and resume()
+    // refuses — the usage-limit recovery path can never fire.
+    const child = `export const meta = { name: 'kidLimit', description: 'k' }
+const p = agent('HANG')
+const c = await agent('LIMIT')
+return c`;
+    const script = `export const meta = { name: 'parLimit', description: 'p' }
+const n = await workflow('kidLimit')
+return n`;
+    let hangAttempts = 0;
+    let limitAttempts = 0;
+    const manager = new WorkflowManager({
+      cwd,
+      loadSavedWorkflow: (name: string) => (name === "kidLimit" ? child : undefined),
+      agent: {
+        async run(prompt, options) {
+          options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+          if (prompt === "HANG") {
+            if (++hangAttempts <= 2) return await new Promise((_resolve, _reject) => {});
+            return "HANG-done";
+          }
+          if (prompt === "LIMIT") {
+            if (++limitAttempts === 1) return ""; // unjournaled gap for the resume
+            if (limitAttempts === 2) {
+              throw new WorkflowError("upstream 429: usage limit reached", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+                recoverable: false,
+              });
+            }
+            return "LIMIT-done";
+          }
+          return `${prompt}-done`;
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    // Run 1: LIMIT completes empty (never journaled — a gap), HANG stays in
+    // flight; the top-level success drain holds the run "running" until the
+    // pause abandons it.
+    const { runId, promise } = manager.startInBackground(script, undefined, {
+      resumeMode: "replay-completed",
+      drainAbortGraceMs: 100,
+    });
+    promise.catch(() => {});
+    for (let i = 0; i < 2000 && (hangAttempts < 1 || limitAttempts < 1); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.ok(hangAttempts >= 1 && limitAttempts >= 1, "both gap calls dispatched before the pause");
+    assert.equal(manager.pause(runId), true);
+    for (let i = 0; i < 2000 && manager.getPersistence().load(runId)?.status !== "paused"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(manager.getPersistence().load(runId)?.status, "paused");
+
+    // The resume re-runs both gaps live; LIMIT's usage-limit failure must
+    // settle the run (paused) instead of wedging behind the HANG drain.
+    assert.equal(await manager.resume(runId, { drainAbortGraceMs: 100 }), true);
+    for (let i = 0; i < 5_000; i++) {
+      const status = manager.getRun(runId)?.status ?? manager.getPersistence().load(runId)?.status;
+      if (status !== "running" && limitAttempts >= 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    const settled = manager.getPersistence().load(runId)?.status;
+    assert.ok(limitAttempts >= 2, "the failing gap call re-ran on the resume");
+    assert.notEqual(settled, "running", "the grace-bound drain must let the usage-limit error settle the run");
+    assert.notEqual(settled, "completed", "the usage-limit failure must not be swallowed");
+
+    // Recovery: the next resume re-runs the gaps once more, both succeed.
+    assert.equal(await manager.resume(runId, { drainAbortGraceMs: 100 }), true, "the settled run resumes");
+    for (let i = 0; i < 5_000 && (manager.getRun(runId)?.status === "running" || limitAttempts < 3); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(manager.getPersistence().load(runId)?.status, "completed");
+    assert.equal(hangAttempts, 3);
+    assert.equal(limitAttempts, 3);
   }),
 );
 
