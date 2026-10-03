@@ -906,7 +906,6 @@ const n = await workflow('kidHang')
 return n`;
     let hangAttempts = 0;
     let secondHangStarted = false;
-    let kSeedDone = false;
     const manager = new WorkflowManager({
       cwd,
       loadSavedWorkflow: (name: string) => (name === "kidHang" ? child : undefined),
@@ -918,7 +917,6 @@ return n`;
             if (attempt === 2) secondHangStarted = true;
             if (attempt <= 2) return await new Promise((_resolve, _reject) => {});
           }
-          if (prompt === "K-SEED") kSeedDone = true;
           return `${prompt}-done`;
         },
       },
@@ -931,18 +929,21 @@ return n`;
     // success drain holds the run "running" until the pause abandons it.
     const { runId, promise } = manager.startInBackground(script, undefined, {
       resumeMode: "replay-completed",
-      drainAbortGraceMs: 100,
+      // Well above the 50ms pre-pause wait so a scheduling stall cannot let
+      // the grace win the race and trip the absence assertion below (#231
+      // R10); still far inside the 2s settle guard for a drain with no wake.
+      drainAbortGraceMs: 1_000,
     });
     promise.catch(() => {});
-    for (let i = 0; i < 2000 && (hangAttempts < 1 || !kSeedDone); i++) {
+    const seedJournaled = () => manager.getRun(runId)?.journal.some((e) => e.result === "K-SEED-done") ?? false;
+    for (let i = 0; i < 2000 && (hangAttempts < 1 || !seedJournaled()); i++) {
       await new Promise((resolve) => setTimeout(resolve, 1));
     }
     assert.ok(hangAttempts >= 1, "the first hung call is in flight before the pause");
-    assert.ok(kSeedDone, "the seed call completed before the pause");
-    // Let the journal write land: pausing before K-SEED is journaled would
-    // leave the child frame with zero entries, disengaging the drain (#231 R9)
-    // and making the abort-wake assertion below vacuous.
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Pausing before K-SEED is journaled would leave the child frame with
+    // zero entries, disengaging the drain (#231 R9) and making the abort-wake
+    // assertion below vacuous — verify the entry, don't wait for it (#231 R10).
+    assert.ok(seedJournaled(), "the seed entry is journaled before the pause");
     assert.equal(manager.pause(runId), true);
     for (let i = 0; i < 2000 && manager.getPersistence().load(runId)?.status !== "paused"; i++) {
       await new Promise((resolve) => setTimeout(resolve, 1));
@@ -952,7 +953,7 @@ return n`;
     // Resume: the HANG gap re-runs live inside the replayed child frame, and
     // the frame's quiescence drain blocks on it. Pausing THAT execution is
     // what must wake the drain.
-    assert.equal(await manager.resume(runId, { drainAbortGraceMs: 100 }), true);
+    assert.equal(await manager.resume(runId, { drainAbortGraceMs: 1_000 }), true);
     for (let i = 0; i < 2000 && !secondHangStarted; i++) await new Promise((resolve) => setTimeout(resolve, 1));
     assert.ok(secondHangStarted, "the signal-ignoring call is in flight before the pause");
     // Let the child frame reach its drain and block in it — pausing earlier
@@ -965,7 +966,7 @@ return n`;
     _setPausedExecutionSettleTimeoutForTests(2_000);
     try {
       assert.equal(
-        await manager.resume(runId, { drainAbortGraceMs: 100 }),
+        await manager.resume(runId, { drainAbortGraceMs: 1_000 }),
         true,
         "the aborted nested drain must let the execution settle so resume can proceed",
       );

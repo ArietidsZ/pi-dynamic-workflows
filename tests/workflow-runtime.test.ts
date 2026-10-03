@@ -2286,7 +2286,10 @@ return { n, c }`;
     loadSavedWorkflow: (name) => (name === "kidHang" ? child : undefined),
     resumeJournal: journalMap(journal),
     signal: controller.signal,
-    drainAbortGraceMs: 100,
+    // Well above the 50ms pre-abort wait so a scheduling stall cannot let the
+    // grace win the race and trip the absence assertion below (#231 R10);
+    // still far inside the 2s wedge watchdog for a drain with no abort wake.
+    drainAbortGraceMs: 1_000,
     resumeMode: "replay-completed",
     onLog: (message) => logs.push(message),
   });
@@ -2422,6 +2425,65 @@ return { n, c }`;
     "c-sees-unset",
     "a fresh run has no journal: the drain must not delay the parent's post-child calls",
   );
+});
+
+test("a replay-completed resume does not serialize a nested fan-out when the child frame has nothing to replay (#231 R9)", async () => {
+  // A frame with zero journaled entries of its own can replay nothing: every
+  // call notes its gap at dispatch, so the frame's first dispatch already
+  // advances the parent's post-child boundary. Engaging the quiescence drain
+  // there would only serialize the fan-out — an observable live-execution
+  // change with zero replay benefit. The resume must behave like a prefix
+  // resume in this shape, whether the journal is empty or holds only
+  // top-level entries.
+  const child = `export const meta = { name: 'kidSide9', description: 'k' }
+const p = agent('SIDE')
+return 'kid-done'`;
+  const parent = `export const meta = { name: 'parSide9', description: 'p' }
+const n = await workflow('kidSide9')
+const c = await agent('C')
+return { n, c }`;
+
+  // Journal variant holding ONLY a top-level entry (SIDE's empty result is
+  // never journaled, so the child frame has no entries of its own).
+  const topLevelOnly: JournalEntry[] = [];
+  await runWorkflow(parent, {
+    agent: {
+      async run(prompt: string) {
+        return prompt === "SIDE" ? "" : `r:${prompt}`;
+      },
+    },
+    persistLogs: false,
+    runId: "r9-empty-frame",
+    loadSavedWorkflow: (name) => (name === "kidSide9" ? child : undefined),
+    onAgentJournal: (e) => topLevelOnly.push(e),
+  });
+  assert.ok(topLevelOnly.length > 0 && topLevelOnly.every((e) => (e.runId ?? "r9-empty-frame") === "r9-empty-frame"));
+
+  for (const resumeJournal of [new Map<string, JournalEntry>(), journalMap(topLevelOnly)]) {
+    let side = "unset";
+    const res = await runWorkflow(parent, {
+      agent: {
+        async run(prompt: string) {
+          if (prompt === "SIDE") {
+            await new Promise((resolve) => setTimeout(resolve, 30));
+            side = "set";
+            return "side-done";
+          }
+          return `c-sees-${side}`;
+        },
+      },
+      persistLogs: false,
+      runId: "r9-empty-frame",
+      loadSavedWorkflow: (name) => (name === "kidSide9" ? child : undefined),
+      resumeJournal,
+      resumeMode: "replay-completed",
+    });
+    assert.equal(
+      res.result.c,
+      "c-sees-unset",
+      "a child frame with nothing to replay must not delay the parent's post-child calls",
+    );
+  }
 });
 
 test("an unusable cached entry (empty output) is an edit, not a gap, in replay-completed mode", async () => {
