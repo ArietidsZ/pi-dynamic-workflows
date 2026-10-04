@@ -312,12 +312,12 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    * sweep evaluates IN THIS CHILD'S FINALLY, answering "could a deferred miss
    * here still change a replay decision downstream of its return" — a later
    * journaled call of the parent frame, or another nested frame's entries.
-   * Must be lazy: the parent's gaps and callSeq keep changing between the
-   * workflow() call and this frame's settlement, and an eager snapshot either
-   * misses gaps that materialize later (hold wrongly engaged) or counts
-   * in-window sibling entries as downstream (same). A plain boolean is
-   * tolerated as a constant so an old producer shape cannot crash the frame.
-   * Never set by hosts.
+   * Must be lazy: the parent's firstEdit, gaps and callSeq keep changing
+   * between the workflow() call and this frame's settlement, and an eager
+   * snapshot engages the hold for misses that can no longer matter. A plain
+   * boolean is tolerated as a constant (the field's previous type), and hosts
+   * can still reach the gate with one via the exported internals. Never set
+   * by hosts directly.
    */
   replaySweepRelevant?: boolean | (() => boolean);
   /** Active durable checkpoint response supplied by WorkflowManager.resume(). */
@@ -1726,38 +1726,35 @@ export async function runWorkflow<T = unknown>(
       // inheritance is decided by this frame's boundary at ITS dispatch).
       // The child's zero-entry sweep holds one macrotask for exactly this;
       // when nothing downstream can replay, the hold is pure, observable
-      // cost (#231 R16 empty journal, R17 upstream-only/foreign journals).
-      // The probe is a CLOSURE evaluated in the child's finally, not a
-      // call-site snapshot (#231 R19): gaps and callSeq change between here
-      // and the child's settlement — a gap dispatched in this window AFTER
-      // the workflow() call, or post-window by a concurrent thunk, is
-      // invisible to a snapshot and wrongly engages the hold, and a
-      // snapshot's callSeq wrongly counts entries of calls dispatched later
-      // in this window as "downstream". Evaluated lazily, the conjuncts are
-      // exact:
-      // - Any gap present at the child's finally shadows EVERY future call
-      //   (its index is below every later call's — callSeq is monotone — and
-      //   no later call can sample a window open at that gap's dispatch,
-      //   since dispatchOpen flips false synchronously) and makes every
-      //   later sibling frame's prefixIntact false at ITS dispatch, so the
-      //   advance can no longer change a decision (#231 R18/R19).
-      // - callSeq read at the finally counts only calls already dispatched;
-      //   their entries are past decisions, so maxOwnIndex >= callSeq means
-      //   a genuinely FUTURE journaled call.
-      // - Conservative by construction: an EARLIER sibling frame's entries
-      //   also engage it (their keys are indistinguishable from a later
-      //   frame's), which at worst re-adds the hold. The current child's OWN
-      //   entries technically engage it too, but a child with entries takes
-      //   the full-drain branch, never the sweep. A shadowing gap that
-      //   arrives only after the child resolves is unknowable here; the
-      //   probe then stays engaged, which is the safe direction.
+      // cost (it flips the parent's post-child ordering vs a prefix resume).
+      // The probe is a CLOSURE evaluated in the child's finally (#231 R19/
+      // R20): firstEdit, gaps and callSeq all change between here and the
+      // child's settlement — a gap or edit dispatched in this window AFTER
+      // the workflow() call, a post-window gap from a concurrent thunk, a
+      // sibling frame's advance — and a snapshot of any of them (including
+      // prefixIntact, whose firstEdit clause goes stale on a post-call
+      // edit, which pushes no gap) wrongly engages the hold. Read lazily,
+      // each conjunct is exact:
+      // - firstEdit > callSeq ⟺ the edit boundary has not yet blocked the
+      //   next dispatched call: a finite firstEdit is <= callSeq, so every
+      //   future index is >= firstEdit and must run live regardless of this
+      //   child.
+      // - Any gap present at the finally shadows every future call (its
+      //   index is below every later call's; no later call can sample a
+      //   window open at that gap's dispatch).
+      // - maxOwnIndex >= callSeq with the live callSeq counts only genuinely
+      //   FUTURE journaled calls (in-window siblings are past decisions).
+      // Conservative by construction: an EARLIER sibling frame's entries
+      // also engage it (at worst re-adding the hold), and a miss that lands
+      // only after the child resolves is unknowable here — the probe stays
+      // engaged, the safe direction.
       // shared.nestedCallSeq, not shared.depth — see its doc comment: depth
       // returns to 0 between sequential sibling calls, which would otherwise
       // mint the same child runId (and hence colliding deltaKeys/event ids)
       // for two different children.
       const childRunId = `${runId}-nested${++shared.nestedCallSeq}`;
       const replaySweepRelevant = () =>
-        prefixIntact &&
+        state.firstEdit > state.callSeq &&
         state.gaps.length === 0 &&
         journalReach !== undefined &&
         (journalReach.maxOwnIndex >= state.callSeq || journalReach.nestedFrames.size > 0);
@@ -2384,20 +2381,14 @@ export async function runWorkflow<T = unknown>(
       // dispatch, so the sweep never waits for a settlement and needs no
       // abort/grace race.
       //
-      // The relevance probe (replaySweepRelevant): the hold only buys
-      // anything when a deferred miss HERE could still change a replay
-      // decision downstream — a later journaled call of the parent frame,
-      // or another nested frame's journal inheritance. Otherwise the one
-      // macrotask is pure, observable cost: it delays this frame's
-      // settlement past a deferred dispatch and flips the parent's
-      // post-child ordering vs a prefix resume (#231 R16 empty journal,
-      // R17 upstream-only/foreign journals). Those shapes fall back to
-      // prefix timing. It is a closure the PARENT passes (the child frame
-      // can see neither the parent's callSeq nor its gaps) and it is
-      // evaluated HERE, at the child's settle point, because the parent's
-      // state keeps changing between the workflow() call and now — an
-      // eager snapshot wrongly engages on gaps or in-window sibling
-      // entries that materialize later (#231 R19).
+      // The relevance probe gates the cost: when no deferred miss here could
+      // still change a downstream replay decision, the one macrotask is pure,
+      // observable cost — it delays this frame's settlement past a deferred
+      // dispatch and flips the parent's post-child ordering vs a prefix
+      // resume, so those shapes fall back to prefix timing (#231 R16/R17).
+      // The parent passes it as a closure evaluated HERE (the child frame
+      // cannot compute the parent's reachability from its own state) — see
+      // workflowFn for why every input must be read lazily.
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
     // Only the top-level frame drains/disposes (see isTopLevelRun) — a nested
