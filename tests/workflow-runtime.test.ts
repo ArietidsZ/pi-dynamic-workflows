@@ -3067,20 +3067,23 @@ return 'kid-done'`;
     return { prefix: await observe("prefix"), replay: await observe("replay-completed") };
   };
   const keys = (journal: JournalEntry[]) => journal.map((e) => `${e.runId}:${e.index}`);
+  // The shared fan-out parent for scenarios (a), (b) and (d): the workflow()
+  // call and one sibling agent() share a single dispatch window.
+  const mkParallelParent = (name: string, sibling: string) => `export const meta = { name: '${name}', description: 'p' }
+let wp;
+parallel([
+  () => { wp = workflow('kidR19'); return 'w-started'; },
+  () => agent('${sibling}'),
+]);
+const w = await wp;
+const c = await agent('C');
+return { w, c }`;
 
   // (a) A gap dispatched in the same window AFTER the workflow() call: no gap
   // exists at the call site, but G's gap is present when the child settles and
   // shadows every post-window call, so the hold can change nothing.
   {
-    const parent = `export const meta = { name: 'parR19A', description: 'p' }
-let wp;
-parallel([
-  () => { wp = workflow('kidR19'); return 'w-started'; },
-  () => agent('G'),
-]);
-const w = await wp;
-const c = await agent('C');
-return { w, c }`;
+    const parent = mkParallelParent("parR19A", "G");
     const journal = await capture("r19-a", parent, (prompt) => (prompt === "C" ? "C-r" : ""));
     assert.deepEqual(keys(journal), ["r19-a:1"], "only C journals; G's run-1 failure leaves a gap");
     const { prefix, replay } = await runPair("r19-a", parent, () => "", journal);
@@ -3094,15 +3097,7 @@ return { w, c }`;
   // snapshot. Lazily, callSeq has advanced past S's index and the probe is
   // false. S absent from the event lists = S replays from its entry.
   {
-    const parent = `export const meta = { name: 'parR19B', description: 'p' }
-let wp;
-parallel([
-  () => { wp = workflow('kidR19'); return 'w-started'; },
-  () => agent('S'),
-]);
-const w = await wp;
-const c = await agent('C');
-return { w, c }`;
+    const parent = mkParallelParent("parR19B", "S");
     const journal = await capture("r19-b", parent, (prompt) => (prompt === "S" ? "S-r" : ""));
     assert.deepEqual(keys(journal), ["r19-b:0"], "only the in-window sibling S journals");
     const { prefix, replay } = await runPair("r19-b", parent, () => "", journal);
@@ -3140,19 +3135,10 @@ return { w, c }`;
   // is already blocked (index >= firstEdit), so only a live firstEdit read
   // keeps the sweep out (#231 R20).
   {
-    const mkParent = (g: string) => `export const meta = { name: 'parR19D', description: 'p' }
-let wp;
-parallel([
-  () => { wp = workflow('kidR19'); return 'w-started'; },
-  () => agent('${g}'),
-]);
-const w = await wp;
-const c = await agent('C');
-return { w, c }`;
     const gOrC = (prompt: string) => (prompt === "G" ? "G-r" : prompt === "C" ? "C-r" : "");
-    const journal = await capture("r19-d", mkParent("G"), gOrC);
+    const journal = await capture("r19-d", mkParallelParent("parR19D", "G"), gOrC);
     assert.deepEqual(keys(journal), ["r19-d:0", "r19-d:1"], "G and C journal in run 1");
-    const { prefix, replay } = await runPair("r19-d", mkParent("G2"), () => "", journal);
+    const { prefix, replay } = await runPair("r19-d", mkParallelParent("parR19D", "G2"), () => "", journal);
     assert.deepEqual(prefix, { c: "c-sees-unset", events: ["G2", "C", "X"] }, "prefix: C beats the deferred X");
     assert.deepEqual(replay, prefix, "a post-call edit must not engage the sweep");
   }

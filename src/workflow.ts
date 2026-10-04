@@ -267,6 +267,11 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    * collide with the parent's own callIndex-0 entry. A legacy entry with no
    * `runId` (persisted before namespacing existed) is looked up under the
    * run's own top-level runId only; see `JournalEntry.runId`.
+   *
+   * The map is read both once at run start (the nested-frame reachability
+   * scan) and live at every call dispatch; do not mutate it while a run is
+   * active — an entry injected mid-run is honored by dispatches but invisible
+   * to the start-time scan (#231 R22).
    */
   resumeJournal?: Map<string, JournalEntry>;
   /** Resume: the run being resumed (informational; enables resume mode). */
