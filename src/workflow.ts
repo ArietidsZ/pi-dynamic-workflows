@@ -308,14 +308,18 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    */
   onJournalMiss?: () => void;
   /**
-   * Internal nested-frame plumbing (workflowFn): the parent frame's
-   * precomputed answer to "could a deferred miss in THIS child still change a
-   * replay decision downstream of its return" — a later journaled call of the
-   * parent frame, or another nested frame's entries. Gates the zero-entry
-   * sweep's one-macrotask hold so frames whose misses cannot matter settle
-   * with base (prefix) timing. Never set by hosts.
+   * Internal nested-frame plumbing (workflowFn): a live probe the zero-entry
+   * sweep evaluates IN THIS CHILD'S FINALLY, answering "could a deferred miss
+   * here still change a replay decision downstream of its return" — a later
+   * journaled call of the parent frame, or another nested frame's entries.
+   * Must be lazy: the parent's gaps and callSeq keep changing between the
+   * workflow() call and this frame's settlement, and an eager snapshot either
+   * misses gaps that materialize later (hold wrongly engaged) or counts
+   * in-window sibling entries as downstream (same). A plain boolean is
+   * tolerated as a constant so an old producer shape cannot crash the frame.
+   * Never set by hosts.
    */
-  replaySweepRelevant?: boolean;
+  replaySweepRelevant?: boolean | (() => boolean);
   /** Active durable checkpoint response supplied by WorkflowManager.resume(). */
   resumeCheckpoint?: WorkflowCheckpoint;
   /** Persist a durable checkpoint transition before it becomes externally observable. */
@@ -1723,27 +1727,38 @@ export async function runWorkflow<T = unknown>(
       // The child's zero-entry sweep holds one macrotask for exactly this;
       // when nothing downstream can replay, the hold is pure, observable
       // cost (#231 R16 empty journal, R17 upstream-only/foreign journals).
-      // Computed here because the child frame can see neither this frame's
-      // callSeq nor its runId. Two refinements:
-      // - A pre-call gap: with prefixIntact true it must share this call's
-      //   dispatch window, and then every downstream decision is already
-      //   fixed — in-window calls decided synchronously at dispatch (the
-      //   child cannot settle inside a synchronous window), post-window
-      //   calls are shadowed by the gap with or without this child's
-      //   advance — so the sweep would change nothing (#231 R18).
+      // The probe is a CLOSURE evaluated in the child's finally, not a
+      // call-site snapshot (#231 R19): gaps and callSeq change between here
+      // and the child's settlement — a gap dispatched in this window AFTER
+      // the workflow() call, or post-window by a concurrent thunk, is
+      // invisible to a snapshot and wrongly engages the hold, and a
+      // snapshot's callSeq wrongly counts entries of calls dispatched later
+      // in this window as "downstream". Evaluated lazily, the conjuncts are
+      // exact:
+      // - Any gap present at the child's finally shadows EVERY future call
+      //   (its index is below every later call's — callSeq is monotone — and
+      //   no later call can sample a window open at that gap's dispatch,
+      //   since dispatchOpen flips false synchronously) and makes every
+      //   later sibling frame's prefixIntact false at ITS dispatch, so the
+      //   advance can no longer change a decision (#231 R18/R19).
+      // - callSeq read at the finally counts only calls already dispatched;
+      //   their entries are past decisions, so maxOwnIndex >= callSeq means
+      //   a genuinely FUTURE journaled call.
       // - Conservative by construction: an EARLIER sibling frame's entries
       //   also engage it (their keys are indistinguishable from a later
-      //   frame's at this point), which at worst re-adds the hold. The
-      //   current child's OWN entries technically engage it too, but a
-      //   child with entries takes the full-drain branch, never the sweep.
+      //   frame's), which at worst re-adds the hold. The current child's OWN
+      //   entries technically engage it too, but a child with entries takes
+      //   the full-drain branch, never the sweep. A shadowing gap that
+      //   arrives only after the child resolves is unknowable here; the
+      //   probe then stays engaged, which is the safe direction.
       // shared.nestedCallSeq, not shared.depth — see its doc comment: depth
       // returns to 0 between sequential sibling calls, which would otherwise
       // mint the same child runId (and hence colliding deltaKeys/event ids)
       // for two different children.
       const childRunId = `${runId}-nested${++shared.nestedCallSeq}`;
-      const replaySweepRelevant =
+      const replaySweepRelevant = () =>
         prefixIntact &&
-        !state.gaps.some((gap) => gap.index < state.callSeq) &&
+        state.gaps.length === 0 &&
         journalReach !== undefined &&
         (journalReach.maxOwnIndex >= state.callSeq || journalReach.nestedFrames.size > 0);
       const childRun = workflowNestingScope.run(nestingDepth + 1, () =>
@@ -2342,7 +2357,13 @@ export async function runWorkflow<T = unknown>(
         options.signal?.removeEventListener("abort", externalWake);
         shared.runFatalController.signal.removeEventListener("abort", fatalWake);
       }
-    } else if (!isTopLevelRun && resolvedResumeMode === "replay-completed" && options.replaySweepRelevant) {
+    } else if (
+      !isTopLevelRun &&
+      resolvedResumeMode === "replay-completed" &&
+      (typeof options.replaySweepRelevant === "function"
+        ? options.replaySweepRelevant()
+        : options.replaySweepRelevant === true)
+    ) {
       // Zero-entry frame (replayQuiescenceEnabled is false because the journal
       // has no keys for this frame): every call here is a gap noted
       // SYNCHRONOUSLY at dispatch (noteJournalMiss precedes the limiter), so
@@ -2363,15 +2384,20 @@ export async function runWorkflow<T = unknown>(
       // dispatch, so the sweep never waits for a settlement and needs no
       // abort/grace race.
       //
-      // The relevance guard (replaySweepRelevant, computed at the workflow()
-      // call site): the hold only buys anything when a deferred miss HERE
-      // could still change a replay decision downstream — a later journaled
-      // call of the parent frame, or another nested frame's journal
-      // inheritance. Otherwise the one macrotask is pure, observable cost:
-      // it delays this frame's settlement past a deferred dispatch and
-      // flips the parent's post-child ordering vs a prefix resume (#231 R16
-      // empty journal, R17 upstream-only/foreign journals). Those shapes
-      // fall back to prefix timing.
+      // The relevance probe (replaySweepRelevant): the hold only buys
+      // anything when a deferred miss HERE could still change a replay
+      // decision downstream — a later journaled call of the parent frame,
+      // or another nested frame's journal inheritance. Otherwise the one
+      // macrotask is pure, observable cost: it delays this frame's
+      // settlement past a deferred dispatch and flips the parent's
+      // post-child ordering vs a prefix resume (#231 R16 empty journal,
+      // R17 upstream-only/foreign journals). Those shapes fall back to
+      // prefix timing. It is a closure the PARENT passes (the child frame
+      // can see neither the parent's callSeq nor its gaps) and it is
+      // evaluated HERE, at the child's settle point, because the parent's
+      // state keeps changing between the workflow() call and now — an
+      // eager snapshot wrongly engages on gaps or in-window sibling
+      // entries that materialize later (#231 R19).
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
     // Only the top-level frame drains/disposes (see isTopLevelRun) — a nested

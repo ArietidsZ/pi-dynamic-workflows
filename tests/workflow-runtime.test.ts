@@ -2997,6 +2997,229 @@ return { w, c }`;
   assert.deepEqual(events, ["G", "C", "X"], "the parent's post-child call must beat the deferred dispatch");
 });
 
+test("the sweep's relevance is evaluated when the child settles, not at the workflow() call (#231 R19)", async () => {
+  // The predicate reads the parent frame's gaps and callSeq, and both keep
+  // changing between the workflow() call and the child's settlement. An eager
+  // call-site snapshot engages the one-macrotask hold in shapes where nothing
+  // downstream can still change, flipping the parent's post-child ordering vs
+  // a prefix resume. Three instances, one root cause; each scenario below
+  // asserts replay-completed matches prefix exactly.
+  const tickChild = (name: string) => `export const meta = { name: '${name}', description: 'k' }
+let release;
+const gate = new Promise((r) => { release = r; });
+const p = (async () => { await gate; const x = await agent('X'); return x; })().catch(() => {});
+let c = Promise.resolve();
+c = c.then(() => {});
+c = c.then(() => {});
+c = c.then(() => Promise.resolve());
+c.then(() => { release(); });
+return 'kid-done'`;
+  const calibrated = tickChild("kidR19");
+
+  type Observed = { c: string; events: string[] };
+  async function runPair(
+    label: string,
+    childName: string,
+    child: string,
+    parent: string,
+    run1Result: (prompt: string) => string,
+    journal: JournalEntry[],
+  ): Promise<{ prefix: Observed; replay: Observed }> {
+    const observe = async (mode: "prefix" | "replay-completed"): Promise<Observed> => {
+      const events: string[] = [];
+      let side = "unset";
+      const out = await runWorkflow<{ w: string; c: string }>(parent, {
+        agent: {
+          async run(prompt: string) {
+            events.push(prompt);
+            if (prompt === "X") {
+              side = "set";
+              return "x-done";
+            }
+            if (prompt === "C") return `c-sees-${side}`;
+            return run1Result(prompt);
+          },
+        },
+        persistLogs: false,
+        runId: label,
+        loadSavedWorkflow: (name) => (name === childName ? child : undefined),
+        resumeJournal: journalMap(journal),
+        resumeMode: mode,
+      });
+      return { c: out.result.c, events };
+    };
+    return { prefix: await observe("prefix"), replay: await observe("replay-completed") };
+  }
+
+  // (a) A gap dispatched in the same window AFTER the workflow() call: no gap
+  // exists at the call site, but G's gap is present when the child settles and
+  // shadows every post-window call, so the hold can change nothing.
+  {
+    const parent = `export const meta = { name: 'parR19A', description: 'p' }
+let wp;
+parallel([
+  () => { wp = workflow('kidR19'); return 'w-started'; },
+  () => agent('G'),
+]);
+const w = await wp;
+const c = await agent('C');
+return { w, c }`;
+    const journal: JournalEntry[] = [];
+    await runWorkflow(parent, {
+      agent: {
+        async run(prompt: string) {
+          return prompt === "C" ? "C-r" : "";
+        },
+      },
+      persistLogs: false,
+      runId: "r19-a",
+      loadSavedWorkflow: (name) => (name === "kidR19" ? calibrated : undefined),
+      onAgentJournal: (e) => journal.push(e),
+    });
+    assert.deepEqual(
+      journal.map((e) => `${e.runId}:${e.index}`),
+      ["r19-a:1"],
+      "only C journals; G's run-1 failure leaves a gap",
+    );
+    const { prefix, replay } = await runPair("r19-a", "kidR19", calibrated, parent, () => "", journal);
+    assert.deepEqual(prefix, { c: "c-sees-unset", events: ["G", "C", "X"] }, "prefix: C beats the deferred X");
+    assert.deepEqual(replay, prefix, "a post-call same-window gap must not engage the sweep");
+  }
+
+  // (b) No gap at all: the only journal entry at an index >= the call-site
+  // callSeq belongs to S, dispatched later in the SAME window — a decision
+  // already made synchronously, wrongly counted as "downstream" by an eager
+  // snapshot. Lazily, callSeq has advanced past S's index and the probe is
+  // false.
+  {
+    const parent = `export const meta = { name: 'parR19B', description: 'p' }
+let wp;
+parallel([
+  () => { wp = workflow('kidR19'); return 'w-started'; },
+  () => agent('S'),
+]);
+const w = await wp;
+const c = await agent('C');
+return { w, c }`;
+    const journal: JournalEntry[] = [];
+    await runWorkflow(parent, {
+      agent: {
+        async run(prompt: string) {
+          return prompt === "S" ? "S-r" : "";
+        },
+      },
+      persistLogs: false,
+      runId: "r19-b",
+      loadSavedWorkflow: (name) => (name === "kidR19" ? calibrated : undefined),
+      onAgentJournal: (e) => journal.push(e),
+    });
+    assert.deepEqual(
+      journal.map((e) => `${e.runId}:${e.index}`),
+      ["r19-b:0"],
+      "only the in-window sibling S journals",
+    );
+    let sLive = 0;
+    const observe = async (mode: "prefix" | "replay-completed") => {
+      const events: string[] = [];
+      let side = "unset";
+      const out = await runWorkflow<{ w: string; c: string }>(parent, {
+        agent: {
+          async run(prompt: string) {
+            events.push(prompt);
+            if (prompt === "X") {
+              side = "set";
+              return "x-done";
+            }
+            if (prompt === "C") return `c-sees-${side}`;
+            sLive++;
+            return "";
+          },
+        },
+        persistLogs: false,
+        runId: "r19-b",
+        loadSavedWorkflow: (name) => (name === "kidR19" ? calibrated : undefined),
+        resumeJournal: journalMap(journal),
+        resumeMode: mode,
+      });
+      return { c: out.result.c, events };
+    };
+    const prefix = await observe("prefix");
+    const replay = await observe("replay-completed");
+    assert.equal(sLive, 0, "S replays from its entry in both modes");
+    assert.deepEqual(prefix, { c: "c-sees-unset", events: ["C", "X"] }, "prefix: C beats the deferred X");
+    assert.deepEqual(replay, prefix, "an in-window sibling entry must not engage the sweep");
+  }
+
+  // (c) A gap dispatched POST-window by a concurrent thunk (B, after A's
+  // replay settles), with real entries on both sides (A and C journal): the
+  // reachability conjunct is genuinely satisfied, so only the gap conjunct
+  // can keep the sweep out — and only its exact form (B's gap is
+  // generation-undefined, which a same-window-gen check cannot see).
+  {
+    const parent = `export const meta = { name: 'parR19C', description: 'p' }
+let wp;
+parallel([
+  () => agent('A').then(() => agent('B')),
+  () => { wp = workflow('kidR19'); return 'w-started'; },
+]);
+const w = await wp;
+const c = await agent('C');
+return { w, c }`;
+    const journal: JournalEntry[] = [];
+    await runWorkflow(parent, {
+      agent: {
+        async run(prompt: string) {
+          if (prompt === "A") return "A-r";
+          if (prompt === "C") return "C-r";
+          return ""; // B (the post-window gap) and X fail with no entry
+        },
+      },
+      persistLogs: false,
+      runId: "r19-c",
+      loadSavedWorkflow: (name) => (name === "kidR19" ? calibrated : undefined),
+      onAgentJournal: (e) => journal.push(e),
+    });
+    assert.deepEqual(
+      journal.map((e) => `${e.runId}:${e.index}`),
+      ["r19-c:0", "r19-c:2"],
+      "A and C journal; B's post-window failure leaves a gap",
+    );
+    let cLive = 0;
+    const observe = async (mode: "prefix" | "replay-completed") => {
+      const events: string[] = [];
+      let side = "unset";
+      const out = await runWorkflow<{ w: string; c: string }>(parent, {
+        agent: {
+          async run(prompt: string) {
+            events.push(prompt);
+            if (prompt === "X") {
+              side = "set";
+              return "x-done";
+            }
+            if (prompt === "C") {
+              cLive++;
+              return `c-sees-${side}`;
+            }
+            if (prompt === "A") return "A-r";
+            return ""; // B gaps again, after A's replay settles
+          },
+        },
+        persistLogs: false,
+        runId: "r19-c",
+        loadSavedWorkflow: (name) => (name === "kidR19" ? calibrated : undefined),
+        resumeJournal: journalMap(journal),
+        resumeMode: mode,
+      });
+      return { c: out.result.c, events };
+    };
+    const prefix = await observe("prefix");
+    const replay = await observe("replay-completed");
+    assert.equal(cLive, 2, "C is shadowed by B's gap and runs live in both modes");
+    assert.deepEqual(prefix, { c: "c-sees-unset", events: ["B", "C", "X"] }, "prefix: C beats the deferred X");
+    assert.deepEqual(replay, prefix, "a post-window gap from a concurrent thunk must not engage the sweep");
+  }
+});
+
 test("an unusable cached entry (empty output) is an edit, not a gap, in replay-completed mode", async () => {
   // Defensive branch: organic empty output is never journaled, but a legacy or
   // hand-edited journal CAN hold an unusable entry. It must pin firstEdit
