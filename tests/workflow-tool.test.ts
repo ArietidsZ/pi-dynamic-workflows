@@ -419,6 +419,38 @@ test(
 );
 
 test(
+  "workflow tool: results carry codemode structuredContent under a declared outputSchema",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent() });
+    manager.on("error", () => {});
+    const tool = createWorkflowTool({ cwd, manager });
+    assert.ok(
+      (tool as { outputSchema?: unknown }).outputSchema,
+      "the declaration carries an outputSchema so codemode resolves structured data instead of prose",
+    );
+
+    const started = await tool.execute("sc1", { script: resumeToolScript }, undefined, undefined, undefined);
+    const startedRunId = (started.details as { runId?: string }).runId;
+    assert.ok(startedRunId);
+    assert.deepEqual((started as { structuredContent?: unknown }).structuredContent, {
+      runId: startedRunId,
+      status: "started",
+    });
+
+    const syncScript = `export const meta = { name: 'sync_sc', description: 'sync' }
+return await agent('one')`;
+    const done = await tool.execute("sc2", { script: syncScript, background: false }, undefined, undefined, undefined);
+    const doneRunId = (done.details as { runId?: string }).runId;
+    assert.ok(doneRunId);
+    assert.deepEqual(
+      (done as { structuredContent?: unknown }).structuredContent,
+      { runId: doneRunId, status: "completed", result: "ok" },
+      "a synchronous call resolves with the workflow's return value",
+    );
+  }),
+);
+
+test(
   "workflow tool: resumeFromRunId resumes a paused run with the edited script",
   withToolTempCwd(async (cwd) => {
     const seen: string[] = [];
@@ -460,6 +492,11 @@ return { a, b }`;
     const details = res.details as { runId?: string; resumedFrom?: string };
     assert.equal(details.runId, runId, "resumed run keeps the same run id");
     assert.equal(details.resumedFrom, runId);
+    assert.deepEqual(
+      (res as { structuredContent?: unknown }).structuredContent,
+      { runId, status: "resumed" },
+      "codemode callers receive the structured resume outcome",
+    );
     const text = res.content?.[0]?.type === "text" ? res.content[0].text : "";
     assert.match(text, new RegExp(`resumed from run ${runId}`), "text names the resumed run");
 

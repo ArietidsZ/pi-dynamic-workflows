@@ -24,3 +24,24 @@ jobs:
         run: npm ci
       - name: Lint, build, and test
         run: npm test
+
+  # The committed lockfile pins the Pi 0.85 dev host while package.json
+  # devDependencies float on "latest". Re-resolve the three Pi packages to the
+  # current 1.x line in one install (partial upgrades leave duplicate pi-ai /
+  # pi-tui instances whose diverged types fail tsc) so Pi-internal seam drift
+  # the extension probes — e.g. sessionManager.buildSessionProjection — is
+  # CI-visible instead of surfacing only at user upgrade time.
+  test-pi-1:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Re-resolve Pi packages to the 1.x line
+        run: npm install --no-save @earendil-works/pi-coding-agent@1 @earendil-works/pi-ai@1 @earendil-works/pi-tui@1
+      - name: Lint, build, and test
+        run: npm test
