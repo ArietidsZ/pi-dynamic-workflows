@@ -24,6 +24,28 @@ import { loadWorkflowSettings } from "./workflow-settings.js";
 export const WORKFLOW_GATE_GUIDELINE =
   "The `workflow` tool runs multi-agent orchestration — it fans decomposable work out across subagents, and fits tasks shaped like: repo-wide inspection, independent parallel research/checks, multi-perspective review, or fan-out/fan-in synthesis. ONLY call it when the user explicitly opts in — via the workflow trigger word, `/workflows run`, or their own words (e.g. 'run a workflow', 'fan this out', '并行审一遍'). For any other task — even one that would clearly benefit — do not call it; you may briefly offer it (with a rough cost) as an option instead.";
 
+/**
+ * What a codemode script receives when it calls the workflow tool (see the
+ * outputSchema spread below): started/resumed runs deliver their result back
+ * into the conversation later; only a synchronous (background: false) call
+ * resolves with `result` present.
+ */
+const workflowOutputSchema = Type.Object({
+  runId: Type.String(),
+  status: Type.Union([Type.Literal("started"), Type.Literal("resumed"), Type.Literal("completed")]),
+  result: Type.Optional(Type.Unknown()),
+});
+
+/**
+ * Attach structuredContent outside the result literals: the floor pi types do
+ * not declare the field (added upstream with outputSchema), so a literal
+ * property would fail the excess-property check. The model-facing `content`
+ * is untouched — only tool-chaining callers (codemode) read this.
+ */
+function withStructuredContent<T extends object>(result: T, structuredContent: unknown): T {
+  return Object.assign(result, { structuredContent });
+}
+
 const workflowToolSchema = Type.Object({
   script: Type.Optional(
     Type.String({
@@ -199,6 +221,13 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       return [WORKFLOW_GATE_GUIDELINE];
     },
     parameters: workflowToolSchema,
+    // Codemode (pi >= 0.99, including the 1.x line) resolves a called tool to
+    // its structuredContent when the declaration carries an outputSchema;
+    // tools without one resolve to prose text. The provider-visible
+    // declaration picks only name/description/parameters, so this costs no
+    // prompt bytes, and hosts without the feature ignore the field. The floor
+    // pi types predate it — spread bypasses the excess-property check.
+    ...{ outputSchema: workflowOutputSchema },
     prepareArguments(args) {
       return normalizeWorkflowToolArgs(args);
     },
@@ -258,19 +287,22 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         if (!resumed) {
           throw new Error(resumeFailureText(manager, runId, params.maxAgents));
         }
-        return {
-          content: [
-            {
-              type: "text",
-              // The EFFECTIVE policy decides the replay description: an omitted
-              // resumeMode falls back to the run's persisted mode (see
-              // WorkflowManager.resume), so params.resumeMode alone can
-              // misdescribe what the resumed run will actually do.
-              text: resumedText(parsed.meta.name, runId, manager.getRun(runId)?.resumeMode ?? params.resumeMode),
-            },
-          ],
-          details: { runId, background: true, resumedFrom: runId },
-        };
+        return withStructuredContent(
+          {
+            content: [
+              {
+                type: "text",
+                // The EFFECTIVE policy decides the replay description: an omitted
+                // resumeMode falls back to the run's persisted mode (see
+                // WorkflowManager.resume), so params.resumeMode alone can
+                // misdescribe what the resumed run will actually do.
+                text: resumedText(parsed.meta.name, runId, manager.getRun(runId)?.resumeMode ?? params.resumeMode),
+              },
+            ],
+            details: { runId, background: true, resumedFrom: runId },
+          },
+          { runId, status: "resumed" },
+        );
       }
 
       // checkpoint() reaches the human only on a UI-bearing foreground run; a
@@ -298,10 +330,13 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           tools: invocationTools,
           toolset: invocationToolset,
         });
-        return {
-          content: [{ type: "text", text: backgroundStartedText(parsed.meta.name, runId) }],
-          details: { runId, background: true },
-        };
+        return withStructuredContent(
+          {
+            content: [{ type: "text", text: backgroundStartedText(parsed.meta.name, runId) }],
+            details: { runId, background: true },
+          },
+          { runId, status: "started" },
+        );
       }
 
       // Synchronous execution (blocking) — but routed through the manager so the
@@ -396,24 +431,31 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       const formattedResult =
         result.result !== undefined ? `\n\`\`\`json\n${JSON.stringify(result.result, null, 2)}\n\`\`\`` : "";
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Workflow **${result.meta.name}** completed with **${result.agentCount}** agent(s).${tokenInfo}\n\n## Result${formattedResult}\n\n${reviseHint(result.runId)}`,
+      return withStructuredContent(
+        {
+          content: [
+            {
+              type: "text",
+              text: `Workflow **${result.meta.name}** completed with **${result.agentCount}** agent(s).${tokenInfo}\n\n## Result${formattedResult}\n\n${reviseHint(result.runId)}`,
+            },
+          ],
+          details: {
+            ...snapshot,
+            meta: result.meta,
+            phases: result.phases,
+            logs: result.logs,
+            result: result.result,
+            durationMs: result.durationMs,
+            tokenUsage: result.tokenUsage,
+            runId: result.runId,
           },
-        ],
-        details: {
-          ...snapshot,
-          meta: result.meta,
-          phases: result.phases,
-          logs: result.logs,
-          result: result.result,
-          durationMs: result.durationMs,
-          tokenUsage: result.tokenUsage,
-          runId: result.runId,
         },
-      };
+        {
+          runId: result.runId,
+          status: "completed",
+          ...(result.result === undefined ? {} : { result: result.result }),
+        },
+      );
     },
     renderCall(_args, theme) {
       return new Text(theme.fg("toolTitle", theme.bold("workflow")), 0, 0);

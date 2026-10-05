@@ -246,12 +246,15 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    * - A NESTED frame's replay quiescence drain, for its whole lifetime —
    *   success path included, abort or not (#231 R8). That drain's only other
    *   release seals downstream of whatever error the drain could be blocking,
-   *   so an unbounded wait could wedge the run; the cost is that a call
-   *   outliving the grace loses late-miss propagation to the parent's
-   *   post-child boundary.
+   *   so an unbounded wait could wedge the run. In replay-completed mode,
+   *   an already-dispatched live gap/edit is recorded before provider
+   *   execution and still forces post-child parent calls live. Grace expiry
+   *   can let those calls run before the child's side effects finish. Work
+   *   whose first miss is dispatched only after the child returns (such as
+   *   independently deferred timer/I/O work) is outside this drain's guarantee.
    *
    * The top-level SUCCESS drain is NOT bounded — those results are still
-   * wanted. Default 10_000; Infinity restores unbounded waiting everywhere.
+   * wanted. Default 10_000; Infinity removes the time bound on tracked-agent drains.
    * Finite values in [1, 2^31-1] are rounded down; invalid
    * values (including NaN, 0, negatives, and overflow) use the default.
    */
@@ -2300,10 +2303,12 @@ export async function runWorkflow<T = unknown>(
     // blocking (a usage limit thrown by a sibling of the hung call, a later
     // parent failure). An unbounded wait would hold that error path hostage
     // forever: run never settles, manager keeps it "running", resume()
-    // refuses. The grace abandons the wait with the same semantics the
-    // top-level drain applies post-abort: a call that outlives the grace can
-    // no longer propagate a late miss (the loss window is "> grace", not
-    // forever). Infinity opts out, restoring the unbounded R6 guarantee.
+    // refuses. Grace expiry abandons only the nested wait, not the live call.
+    // A live gap/edit was already recorded at dispatch and still invalidates
+    // the parent's post-child replay boundary, but the parent can run before
+    // that call's side effects finish. Independently deferred work whose FIRST
+    // miss occurs after the child returns is outside the guarantee. Infinity
+    // removes the time bound; it cannot track arbitrary future timer/I/O work.
     // Prefix mode deliberately never waits: its one-way frame boundary is
     // byte-for-byte base behavior.
     if (!isTopLevelRun && replayQuiescenceEnabled) {
@@ -2337,7 +2342,7 @@ export async function runWorkflow<T = unknown>(
             ]);
             if (winner === "grace") {
               log(
-                `nested frame drain abandoned ${state.inFlight.size} in-flight agent() call(s) after ${drainAbortGraceMs}ms; any miss they would note arrives too late for the parent's post-child boundary`,
+                `nested frame drain abandoned ${state.inFlight.size} in-flight agent() call(s) after ${drainAbortGraceMs}ms; recorded misses still invalidate parent replay, but child side effects may finish after the parent continues`,
               );
               break;
             }
