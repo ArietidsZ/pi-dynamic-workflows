@@ -485,6 +485,11 @@ describe("installResultDelivery", () => {
           getEntries: () => entries,
           getBranch: () => history.branch,
           getSessionFile: () => history.sessionFile,
+          // Pi 1.0 rebuilds agent.state.messages in _appendCustomMessage via
+          // SessionManager.buildSessionProjection(); the fake host holds no
+          // entries, so project an empty session (fresh object per call —
+          // agent.state.messages aliases the returned array).
+          buildSessionProjection: () => ({ entries: [], messages: [], thinkingLevel: "medium", model: null }),
         },
       });
     } else {
@@ -512,6 +517,11 @@ describe("installResultDelivery", () => {
       if (!sm || !("getSessionFile" in sm)) {
         Object.assign(sm ?? (session as { sessionManager: Record<string, unknown> }).sessionManager, {
           getSessionFile: () => history.sessionFile,
+        });
+      }
+      if (!sm || !("buildSessionProjection" in sm)) {
+        Object.assign(sm ?? (session as { sessionManager: Record<string, unknown> }).sessionManager, {
+          buildSessionProjection: () => ({ entries: [], messages: [], thinkingLevel: "medium", model: null }),
         });
       }
     }
@@ -2641,6 +2651,7 @@ describe("installResultDelivery", () => {
       _pendingBashMessages: unknown[];
       _pendingNextTurnMessages: unknown[];
       _pendingCustomMessages: unknown[];
+      _pendingToolNames: Set<string>;
       _extensionRunner: unknown;
       _emit: () => void;
     };
@@ -2672,12 +2683,17 @@ describe("installResultDelivery", () => {
         history.append({ id: `entry-${history.branch.length}`, type: "custom_message", customType, details });
         return "";
       },
+      // Pi 1.0's _appendCustomMessage refreshes agent.state.messages through a
+      // projection; empty like the fake host's real state.
+      buildSessionProjection: () => ({ entries: [], messages: [], thinkingLevel: "medium", model: null }),
     };
     idleSession._resourceLoader = { noExtensions: false };
     idleSession._isAgentRunActive = false;
     idleSession._pendingBashMessages = [];
     idleSession._pendingNextTurnMessages = [];
     idleSession._pendingCustomMessages = [];
+    // Pi 1.0's _runAgentPrompt clears the pending loadout set before prompting.
+    idleSession._pendingToolNames = new Set();
     Object.assign(idleSession, { subscribe: () => () => {} });
     idleSession._extensionRunner = {
       emit: async (e: { type: string }) => {
