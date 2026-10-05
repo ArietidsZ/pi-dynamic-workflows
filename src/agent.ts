@@ -52,6 +52,20 @@ import { createStructuredOutputTool, type StructuredOutputCapture } from "./stru
 
 const LIVE_USAGE_EMIT_INTERVAL_MS = 250;
 
+type AgentSessionFactory = typeof createAgentSession;
+let agentSessionFactory: AgentSessionFactory = createAgentSession;
+const localSessionDependencies = { SessionManager, SettingsManager, DefaultResourceLoader };
+let sessionDependencies = localSessionDependencies;
+
+/** Use the host Pi SDK to create children so its ModelRuntime protocol matches. */
+export function installHostCreateAgentSession(
+  factory: AgentSessionFactory,
+  dependencies = localSessionDependencies,
+): void {
+  agentSessionFactory = factory;
+  sessionDependencies = dependencies;
+}
+
 /**
  * Find a JSON object/array in free-form text: a fenced ```json block if present,
  * else the first balanced {...} or [...]. Best-effort (the schema check is the
@@ -129,7 +143,19 @@ export function throwIfProviderLimit(messages: unknown[], label?: string): void 
   );
 }
 
-/** Minimal session surface resolveStructuredOutput needs (real session or a test double). */
+/** Preserve terminal provider errors instead of treating their missing text as empty output. */
+function throwIfAssistantError(messages: unknown[], label?: string): void {
+  throwIfProviderLimit(messages, label);
+  const err = lastAssistantError(messages);
+  if (err?.stopReason !== "error") return;
+  throw new WorkflowError(
+    err.errorMessage || "Provider ended the assistant turn with an error",
+    WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+    { recoverable: true, agentLabel: label },
+  );
+}
+
+/** Minimal session surface for schema repair; messages must contain only the current turn and its repairs. */
 export interface StructuredSession {
   prompt(text: string): Promise<void>;
   setActiveToolsByName?(names: string[]): void;
@@ -165,6 +191,7 @@ export async function resolveStructuredOutput<T>(
     await session.prompt(
       "You did not call the structured_output tool. Call structured_output now as your only action, with the required fields filled in. Do not write a prose answer.",
     );
+    throwIfAssistantError(session.messages, options.label);
   }
   if (capture.called) return capture.value as T;
 
@@ -176,9 +203,8 @@ export async function resolveStructuredOutput<T>(
     return extracted;
   }
 
-  // A repair re-prompt can itself hit the provider limit. Surface that as the real
-  // (recoverable) cause instead of the misleading non-recoverable SCHEMA_NONCOMPLIANCE.
-  throwIfProviderLimit(session.messages, options.label);
+  // Also preserve terminal errors when no repair attempts were requested.
+  throwIfAssistantError(session.messages, options.label);
 
   throw new WorkflowError(
     "Subagent did not produce valid structured_output after repair attempts",
@@ -881,7 +907,8 @@ export class WorkflowAgent {
   private buildSharedResourceLoader(agentDir: string, cwd: string, key: string): Promise<DefaultResourceLoader> {
     const shared = this.providerMiddlewareExtensions.length === 0;
     const pending = (async () => {
-      const settingsManager = this.sessionOptions.settingsManager ?? SettingsManager.create(cwd, agentDir);
+      const settingsManager =
+        this.sessionOptions.settingsManager ?? sessionDependencies.SettingsManager.create(cwd, agentDir);
       let middlewarePaths: string[] = [];
       const packageSources = new Map<string, string>();
       if (this.providerMiddlewareExtensions.length > 0) {
@@ -897,7 +924,7 @@ export class WorkflowAgent {
           })
           .map((extension) => extension.path);
       }
-      const loader = new DefaultResourceLoader({
+      const loader = new sessionDependencies.DefaultResourceLoader({
         cwd,
         agentDir,
         settingsManager,
@@ -1013,10 +1040,10 @@ export class WorkflowAgent {
 
     let manager: SessionManager;
     if (!this.persistAgentSessions) {
-      manager = SessionManager.inMemory();
+      manager = sessionDependencies.SessionManager.inMemory();
     } else {
       try {
-        manager = SessionManager.create(this.cwd);
+        manager = sessionDependencies.SessionManager.create(this.cwd);
         // SessionManager.create() starts a fresh session without lineage. Reset
         // it before createAgentSession() so the child header records the host
         // session, while retaining the default behavior for ephemeral parents.
@@ -1031,7 +1058,7 @@ export class WorkflowAgent {
             error instanceof Error ? error.message : String(error)
           }); continuing with an in-memory session`,
         );
-        manager = SessionManager.inMemory();
+        manager = sessionDependencies.SessionManager.inMemory();
       }
     }
     return manager;
@@ -1260,7 +1287,7 @@ export class WorkflowAgent {
     const modelRuntime = runtimeOf(modelRegistry) as ModelRuntime | undefined;
     let session: Awaited<ReturnType<typeof createAgentSession>>["session"];
     try {
-      ({ session } = await createAgentSession({
+      ({ session } = await agentSessionFactory({
         cwd: runCwd,
         agentDir,
         sessionManager,
@@ -1268,7 +1295,7 @@ export class WorkflowAgent {
         // SettingsManager.inMemory() doesn't load ~/.pi/settings.json, so subagents
         // would fall back to the first available model (e.g. openai-codex) which may
         // not have valid auth, causing silent empty responses.
-        settingsManager: SettingsManager.create(runCwd, agentDir),
+        settingsManager: sessionDependencies.SettingsManager.create(runCwd, agentDir),
         customTools,
         // Shared per-run loader with opt-in provider middleware (#109) — see
         // getSharedResourceLoader. An injected resourceLoader (tests / embedders)
@@ -1435,15 +1462,22 @@ export class WorkflowAgent {
 
       if (options.signal?.aborted) throw new Error("Subagent was aborted");
 
-      // The SDK buries a provider usage/quota limit in the assistant message rather
-      // than throwing; detect it here (before the schema/empty-text branches) so it
-      // is classified as a recoverable checkpoint, not a SCHEMA_NONCOMPLIANCE failure
-      // (schema path) or a silent empty-output null (non-schema path).
-      throwIfProviderLimit(session.messages, options.label);
+      // The SDK can report provider failures in a terminal assistant message
+      // without rejecting prompt(). Inspect only this turn so restored history
+      // cannot turn a genuinely empty response into an old provider failure.
+      throwIfAssistantError(turnMessages, options.label);
 
       if (options.schema) {
-        const result = (await resolveStructuredOutput(session, capture, options.schema, options, () =>
-          this.lastAssistantText(turnMessages),
+        const result = (await resolveStructuredOutput(
+          {
+            prompt: (text) => session.prompt(text),
+            setActiveToolsByName: (names) => session.setActiveToolsByName(names),
+            messages: turnMessages,
+          },
+          capture,
+          options.schema,
+          options,
+          (messages) => this.lastAssistantText(messages),
         )) as AgentRunResult<TSchemaDef>;
         threadTurnSucceeded = true;
         return result;
